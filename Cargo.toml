@@ -8,6 +8,9 @@ keywords = ["mysql", "binlog", "database", "cli", "replication"]
 categories = ["database", "command-line-utilities"]
 license = "Apache-2.0"
 repository = "https://github.com/houseme/binlog-inspect"
+# Verified: the crate and its locked dependency graph (uuid pinned to 1.26.1)
+# build and test on the 1.88.0 toolchain; let-chains set the floor (R43).
+rust-version = "1.88"
 # The .crate ships user-facing documentation and sources only; internal
 # engineering notes, planning documents, and CI/test material stay out of the
 # published tarball (R40). CHANGELOG.md, DESIGN.md, README.md, and LICENSE
