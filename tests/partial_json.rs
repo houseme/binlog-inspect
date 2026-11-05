@@ -712,6 +712,47 @@ fn flipped_partial_json_tlv_byte_fails_the_checksum() {
     assert!(err.to_string().contains("event checksum mismatch"), "{err}");
 }
 
+/// A diff that composes a document deeper than the nesting limit (path depth
+/// plus inserted-value depth) is rejected before mutation and renders as a
+/// loss-marked `partial_json` cell: the composite would overflow the stack
+/// on drop or serialization if it were ever built (verification finding D1).
+#[test]
+fn composed_diff_depth_beyond_the_limit_is_loss_marked() {
+    let mut diff = vec![0x00]; // REPLACE
+    put_lenenc(&mut diff, 3); // path length
+    diff.extend_from_slice(b"$.b");
+    let value = deep_jsonb(100);
+    put_lenenc(&mut diff, value.len() as u64);
+    diff.extend_from_slice(&value);
+
+    let mut parser_events = BinlogParser::open(
+        binlog(&[
+            format_description(),
+            table_map(1, true, true),
+            partial_update_rows(1, JSONB_DOC, &diff),
+        ])
+        .path(),
+    )
+    .unwrap();
+    let mut events = parser_events.events();
+    assert!(events.next().unwrap().is_ok()); // format description
+    assert!(events.next().unwrap().is_ok()); // table map
+    let event = events.next().unwrap().unwrap();
+    let EventPayload::PartialUpdateRows { after, .. } = event.payload else {
+        panic!("expected a partial update rows payload");
+    };
+    let after = after[0].as_ref().unwrap();
+    let CellValue::PartialJson { diffs, reason } = &after.columns[1].value else {
+        panic!(
+            "expected a loss-marked JSON cell, got {:?}",
+            after.columns[1].value
+        );
+    };
+    assert_eq!(diffs.len(), 1);
+    assert!(reason.contains("nesting limit"), "{reason}");
+    assert!(events.next().is_none());
+}
+
 /// Binary jsonb for `{"a": 1, "b": [1]}`.
 const JSONB_EDGE_BEFORE: &[u8] = &[
     0x00, 0x02, 0x00, 0x1b, 0x00, // small object, two members, 27 bytes

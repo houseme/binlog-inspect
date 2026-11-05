@@ -774,7 +774,39 @@ mod json_diff {
         for diff in diffs {
             apply_one(&mut value, diff)?;
         }
+        // Applying a ≤100-deep diff value at a deep path composes documents
+        // whose depth no input cap bounds: a REPLACE can re-insert a
+        // 100-level chain at a leaf, adding ~99 levels per diff. The output
+        // serializer recurses, so an unbounded composite would abort the
+        // process; a composed document beyond MySQL's limit is a loss record
+        // instead (real server diffs never compose beyond it).
+        if json_depth(&value) > super::MAX_JSONB_DEPTH {
+            return Err(ApplyError(
+                "the composed document exceeds the nesting limit of 100 levels".to_owned(),
+            ));
+        }
         Ok(value)
+    }
+
+    /// Maximum depth of a JSON value, computed iteratively with an explicit
+    /// stack: the serializer recurses, so measuring a potentially hostile
+    /// composite must not.
+    fn json_depth(value: &serde_json::Value) -> usize {
+        let mut max = 1;
+        let mut stack = vec![(value, 1usize)];
+        while let Some((current, depth)) = stack.pop() {
+            max = max.max(depth);
+            match current {
+                serde_json::Value::Array(items) => {
+                    stack.extend(items.iter().map(|item| (item, depth + 1)));
+                }
+                serde_json::Value::Object(members) => {
+                    stack.extend(members.values().map(|member| (member, depth + 1)));
+                }
+                _ => {}
+            }
+        }
+        max
     }
 
     /// Applies a single diff to a value in place.
@@ -790,6 +822,19 @@ mod json_diff {
         let at = |what: &'static str| ApplyError(format!("path `{}`: {what}", diff.path));
         let operation = Operation::parse(&diff.operation)?;
         let segments = parse_path(&diff.path)?;
+        // Depth bound enforced BEFORE any mutation: an inserted value of
+        // depth `json_depth(value)` at a path `segments.len()` levels down
+        // composes a document that deep. The composite is dropped
+        // recursively and serialized recursively, so it must never be built
+        // past the limit — rejecting the diff early keeps every reachable
+        // state within it (R44 verification finding D1).
+        if let Some(new_value) = &diff.value
+            && segments.len() + json_depth(new_value) > super::MAX_JSONB_DEPTH
+        {
+            return Err(at(
+                "the composed document would exceed the nesting limit of 100 levels",
+            ));
+        }
         let Some((last, parents)) = segments.split_last() else {
             // The bare `$` path targets the whole document.
             return match operation {

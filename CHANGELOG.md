@@ -13,6 +13,8 @@ Fourth batch, from the 2026-11-06 multi-expert re-review (ROADMAP R39–R44).
 
 ### Fixed
 
+- Applying a partial-JSON diff at a deep path with a deep inserted value composes a document past the 100-level nesting limit; the composition is now rejected before the document is built and the cell renders as `partial_json` with the reason — a hostile sequence previously built a document whose recursive drop/serialization aborted the process.
+- `--completions` output goes through the graceful broken-pipe path as well: it is generated into a buffer first, because clap_complete's shell generators panic on write errors (R40).
 - JSON columns whose jsonb tree nests deeper than MySQL's limit of 100 containers return a parse error carrying the offset; a hostile ~60,000-deep value previously overflowed the stack and aborted the process (fail-closed violation).
 - The broken-pipe exit-0 contract now holds on every write path: `FormatterError::Json(serde_json::Error)` write failures are recognized as `BrokenPipe` via `serde_json::Error::io_error_kind()`, so piping into `head` exits 0 again.
 - `rust-version = "1.88"` is claimed and enforced by a dedicated MSRV CI job (the crate's let-chains set the floor; the locked `uuid` was pinned to 1.26.1 because 1.27+ requires 1.89).

@@ -249,7 +249,7 @@ timestamp,event_type,database,table,before,after
 - `--table`：只保留匹配的 table map、行事件与部分 JSON 更新事件；Query、XID、GTID 等非表事件会被排除，没有表映射的行事件（`unresolved`）因不携带表名也永不匹配。值在第一个 `.` 处拆分为 `(database, table)` 后按字符串精确比较，不做大小写归一化。
 - `--start-position` / `--stop-position`：保留字节偏移 `>= start` 且 `< stop` 的事件（start 含边界，stop 不含）。与 mysqlbinlog 在 stop 位置停止读文件不同，后续事件仍会流经解析器，只是被过滤掉。
 - `--start-datetime` / `--stop-datetime`：保留时间戳 `>= start` 且 `<= stop` 的事件（两端均含边界；mysqlbinlog 的 stop-datetime 不含边界，本工具按帮助文本所述为含边界）。时间在参数解析期完成换算，早于窗口或时间戳为零的事件自然不匹配。
-- `--include-gtid`：对 GTID 事件的 `payload.gtid` 做精确匹配白名单。UUID 部分归一化为小写，tag 区分大小写且须满足 MySQL tag 规则（1–32 个字符，以字母或下划线开头），GNO 从 1 开始。只保留 GTID 事件本身——与 mysqlbinlog 的 `--include-gtids` 不同，不会保留整个事务。
+- `--include-gtid`：对 GTID 事件的 `payload.gtid` 做精确匹配白名单。UUID 部分归一化为小写，tag 区分大小写且须满足 MySQL tag 规则（1–32 个字符，以 ASCII 小写字母或下划线开头），GNO 从 1 开始。只保留 GTID 事件本身——与 mysqlbinlog 的 `--include-gtids` 不同，不会保留整个事务。
 
 ### 统计模式
 
@@ -334,7 +334,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 - `parser::BinlogParser`：`open`（本地文件，含 magic 与加密头校验）、`from_reader`（任意流）、`with_max_event_size`（调整 64 MiB 默认上限）；`events()` 迭代遇到错误即终止。
 - `event` 模块：输出模型，全部类型实现 `Serialize` + `Deserialize`（`CellValue::Bytes` 序列化为小写十六进制字符串，反序列化期望同样形式）；`EventType::as_str` 给出 JSON 中的 snake_case 名称，`from_raw` 完成原始类型码映射。
-- `filter::EventFilter`：`kinds: HashSet<EventType>` 与 `tables: HashSet<(String, String)>` 组合过滤，`keep(&event)` 判定。
+- `filter::EventFilter`：`kinds: HashSet<EventType>`、`tables: HashSet<(String, String)>`、`ranges: RangeFilter`（位置与时间区间）与 `gtids: HashSet<String>`（精确 GTID 白名单）组合过滤，`keep(&event)` 判定。
 - `formatter` 模块：`Formatter` trait 直写 `&mut dyn Write` 并返回 `Result<bool, FormatterError>`（表示本事件是否产生输出）；提供 `JsonLinesFormatter`、`TextFormatter`、`CsvFormatter`（`header()` 返回 CSV 表头）。
 
 网络下载仅在 CLI 内实现，不是公开库 API。开发验证命令及真实样本验证范围见[执行与验证](../EXECUTION.md)，设计细节见[设计文档](../DESIGN.md)。

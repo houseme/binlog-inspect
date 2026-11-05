@@ -539,12 +539,14 @@ fn main() -> Result<()> {
     // --completions ignores every other option and never opens any input.
     if let Some(shell) = cli.completions {
         let mut command = Cli::command();
-        clap_complete::generate(
-            shell,
-            &mut command,
-            env!("CARGO_BIN_NAME"),
-            &mut io::stdout(),
-        );
+        // Generate into a buffer instead of writing straight to stdout:
+        // clap_complete's shell generators panic on write errors, and the
+        // broken-pipe exit-0 contract must hold here too (R40).
+        let mut script = Vec::new();
+        clap_complete::generate(shell, &mut command, env!("CARGO_BIN_NAME"), &mut script);
+        let mut stdout = io::stdout().lock();
+        stdout.write_all(&script)?;
+        stdout.flush()?;
         return Ok(());
     }
     #[cfg(feature = "remote")]

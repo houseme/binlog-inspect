@@ -249,7 +249,7 @@ All filters combine with AND. Filtering happens after parsing and cannot bypass 
 - `--table`: keeps only matching table-map, row and partial-update events; non-table events such as Query, XID and GTID are excluded, and row events without a table map (`unresolved`) carry no table name so they never match. The value is split at the first `.` into `(database, table)` and compared exactly, without case normalization.
 - `--start-position` / `--stop-position`: keep events whose byte offset is `>= start` and `< stop` (start inclusive, stop exclusive). Unlike mysqlbinlog, which stops reading the file at the stop position, later events still stream through the parser; they are just filtered out.
 - `--start-datetime` / `--stop-datetime`: keep events whose timestamp is `>= start` and `<= stop` (both ends inclusive; mysqlbinlog's stop-datetime is exclusive — this tool is inclusive, as its help states). Datetimes are parsed at argument time, so files with pre-epoch or zero timestamps simply never match a realistic window.
-- `--include-gtid`: exact-match allowlist for `payload.gtid` of GTID events. The UUID part is normalized to lowercase, tags are case-sensitive and must satisfy the MySQL tag rules (1–32 characters, starting with a letter or underscore), and GNOs start at 1. Only the GTID event itself is kept — unlike mysqlbinlog's `--include-gtids`, not the whole transaction.
+- `--include-gtid`: exact-match allowlist for `payload.gtid` of GTID events. The UUID part is normalized to lowercase, tags are case-sensitive and must satisfy the MySQL tag rules (1–32 characters, starting with an ASCII lowercase letter or underscore), and GNOs start at 1. Only the GTID event itself is kept — unlike mysqlbinlog's `--include-gtids`, not the whole transaction.
 
 ### Statistics mode
 
@@ -334,7 +334,7 @@ Key points:
 
 - `parser::BinlogParser`: `open` (local file, validates the magic and rejects encrypted headers), `from_reader` (any stream), `with_max_event_size` (override the 64 MiB default); `events()` iteration stops at the first error.
 - The `event` module defines the output model; every type implements `Serialize` + `Deserialize` (`CellValue::Bytes` serializes to a lowercase hexadecimal string and deserialization expects the same form). `EventType::as_str` gives the snake_case name used in JSON, and `from_raw` maps raw type codes.
-- `filter::EventFilter`: combined filtering with `kinds: HashSet<EventType>` and `tables: HashSet<(String, String)>`; `keep(&event)` decides.
+- `filter::EventFilter`: combined filtering with `kinds: HashSet<EventType>`, `tables: HashSet<(String, String)>`, `ranges: RangeFilter` (position and datetime windows) and `gtids: HashSet<String>` (exact-match GTID allowlist); `keep(&event)` decides.
 - The `formatter` module: the `Formatter` trait writes to a `&mut dyn Write` and returns `Result<bool, FormatterError>` (whether the event produced output); `JsonLinesFormatter`, `TextFormatter` and `CsvFormatter` are provided (`header()` returns the CSV header).
 
 Network downloading is implemented in the CLI and is not a public library API. See [execution and validation](../EXECUTION.md) for development checks and the scope of real-sample validation, and [design](../DESIGN.md) for further details.

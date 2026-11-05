@@ -23,7 +23,7 @@
 
 ## 安装与快速开始
 
-从 crates.io 安装（需要当前 Rust stable 工具链；项目使用 Rust 2024 edition，最低支持版本尚未验证）：
+从 crates.io 安装（需要 Rust 1.88 或更新版本——MSRV 已验证并由 CI 强制执行；项目使用 Rust 2024 edition）：
 
 ```sh
 cargo install binlog-inspect --locked
@@ -59,7 +59,7 @@ cargo run --locked --features remote -- --url https://example.com/mysql-bin.0000
 
 ## Rust 工具链兼容性
 
-需要当前 Rust stable 工具链。项目使用 Rust 2024 edition，最低支持版本（MSRV）尚未验证；请使用最新 stable 工具链构建。
+需要 Rust 1.88 或更新版本（MSRV 已验证，并由专门的 CI job 强制执行）；项目使用 Rust 2024 edition。
 
 ## 限制
 

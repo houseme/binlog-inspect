@@ -23,7 +23,7 @@ English | [简体中文](README.zh-CN.md)
 
 ## Install and quick start
 
-Install from crates.io (requires a current Rust stable toolchain; the project uses the Rust 2024 edition and has no verified MSRV yet):
+Install from crates.io (requires Rust 1.88 or newer — the MSRV is verified and CI-enforced; the project uses the Rust 2024 edition):
 
 ```sh
 cargo install binlog-inspect --locked
@@ -59,7 +59,7 @@ cargo run --locked --features remote -- --url https://example.com/mysql-bin.0000
 
 ## Rust toolchain compatibility
 
-Requires a current Rust stable toolchain. The project uses the Rust 2024 edition; a minimum supported version has not been verified, so build with the latest stable toolchain.
+Requires Rust 1.88 or newer (the MSRV is verified and enforced by a dedicated CI job); the project uses the Rust 2024 edition.
 
 ## Limitations
 
