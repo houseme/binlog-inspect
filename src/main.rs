@@ -232,8 +232,10 @@ fn parse_datetime(value: &str) -> Result<i64, String> {
 /// Parses one `--include-gtid` value: exact `uuid:gno` or `uuid:tag:gno`.
 ///
 /// The UUID is normalized to lowercase because that is how event output
-/// renders it; the tag is case-sensitive and kept verbatim. The allow list
-/// matches whole strings only; no interval or set algebra.
+/// renders it; the tag is case-sensitive and must satisfy the MySQL tag
+/// rules (1-32 characters, starting with a letter or underscore). GNOs start
+/// at one. The allow list matches whole strings only; no interval or set
+/// algebra.
 fn parse_gtid(value: &str) -> Result<String, String> {
     let invalid =
         || format!("invalid GTID '{value}': expected uuid:gno or uuid:tag:gno (exact match only)");
@@ -244,12 +246,21 @@ fn parse_gtid(value: &str) -> Result<String, String> {
         _ => return Err(invalid()),
     };
     validate_gtid_uuid(uuid).map_err(|_| invalid())?;
-    if let Some(tag) = tag
-        && (tag.is_empty() || !tag.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
-    {
+    if let Some(tag) = tag {
+        let starts_ok = tag.starts_with(|c: char| c.is_ascii_lowercase() || c == '_');
+        let rest_ok = tag
+            .chars()
+            .skip(1)
+            .all(|c| c.is_ascii_alphanumeric() || c == '_');
+        if tag.len() > 32 || !starts_ok || !rest_ok {
+            return Err(invalid());
+        }
+    }
+    // MySQL GNOs start at one; zero cannot match a real transaction.
+    let gno = gno.parse::<u64>().map_err(|_| invalid())?;
+    if gno == 0 {
         return Err(invalid());
     }
-    gno.parse::<u64>().map_err(|_| invalid())?;
     Ok(match tag {
         Some(tag) => format!("{}:{tag}:{gno}", uuid.to_ascii_lowercase()),
         None => format!("{}:{gno}", uuid.to_ascii_lowercase()),
@@ -274,8 +285,9 @@ fn validate_gtid_uuid(uuid: &str) -> Result<(), ()> {
 }
 /// Parses one `--max-event-size` value in bytes.
 ///
-/// Values above the 1 GiB inspection limit are rejected at parse time (exit
-/// code 2); the resulting number always fits `u32`.
+/// Values above the 1 GiB inspection limit and below the 19-byte event
+/// header are rejected at parse time (exit code 2); the resulting number
+/// always fits `u32`.
 fn parse_max_event_size(value: &str) -> Result<u32, String> {
     let bytes: u64 = value.parse().map_err(|_| {
         format!("invalid --max-event-size value '{value}': expected a number of bytes")
@@ -283,6 +295,11 @@ fn parse_max_event_size(value: &str) -> Result<u32, String> {
     if bytes > MAX_EVENT_SIZE_LIMIT {
         return Err(format!(
             "--max-event-size {bytes} exceeds the 1 GiB inspection limit"
+        ));
+    }
+    if bytes < 19 {
+        return Err(format!(
+            "--max-event-size {bytes} is smaller than the 19-byte event header"
         ));
     }
     Ok(u32::try_from(bytes).expect("bounded by the 1 GiB inspection limit"))
