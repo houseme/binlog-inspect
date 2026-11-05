@@ -31,11 +31,18 @@ jobs:
         include:
           # Default features (`cli`) — builds the library and the binary.
           - features: "default"
+            flags: ""
           # All features — adds `remote` (ureq HTTP(S) download + loopback tests).
           - features: "all"
+            flags: "--all-features"
           # No default features — library only; mirrors the README build gate
           # and guards the `cli` feature gate (R37).
           - features: "no-default-features"
+            flags: "--no-default-features"
+          # No default features plus `remote` — `remote` implies `cli`, so
+          # this combination must still build the binary (R40/R43).
+          - features: "no-default-with-remote"
+            flags: "--no-default-features --features remote"
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
 
@@ -47,7 +54,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
 
       - name: Build (lib + bin)
-        run: cargo build --locked ${{ matrix.features == 'default' && '' || (matrix.features == 'all' && '--all-features' || '--no-default-features') }}
+        run: cargo build --locked ${{ matrix.flags }}
 
       - name: Verify the binary and the library are both produced
         if: matrix.os == 'ubuntu-latest' && matrix.features == 'default'
@@ -60,8 +67,14 @@ jobs:
         if: matrix.os == 'ubuntu-latest' && matrix.features == 'no-default-features'
         run: test ! -e target/debug/binlog-inspect
 
+      - name: Verify remote-without-defaults still produces the binary
+        if: matrix.os == 'ubuntu-latest' && matrix.features == 'no-default-with-remote'
+        run: |
+          test -f target/debug/binlog-inspect || { echo "bin target missing"; exit 1; }
+          ./target/debug/binlog-inspect --version
+
       - name: Test
-        run: cargo test --locked ${{ matrix.features == 'default' && '' || (matrix.features == 'all' && '--all-features' || '--no-default-features') }}
+        run: cargo test --locked ${{ matrix.flags }}
 
   # ── Functional smoke: parse → formatters → filters → layered exit codes ─────
 
@@ -145,6 +158,9 @@ jobs:
 
       - name: Clippy (all features, all targets, -D warnings)
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+      - name: Clippy (no default features, all targets, -D warnings)
+        run: cargo clippy --locked --all-targets --no-default-features -- -D warnings
 
   # ── Documentation ───────────────────────────────────────────────────────────
 

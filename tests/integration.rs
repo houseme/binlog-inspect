@@ -784,6 +784,55 @@ fn mismatched_log_pos_is_reported_as_an_advisory_warning() {
 }
 
 #[test]
+fn advisory_log_pos_warnings_are_capped_at_100() {
+    // R43: the advisory-warning buffer is capped at 100 entries. The fixture
+    // helper writes a fixed log_pos (4 + size) into every event header, so
+    // every event after the first sits at an offset that does not match it:
+    // 103 events produce 102 mismatching log_pos values, and stderr must
+    // stop at the cap instead of growing with the file.
+    let mut bytes = b"\xfebin".to_vec();
+    for index in 0..103u64 {
+        bytes.extend(event(16, &index.to_le_bytes()));
+    }
+    let f = file(&bytes);
+    let out = run_cli(&[f.path().to_str().unwrap()]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let warnings = stderr.matches("warning:").count();
+    assert!(warnings <= 100, "warning cap exceeded: {warnings}");
+    assert_eq!(
+        warnings, 100,
+        "the cap must be reached (102 mismatching events)"
+    );
+    // All events still parse and are emitted; only the warnings are capped.
+    assert_eq!(String::from_utf8_lossy(&out.stdout).lines().count(), 103);
+}
+
+#[test]
+fn framing_error_message_carries_the_exact_offset() {
+    // R43: ParserError messages must carry the file offset so per-file
+    // reports can point at the corruption. One 27-byte XID event parses; the
+    // 19-byte header with a declared size of 0 after it fails at
+    // offset 4 + 27 = 31.
+    let mut bytes = b"\xfebin".to_vec();
+    bytes.extend(event(16, &123u64.to_le_bytes()));
+    bytes.extend(corrupt_event());
+    let f = file(&bytes);
+    let mut p = BinlogParser::open(f.path()).unwrap();
+    let error = p.events().nth(1).unwrap().unwrap_err().to_string();
+    assert!(
+        error.contains("binlog error at offset 31"),
+        "expected the offset in the message: {error}"
+    );
+    assert!(error.contains("invalid or oversized"), "{error}");
+}
+
+#[test]
 fn row_column_count_must_match_table_map() {
     let mut map = vec![1, 0, 0, 0, 0, 0, 0, 0];
     map.extend_from_slice(b"\x03app\0\x01t\0\x01\x03\x00\x00");
