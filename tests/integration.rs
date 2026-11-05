@@ -8,7 +8,7 @@ use binlog_inspect::{
     parser::{BinlogParser, MAX_EVENT_SIZE, ParserError},
 };
 use std::{
-    io::Write,
+    io::{Read, Write},
     process::{Command, Output, Stdio},
 };
 
@@ -285,6 +285,49 @@ fn stdin_dash_is_parsed() {
     );
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["payload"]["xid"], 99);
+}
+
+#[test]
+fn broken_pipe_from_a_piped_reader_exits_zero() {
+    // R40: `binlog-inspect big.binlog | head -c 100` must exit 0 on every
+    // write path. The JSONL formatter surfaces writer failures as
+    // FormatterError::Json(serde_json::Error), which hides the underlying io
+    // error one level down, so the graceful-exit check has to see through it.
+    // 2000 events produce far more output than any OS pipe buffer, so the
+    // child is guaranteed to hit the closed pipe while still writing.
+    let mut bytes = b"\xfebin".to_vec();
+    for index in 0..2000u64 {
+        bytes.extend(event(16, &index.to_le_bytes()));
+    }
+    let f = file(&bytes);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_binlog-inspect"))
+        .arg(f.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Read a few bytes, then close the read end while the child is still
+    // producing output.
+    {
+        let mut stdout = child.stdout.take().unwrap();
+        let mut first = [0u8; 16];
+        stdout.read_exact(&mut first).unwrap();
+    }
+    let output = child.wait_with_output().unwrap();
+    // std maps a closed pipe to ErrorKind::BrokenPipe on every platform
+    // (Windows ERROR_BROKEN_PIPE included), so the exit-0 contract is
+    // asserted uniformly.
+    assert!(
+        output.status.success(),
+        "exit {:?}: {}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("panicked"),
+        "a broken pipe must not panic: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 #[test]
 fn gtid_events_expose_kind_gtid_value_and_tag() {
@@ -738,6 +781,55 @@ fn mismatched_log_pos_is_reported_as_an_advisory_warning() {
     // Exactly one warning for the one broken event; the stream continued.
     assert_eq!(stderr.matches("warning:").count(), 1);
     assert_eq!(String::from_utf8_lossy(&out.stdout).lines().count(), 3);
+}
+
+#[test]
+fn advisory_log_pos_warnings_are_capped_at_100() {
+    // R43: the advisory-warning buffer is capped at 100 entries. The fixture
+    // helper writes a fixed log_pos (4 + size) into every event header, so
+    // every event after the first sits at an offset that does not match it:
+    // 103 events produce 102 mismatching log_pos values, and stderr must
+    // stop at the cap instead of growing with the file.
+    let mut bytes = b"\xfebin".to_vec();
+    for index in 0..103u64 {
+        bytes.extend(event(16, &index.to_le_bytes()));
+    }
+    let f = file(&bytes);
+    let out = run_cli(&[f.path().to_str().unwrap()]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let warnings = stderr.matches("warning:").count();
+    assert!(warnings <= 100, "warning cap exceeded: {warnings}");
+    assert_eq!(
+        warnings, 100,
+        "the cap must be reached (102 mismatching events)"
+    );
+    // All events still parse and are emitted; only the warnings are capped.
+    assert_eq!(String::from_utf8_lossy(&out.stdout).lines().count(), 103);
+}
+
+#[test]
+fn framing_error_message_carries_the_exact_offset() {
+    // R43: ParserError messages must carry the file offset so per-file
+    // reports can point at the corruption. One 27-byte XID event parses; the
+    // 19-byte header with a declared size of 0 after it fails at
+    // offset 4 + 27 = 31.
+    let mut bytes = b"\xfebin".to_vec();
+    bytes.extend(event(16, &123u64.to_le_bytes()));
+    bytes.extend(corrupt_event());
+    let f = file(&bytes);
+    let mut p = BinlogParser::open(f.path()).unwrap();
+    let error = p.events().nth(1).unwrap().unwrap_err().to_string();
+    assert!(
+        error.contains("binlog error at offset 31"),
+        "expected the offset in the message: {error}"
+    );
+    assert!(error.contains("invalid or oversized"), "{error}");
 }
 
 #[test]

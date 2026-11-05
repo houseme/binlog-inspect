@@ -503,15 +503,25 @@ fn publish_output(written: &Path, target: &Path) -> Result<()> {
     Ok(())
 }
 /// Whether the error chain is a closed stdout (a reader such as head exited).
+///
+/// Every write path is covered: the JSONL and text-payload formatters wrap
+/// writer failures in `FormatterError::Json(serde_json::Error)`, which hides
+/// the io error one level down, so the kind is recovered through
+/// `serde_json::Error::io_error_kind`. Only `BrokenPipe` counts as the
+/// graceful "reader went away" case.
 fn is_broken_pipe(error: &anyhow::Error) -> bool {
     use binlog_inspect::formatter::FormatterError;
     error.chain().any(|cause| {
-        cause
-            .downcast_ref::<io::Error>()
-            .is_some_and(|error| error.kind() == io::ErrorKind::BrokenPipe)
-            || cause
-                .downcast_ref::<FormatterError>()
-                .is_some_and(|error| matches!(error, FormatterError::Io(io_error) if io_error.kind() == io::ErrorKind::BrokenPipe))
+        if let Some(io_error) = cause.downcast_ref::<io::Error>() {
+            return io_error.kind() == io::ErrorKind::BrokenPipe;
+        }
+        match cause.downcast_ref::<FormatterError>() {
+            Some(FormatterError::Io(io_error)) => io_error.kind() == io::ErrorKind::BrokenPipe,
+            Some(FormatterError::Json(json_error)) => {
+                json_error.io_error_kind() == Some(io::ErrorKind::BrokenPipe)
+            }
+            _ => false,
+        }
     })
 }
 fn main() -> Result<()> {
