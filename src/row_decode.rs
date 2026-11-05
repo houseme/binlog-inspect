@@ -267,20 +267,28 @@ pub(crate) fn decode_rows_pair(
 ///
 /// Cells whose diffs were already resolved (or whose before counterpart
 /// offers no JSON value to apply against) keep their state.
+///
+/// Both images are in table-column order, so the before cursor advances
+/// monotonically — a linear merge instead of a per-cell search (R42).
 fn apply_pair(before: &RowImage, after: &mut RowImage) {
-    let pending: Vec<usize> = after
-        .columns
-        .iter()
-        .enumerate()
-        .filter(|(_, cell)| matches!(cell.value, CellValue::PartialJson { .. }))
-        .map(|(position, _)| position)
-        .collect();
-    for position in pending {
-        let (diffs, index) = match &after.columns[position].value {
-            CellValue::PartialJson { diffs, .. } => (diffs.to_vec(), after.columns[position].index),
-            _ => continue,
+    let mut cursor = before.columns.iter();
+    let mut candidate = cursor.next();
+    for after_cell in after.columns.iter_mut() {
+        // Advance the before cursor to this column's index; both images are
+        // sorted by column index, so the cursor never moves backwards.
+        while candidate.is_some_and(|cell| cell.index < after_cell.index) {
+            candidate = cursor.next();
+        }
+        if !matches!(after_cell.value, CellValue::PartialJson { .. }) {
+            continue;
+        }
+        let CellValue::PartialJson { diffs, .. } = &after_cell.value else {
+            continue;
         };
-        let Some(before_cell) = before.columns.iter().find(|cell| cell.index == index) else {
+        let diffs = diffs.clone();
+        // A gap (no before cell at this index) keeps the loss-marked value,
+        // matching the previous search-based behavior.
+        let Some(before_cell) = candidate.filter(|cell| cell.index == after_cell.index) else {
             continue;
         };
         let replacement = match &before_cell.value {
@@ -302,7 +310,7 @@ fn apply_pair(before: &RowImage, after: &mut RowImage) {
                 reason: "before value is not JSON".to_owned(),
             },
         };
-        after.columns[position].value = replacement;
+        after_cell.value = replacement;
     }
 }
 

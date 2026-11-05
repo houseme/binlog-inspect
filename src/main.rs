@@ -131,6 +131,11 @@ struct Stats {
     by_type: BTreeMap<&'static str, u64>,
     by_table: BTreeMap<String, u64>,
     errors: u64,
+    /// Scratch key reused across `record` calls so the hot path only
+    /// allocates on the first sighting of a table (R42); excluded from the
+    /// JSON output.
+    #[serde(skip)]
+    table_key: String,
 }
 impl Stats {
     /// Records one kept event.
@@ -147,24 +152,29 @@ impl Stats {
                 table,
                 changes,
                 ..
-            } => {
-                *self
-                    .by_table
-                    .entry(format!("{database}.{table}"))
-                    .or_default() += changes.len() as u64;
-            }
+            } => self.count_row_changes(database, table, changes.len() as u64),
             EventPayload::PartialUpdateRows {
                 database,
                 table,
                 before,
                 ..
-            } => {
-                *self
-                    .by_table
-                    .entry(format!("{database}.{table}"))
-                    .or_default() += before.len() as u64;
-            }
+            } => self.count_row_changes(database, table, before.len() as u64),
             _ => {}
+        }
+    }
+    /// Adds `n` row changes to `by_table` without a per-event allocation:
+    /// the lookup borrows the scratch key, the clone happens only on the
+    /// first insertion for that table.
+    fn count_row_changes(&mut self, database: &str, table: &str, n: u64) {
+        self.table_key.clear();
+        self.table_key.push_str(database);
+        self.table_key.push('.');
+        self.table_key.push_str(table);
+        match self.by_table.get_mut(self.table_key.as_str()) {
+            Some(count) => *count += n,
+            None => {
+                self.by_table.insert(self.table_key.clone(), n);
+            }
         }
     }
 }

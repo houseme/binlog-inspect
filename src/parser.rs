@@ -9,6 +9,7 @@ use mysql_common::binlog::{
     events::{Event, EventData, PreviousGtidsEvent, RowsEventData, TransactionPayloadReader},
 };
 use std::{
+    collections::HashMap,
     fs::File,
     io::{self, BufRead, BufReader, Cursor, Read},
     path::Path,
@@ -66,6 +67,11 @@ pub struct BinlogParser<R: Read = File> {
     buffer: Vec<u8>,
     max_event_size: u32,
     warnings: Vec<String>,
+    /// Per-table signedness metadata (R42): `signedness()` walks the table
+    /// map's serialized body, so it is computed once per registration instead
+    /// of once per row event. Entries are replaced when a table map
+    /// re-registers the same table id.
+    signedness_cache: HashMap<u64, std::sync::Arc<Vec<Option<bool>>>>,
 }
 
 impl BinlogParser<File> {
@@ -108,6 +114,7 @@ impl<R: Read> BinlogParser<R> {
             buffer: Vec::new(),
             max_event_size: MAX_EVENT_SIZE,
             warnings: Vec::new(),
+            signedness_cache: HashMap::new(),
         })
     }
 
@@ -311,12 +318,22 @@ impl<R: Read> BinlogParser<R> {
             Some(EventData::FormatDescriptionEvent(e)) => EventPayload::FormatDescription {
                 server_version: server_version(e.server_version_raw()),
             },
-            Some(EventData::TableMapEvent(e)) => EventPayload::TableMap {
-                table_id: e.table_id(),
-                database: e.database_name().into_owned(),
-                table: e.table_name().into_owned(),
-                column_count: e.columns_count(),
-            },
+            Some(EventData::TableMapEvent(e)) => {
+                // Refresh the signedness cache on every registration: a
+                // re-registered table id carries a new schema, so the cached
+                // entry must be replaced (R42).
+                let table_id = e.table_id();
+                if let Some(map) = self.reader.get_tme(table_id) {
+                    let computed = std::sync::Arc::new(crate::row_decode::signedness(map)?);
+                    self.signedness_cache.insert(table_id, computed);
+                }
+                EventPayload::TableMap {
+                    table_id: e.table_id(),
+                    database: e.database_name().into_owned(),
+                    table: e.table_name().into_owned(),
+                    column_count: e.columns_count(),
+                }
+            }
             Some(EventData::QueryEvent(e)) => EventPayload::Query {
                 database: e.schema().into_owned(),
                 sql: e.query().into_owned(),
@@ -402,7 +419,20 @@ impl<R: Read> BinlogParser<R> {
                                     .map(pad)
                             })
                             .transpose()?;
-                        let signedness = crate::row_decode::signedness(map)?;
+                        // The signedness walk re-serializes the table map, so
+                        // it is cached per table id at registration (R42);
+                        // the fallback covers ids the cache has not seen.
+                        let signedness = {
+                            if let Some(cached) = self.signedness_cache.get(&id) {
+                                std::sync::Arc::clone(cached)
+                            } else {
+                                let computed =
+                                    std::sync::Arc::new(crate::row_decode::signedness(map)?);
+                                self.signedness_cache
+                                    .insert(id, std::sync::Arc::clone(&computed));
+                                computed
+                            }
+                        };
                         let mut before = Vec::new();
                         let mut after = Vec::new();
                         for row in e.rows(map) {
@@ -465,7 +495,18 @@ impl<R: Read> BinlogParser<R> {
                                 .map(pad)
                         })
                         .transpose()?;
-                    let signedness = crate::row_decode::signedness(map)?;
+                    // Cached per table id at registration (R42); see the
+                    // PartialUpdateRows arm for the fallback.
+                    let signedness = {
+                        if let Some(cached) = self.signedness_cache.get(&id) {
+                            std::sync::Arc::clone(cached)
+                        } else {
+                            let computed = std::sync::Arc::new(crate::row_decode::signedness(map)?);
+                            self.signedness_cache
+                                .insert(id, std::sync::Arc::clone(&computed));
+                            computed
+                        }
+                    };
                     let mut changes = Vec::new();
                     for row in e.rows(map) {
                         let (before_row, after_row) = row?;
