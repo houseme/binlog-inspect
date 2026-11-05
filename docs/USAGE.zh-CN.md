@@ -59,7 +59,7 @@ cargo build --locked --release --features remote
 | `write_rows` | 插入的行镜像。 |
 | `update_rows` | 更新的前后行镜像对。 |
 | `delete_rows` | 删除的行镜像。 |
-| `partial_update_rows` | 部分 JSON 更新（WL#2955）；仅解码 before 镜像，after 差异不解码。 |
+| `partial_update_rows` | 部分 JSON 更新（WL#2955）；before 镜像是完整行镜像，after 的 JSON 差异会应用到 before 值上（无法应用的差异以 `partial_json` 丢失标记呈现）。 |
 | `query` | SQL 语句事件。 |
 | `xid` | 事务提交标识。 |
 | `gtid` | 全局事务标识，支持 MySQL 8.4+ 的 tagged GTID（`uuid:tag:gno`）。 |
@@ -79,8 +79,8 @@ cargo build --locked --release --features remote
 | `transaction_context` | 两阶段提交事务上下文（未解码）。 |
 | `view_change` | 组复制视图变更（未解码）。 |
 | `xa_prepare` | XA 事务准备（未解码）。 |
-| `unknown` | 本版本未命名的事件类型（含 MariaDB 专有的 160+ 类型码）。 |
 | `transaction_payload` | 压缩事务 payload（WL#3549，MySQL 8）；在安全的解压限制下解码。 |
+| `unknown` | 本版本未命名的事件类型（含 MariaDB 专有的 160+ 类型码）。 |
 
 未知取值同样在参数解析期报错（退出码 2），错误消息列出全部合法值：
 
@@ -280,7 +280,7 @@ timestamp,event_type,database,table,before,after
 - 定位不同：本工具是离线明文 binlog 检查器，不实现 MySQL 服务端协议，也不解密；需要从服务器获取明文时请使用 `mysqlbinlog --read-from-remote-server`。
 - 输出面向机器：JSON Lines / CSV 每事件一条记录，行镜像区分缺失列与 SQL NULL；适合管道与脚本处理，不追求 mysqlbinlog 的 SQL 重放输出。
 - 功能子集：范围过滤更简单（位置窗口只过滤而非停止读取，时间边界两端均含，GTID 选择按事件精确匹配而非按事务），不生成重放语句，不跟随 Rotate，压缩 payload 内的事务不会解压成可重放 SQL。
-- 校验行为：逐事件验证 CRC32 校验和，并对敌意构造的事件头和表映射元数据做 fail-closed 预校验；`partial_update_rows` 只给出 before 镜像。
+- 校验行为：逐事件验证 CRC32 校验和，并对敌意构造的事件头和表映射元数据做 fail-closed 预校验；`partial_update_rows` 解码 before 镜像，并将 after 的 JSON 差异应用到 before 值上。
 
 ## 作为 Rust 库使用
 
@@ -288,7 +288,7 @@ timestamp,event_type,database,table,before,after
 
 ```toml
 [dependencies]
-binlog-inspect = { path = "../binlog-inspect" }
+binlog-inspect = "0.4"        # or { path = "../binlog-inspect" } for a checkout
 serde_json = "1"
 ```
 
@@ -337,4 +337,4 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 - `filter::EventFilter`：`kinds: HashSet<EventType>` 与 `tables: HashSet<(String, String)>` 组合过滤，`keep(&event)` 判定。
 - `formatter` 模块：`Formatter` trait 直写 `&mut dyn Write` 并返回 `Result<bool, FormatterError>`（表示本事件是否产生输出）；提供 `JsonLinesFormatter`、`TextFormatter`、`CsvFormatter`（`header()` 返回 CSV 表头）。
 
-网络下载仅在 CLI 内实现，不是公开库 API。开发验证命令及真实样本验证范围见[执行与验证](../EXECUTION.md)，设计细节见[设计文档](../DESIGN.md)（均为中文文档）。
+网络下载仅在 CLI 内实现，不是公开库 API。开发验证命令及真实样本验证范围见[执行与验证](../EXECUTION.md)，设计细节见[设计文档](../DESIGN.md)。

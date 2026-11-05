@@ -13,7 +13,7 @@
 ## 功能
 
 - 读取一个或多个本地 binlog，支持 `-` 从标准输入读取；启用 `remote` feature 后也可下载 HTTP(S) 文件。
-- 事件类型全面分类（27 种）：类型化解码 format_description、table_map、query、xid、gtid（tagged，`uuid:tag:gno`）、anonymous_gtid、previous_gtids、rotate、stop、rows_query、incident、intvar、partial_update_rows（before 镜像）及 write/update/delete 行事件；命名但未解码的事件保留类型与 `raw_len`。
+- 事件类型全面分类（27 种）：类型化解码 format_description、table_map、query、xid、gtid（tagged，`uuid:tag:gno`）、anonymous_gtid、previous_gtids、rotate、stop、rows_query、incident、intvar、partial_update_rows（before 镜像 + 应用 JSON 差异）及 write/update/delete 行事件；命名但未解码的事件保留类型与 `raw_len`。
 - 行镜像保留列位置、缺失列与 SQL NULL 的区分，数值附带 MySQL 列类型与 signedness。
 - 多维过滤：按事件类型、`database.table`、字节偏移区间（`--start-position`/`--stop-position`）、时间区间（`--start-datetime`/`--stop-datetime`）与精确 GTID（`--include-gtid`）筛选，行事件保留前后镜像。
 - `--stats` 输出单个 JSON 统计对象（文件数、事件数、字节数、事务数、按类型与按表计数、错误数）；`--completions` 生成 shell 补全脚本。

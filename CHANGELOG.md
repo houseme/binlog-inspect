@@ -4,6 +4,27 @@ This project follows the [Keep a Changelog](https://keepachangelog.com/en/1.1.0/
 
 ## [Unreleased]
 
+Fourth batch, from the 2026-11-06 multi-expert re-review (ROADMAP R39–R44).
+
+### Added
+
+- JSON columns containing opaque jsonb values (decimals and date/time values stored in JSON — type byte `NEWDECIMAL` and friends) decode through the library's `JsonDom` rendering instead of failing the whole file; opaque diff members render as their canonical string form.
+- Row events with type codes 23–25 (the MySQL 5.5-era V1 write/update/delete rows events) are labeled `write_rows`/`update_rows`/`delete_rows` instead of `unknown` — the payload was always decoded; only the label was wrong (the truly pre-GA codes are 20–22, which remain `unknown`).
+
+### Fixed
+
+- JSON columns whose jsonb tree nests deeper than MySQL's limit of 100 containers return a parse error carrying the offset; a hostile ~60,000-deep value previously overflowed the stack and aborted the process (fail-closed violation).
+- The broken-pipe exit-0 contract now holds on every write path: `FormatterError::Json(serde_json::Error)` write failures are recognized as `BrokenPipe` via `serde_json::Error::io_error_kind()`, so piping into `head` exits 0 again.
+- `rust-version = "1.88"` is claimed and enforced by a dedicated MSRV CI job (the crate's let-chains set the floor; the locked `uuid` was pinned to 1.26.1 because 1.27+ requires 1.89).
+- All third-party GitHub Actions are pinned by full commit SHA (one exception recorded in the workflow: `rustsec/audit-check@v2`, whose SHA could not be resolved at the time).
+- Documentation: the USAGE `--events` tables, the `EventType::PartialUpdateRows` rustdoc, and the library/limitation sections now describe the applied JSON-diff after image instead of the pre-R33 "not decoded" wording; the library section documents the full `EventFilter` (ranges, GTID allowlist) and the crates.io dependency form; stale language markers removed; the ROADMAP Contract section is annotated as the historical batch-1 spec.
+
+### Changed
+
+- **Packaging**: the `remote` feature now implies `cli` (so `--no-default-features --features remote` builds the binary); the unused `clap` dev-dependency is gone; the published `.crate` excludes internal engineering documents (`AGENT.md`, `EXECUTION.md`, `ROADMAP.md`, `docs/`, `tests/`, `.github/`).
+- Performance: per-table signedness metadata no longer re-serializes the table map for every row event; JSON-diff cell matching is linear in the column count; `--stats` reuses a scratch string for `by_table` keys. JSON output is byte-identical.
+- CI: the lint job runs clippy for no-default-features as well; the test matrix covers `--no-default-features --features remote`; the loopback download tests no longer spend a 30 s drain bound on truncated responses.
+
 ## [0.4.0] - 2026-11-05
 
 Third batch: partial JSON diff application, backlogged correctness and packaging items.
@@ -26,7 +47,7 @@ Third batch: partial JSON diff application, backlogged correctness and packaging
 - The remote download's 1 MiB copy chunk is heap-allocated: as a stack array it overflowed the default 1 MiB main-thread stack on Windows, so every `--url` download aborted the process immediately before any network I/O (Linux and macOS have 8 MiB main stacks and were unaffected).
 - The loopback test servers clear the inherited `O_NONBLOCK` flag on accepted sockets (a BSD/macOS behavior) and bound their accept wait, so a client that never connects fails fast with its own stderr instead of hanging the suite.
 
-## [0.3.0] - 2026-11-05
+## 0.3.0 - 2026-11-05
 
 Second batch: compressed transaction support, range filters, statistics, completions, and download/event size limits.
 
@@ -52,7 +73,7 @@ Second batch: compressed transaction support, range filters, statistics, complet
 - Large uncompressed (`NONE`) transaction payloads (above the old 1 MiB slack) are no longer falsely rejected.
 - `--include-gtid` validation tightened: tag length (≤ 32) and charset per MySQL rules; GNO 0 rejected.
 
-## [0.2.0] - 2026-11-05
+## 0.2.0 - 2026-11-05
 
 First batch of review fixes (event classification, CLI reliability and safety, performance, library quality, documentation, and engineering).
 
@@ -88,7 +109,7 @@ First batch of review fixes (event classification, CLI reliability and safety, p
 - A present-bitmap bit count that disagrees with the column count in a row image now returns an error instead of silently truncating.
 - Hostile previous-GTIDs (`n_sids` out of bounds) and table-map metadata TLVs no longer abort the process; they produce parse errors carrying the offset.
 
-## [0.1.0] - 2026-11-04
+## 0.1.0 - 2026-11-04
 
 ### Added
 

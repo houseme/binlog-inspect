@@ -59,7 +59,7 @@ Status markers: `[done W1]` implemented in the first batch, `[done W2]` implemen
 
 - **R22 [done W1] Comprehensive documentation corrections (kept in sync across languages).**
   Additions: field tables for every payload kind; real output samples for the three formats; exit-code explanation; limitation notes (tagged-GTID support statement, rotate not followed, 64 MiB event cap, `previous_gtids` required by standard binlogs no longer shown as unknown, `--table` restrictions for identifiers containing dots); a "differences from mysqlbinlog" section; an install section; all `--events` values visible.
-- **R23 [done W1; version now 0.3.0] Packaging metadata: Cargo.toml gains description/readme/keywords/release profile (lto+strip); version bumped to 0.2.0; CHANGELOG.md added.**
+- **R23 [done W1] Packaging metadata: Cargo.toml gains description/readme/keywords/release profile (lto+strip); version bumped to 0.2.0; CHANGELOG.md added.**
   `license`/`repository` are covered by R33.
 - **R24 [done W1] CI enhancements: clippy+test also for no-default-features; rust-cache; dependabot; concurrency group; actions pinned by SHA.**
 
@@ -120,6 +120,8 @@ Status markers: `[done W1]` implemented in the first batch, `[done W2]` implemen
 - **R47 [W5 candidate] Fuzz/property harness** over the hand-written wire-format mirrors (previous-GTIDs walk, table-map TLV prevalidation, payload-header prevalidation, jsonb conversion).
 
 ## Contract: API Specification for the First Parallel Implementation Batch
+
+> Historical batch-1 specification, kept verbatim for provenance. The code has since evolved beyond it (R26 added `ranges`/GTID fields to `EventFilter`, R33 added `PartialUpdateRows.after`, `EventType` derives `ValueEnum` only under the `cli` feature); consult the rustdoc for the current signatures.
 
 Implementations must match the signatures below (both parallel implementers take this as authoritative; report contract defects in the final report instead of unilaterally deviating):
 

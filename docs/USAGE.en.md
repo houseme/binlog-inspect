@@ -59,7 +59,7 @@ The values map one-to-one to the library `EventType` enum, which is also the set
 | `write_rows` | Inserted row images. |
 | `update_rows` | Updated before/after row image pairs. |
 | `delete_rows` | Deleted row images. |
-| `partial_update_rows` | Partial JSON updates (WL#2955); only the before image is decoded, the after diff is not. |
+| `partial_update_rows` | Partial JSON updates (WL#2955); the before image is a full row image and the after image's JSON diffs are applied against it (unappliable diffs render as `partial_json`). |
 | `query` | SQL statement event. |
 | `xid` | Transaction commit identifier. |
 | `gtid` | Global transaction identifier, including MySQL 8.4+ tagged GTIDs (`uuid:tag:gno`). |
@@ -79,8 +79,8 @@ The values map one-to-one to the library `EventType` enum, which is also the set
 | `transaction_context` | Two-phase commit transaction context (undecoded). |
 | `view_change` | Group replication view change (undecoded). |
 | `xa_prepare` | XA transaction prepare (undecoded). |
-| `unknown` | Event type this version does not name (including MariaDB-specific 160+ codes). |
 | `transaction_payload` | Compressed transaction payload (WL#3549, MySQL 8); decoded with safe decompression limits. |
+| `unknown` | Event type this version does not name (including MariaDB-specific 160+ codes). |
 
 Unknown values also fail at argument parsing (exit code 2); the error message lists every valid value:
 
@@ -280,7 +280,7 @@ When the server sets `binlog_row_value_options=PARTIAL_JSON`, table maps carry o
 - Different positioning: this tool is an offline plaintext binlog inspector; it does not implement the MySQL server protocol and does not decrypt. Use `mysqlbinlog --read-from-remote-server` against the server to obtain plaintext.
 - Machine-oriented output: JSON Lines / CSV with one record per event, and row images that distinguish absent columns from SQL NULL; suitable for piping and scripting rather than mysqlbinlog's SQL replay output.
 - Feature subset: range filters are simpler (position windows filter rather than stop reading, datetime bounds are inclusive on both ends, and GTID selection is exact-match per event rather than per transaction), there is no replay-statement generation, Rotate is not followed, and transactions inside a compressed payload are not decompressed into replayable SQL.
-- Verification behavior: CRC32 checksums are verified per event, and hostile event headers and table-map metadata are pre-validated fail-closed; `partial_update_rows` exposes only the before image.
+- Verification behavior: CRC32 checksums are verified per event, and hostile event headers and table-map metadata are pre-validated fail-closed; `partial_update_rows` decodes the before image and applies the JSON-diff after image against it.
 
 ## Use as a Rust library
 
@@ -288,7 +288,7 @@ In another project's `Cargo.toml`, reference the source using the appropriate pa
 
 ```toml
 [dependencies]
-binlog-inspect = { path = "../binlog-inspect" }
+binlog-inspect = "0.4"        # or { path = "../binlog-inspect" } for a checkout
 serde_json = "1"
 ```
 
@@ -337,4 +337,4 @@ Key points:
 - `filter::EventFilter`: combined filtering with `kinds: HashSet<EventType>` and `tables: HashSet<(String, String)>`; `keep(&event)` decides.
 - The `formatter` module: the `Formatter` trait writes to a `&mut dyn Write` and returns `Result<bool, FormatterError>` (whether the event produced output); `JsonLinesFormatter`, `TextFormatter` and `CsvFormatter` are provided (`header()` returns the CSV header).
 
-Network downloading is implemented in the CLI and is not a public library API. See [execution and validation](../EXECUTION.md) for development checks and the scope of real-sample validation, and [design](../DESIGN.md) for further details (both in Chinese).
+Network downloading is implemented in the CLI and is not a public library API. See [execution and validation](../EXECUTION.md) for development checks and the scope of real-sample validation, and [design](../DESIGN.md) for further details.

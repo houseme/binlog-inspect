@@ -13,7 +13,7 @@ English | [简体中文](README.zh-CN.md)
 ## Features
 
 - Read one or more local binlogs, or standard input with `-`; download HTTP(S) files with the optional `remote` feature.
-- Full event-type classification (27 types): typed decoding of format_description, table_map, query, xid, gtid (tagged, `uuid:tag:gno`), anonymous_gtid, previous_gtids, rotate, stop, rows_query, incident, intvar, partial_update_rows (before images) and write/update/delete row events; named but undecoded events retain their type and `raw_len`.
+- Full event-type classification (27 types): typed decoding of format_description, table_map, query, xid, gtid (tagged, `uuid:tag:gno`), anonymous_gtid, previous_gtids, rotate, stop, rows_query, incident, intvar, partial_update_rows (before images with applied JSON diffs) and write/update/delete row events; named but undecoded events retain their type and `raw_len`.
 - Row images preserve column positions and distinguish absent columns from SQL NULL, with MySQL column type and signedness for numerics.
 - Filter by event type, `database.table`, byte-offset ranges (`--start-position`/`--stop-position`), timestamp ranges (`--start-datetime`/`--stop-datetime`) and exact GTIDs (`--include-gtid`), with before/after row images.
 - `--stats` prints one JSON summary (files, events, bytes, transactions, per-type and per-table counts, errors); `--completions` generates shell completion scripts.
@@ -55,6 +55,8 @@ Enable the optional feature for remote downloads:
 cargo run --locked --features remote -- --url https://example.com/mysql-bin.000001
 ```
 
+<a id="rust-toolchain-compatibility" name="rust-toolchain-compatibility"></a>
+
 ## Rust toolchain compatibility
 
 Requires a current Rust stable toolchain. The project uses the Rust 2024 edition; a minimum supported version has not been verified, so build with the latest stable toolchain.
@@ -73,8 +75,8 @@ Requires a current Rust stable toolchain. The project uses the Rust 2024 edition
 ## Documentation and development
 
 - [English usage guide](docs/USAGE.en.md) | [中文使用文档](docs/USAGE.zh-CN.md)
-- [Design](DESIGN.md) (Chinese); [build and validation notes](EXECUTION.md) (Chinese)
-- [ROADMAP](ROADMAP.md) (Chinese); [CHANGELOG](CHANGELOG.md)
+- [Design](DESIGN.md); [build and validation notes](EXECUTION.md)
+- [ROADMAP](ROADMAP.md); [CHANGELOG](CHANGELOG.md)
 
 ```sh
 cargo clippy --locked --all-targets -- -D warnings
