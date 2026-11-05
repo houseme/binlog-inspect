@@ -4,7 +4,7 @@
 //! Streaming inspection of plaintext MySQL binary logs.
 //!
 //! The crate parses a binlog one event at a time into a stable event model
-//! ([`parser::ParsedEvent`]) that is independent of the underlying binlog
+//! ([`event::ParsedEvent`]) that is independent of the underlying binlog
 //! library, so CLI output and library consumers never see raw library types.
 //!
 //! # Guarantees
