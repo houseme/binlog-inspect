@@ -2,7 +2,7 @@
 
 Based on the conclusions of three independent expert reviews dated 2026-11-05 (binlog protocol correctness / Rust engineering quality / documentation & UX). Every item includes acceptance criteria; the "Contract" section is the unified API specification for the parallel implementations, and implementations must conform to it.
 
-Status markers: `[done W1]` implemented in the first batch, `[done W2]` implemented in the second batch, `[pending user decision]` waiting on the user, `[backlog]` not scheduled.
+Status markers: `[done W1]` implemented in the first batch, `[done W2]` implemented in the second batch, `[done W3]` implemented in the third batch, `[W4]` fourth batch (2026-11-06 expert re-review), `[pending user decision]` waiting on the user, `[backlog]` not scheduled.
 
 ## R. Correctness Fixes (P0/P1)
 
@@ -84,6 +84,40 @@ Status markers: `[done W1]` implemented in the first batch, `[done W2]` implemen
 - **R36 [done W3] Tolerance policy**: a row event may declare fewer columns than the table map (missing tail columns render as `absent`); declaring more is still an error.
 - **R37 [partially done W3] The CLI layer moved behind a default-on `cli` feature** (clap, clap_complete, jiff, anyhow; binary declares `required-features = ["cli"]`). MSRV verification / rust-toolchain pinning remains [backlog].
 - **R38 [partially done W3] `deny.toml` added, and `cargo deny check` (advisories, licenses, bans, sources) runs in the audit workflow** on a daily schedule and on manual dispatch, alongside the RustSec advisory scan; the virtual workspace lib/bin split remains [backlog].
+- **R39 [W4] JSON value hardening.**
+  Findings A1/A2/A4/A6/A7 of the 2026-11-06 protocol re-review.
+  - Opaque jsonb members (`NEWDECIMAL`, DATE/TIME/DATETIME opaques — what MySQL writes for decimal literals or DECIMAL column values inside JSON) currently fail the whole file via `serde_json::Value::try_from(jsonb)`; decode through the library's `JsonDom` path instead (or per-cell loss marking), never failing the event on legitimate data.
+  - Cap jsonb nesting depth (MySQL's own limit is 100) during conversion and return `InvalidData` on deeper hostile input — a depth-60k fixture currently aborts the process (stack overflow), violating fail-closed.
+  - Pin the stripped-table-map checksum path with a test: flipping a byte inside a PARTIAL_JSON TLV of a checksummed table map must yield "event checksum mismatch" even though the library never sees those bytes.
+  - Document and pin the JSON-diff edge-case semantics (object REPLACE as upsert, array INSERT at index ≤ len) with a comment referencing `sql/json_diff.cc` behavior.
+  Acceptance: a fixture with an opaque-NEWDECIMAL JSON member decodes and the file's event count is intact; a depth-60k jsonb fixture yields `InvalidData` with an offset, not an abort; the corrupted-TLV checksum test fails with the documented message.
+- **R40 [W4] CLI correctness and packaging hygiene.**
+  Findings B1/B6/B7/B10 of the 2026-11-06 engineering re-review.
+  - Broken-pipe exit 0 must hold for every write path: `FormatterError::Json(serde_json::Error)` wraps the io error one level down, so `is_broken_pipe` misses it (`serde_json::Error::io_error_kind()`); `binlog-inspect big.binlog | head -c 100` currently exits 1.
+  - Drop the unused `clap` dev-dependency; the `required-features = ["cli"]` on the test targets is the correct mechanism.
+  - `remote` is a CLI-layer feature: declare `remote = ["cli", …]` so the combination `--no-default-features --features remote` still builds the binary.
+  - tests/remote.rs: a response with `Content-Length` larger than the body deadlocks until the 30 s drain bound; close the write side (or skip the wait) for known-truncated responses so the suite runs fast deterministically.
+  Acceptance: a large-output piped-into-`head` test exits 0; `cargo test --locked --no-default-features --features remote` builds the binary; the remote suite has no 30 s stall.
+- **R41 [W4] V1 row-event labeling consistency.**
+  Finding A3. Codes 23–25 (`WRITE/UPDATE/DELETE_ROWS_EVENT_V1`, MySQL 5.5 era) are decoded as full row payloads by the library but labeled `EventType::Unknown` — `event_type=unknown` with `payload.kind=rows`. The pre-GA codes are 20–22 (which stay `Unknown{raw_len}`); correct the "pre-GA" naming wherever it appears. Map 23–25 onto `WriteRows`/`UpdateRows`/`DeleteRows`.
+  Acceptance: a code-23 fixture emits `event_type=write_rows` with a decoded row payload; `--events write_rows` selects it; DESIGN/USAGE no longer call 23–25 pre-GA.
+- **R42 [W4] Hot-path performance pass.**
+  Findings B12/B13/B14. `signedness()` re-serializes the whole table map for every row event — cache it per table id (invalidate on re-registration; correctness first, benchmarks optional). `apply_pair` matches pending JSON cells against before columns with `Vec::find` (O(columns²) on hostile input) — both images are in table-column order, so a linear merge suffices. `Stats::record` allocates `format!("{db}.{t}")` per row event — reuse a scratch String.
+  Acceptance: all existing tests pass unchanged; a micro-benchmark or before/after timing shows no regression; behavior (JSON output) is byte-identical.
+- **R43 [W4] CI and packaging hardening.**
+  Findings B5/B8/B9/B11/B15.
+  - True MSRV is **1.88** (let-chains; edition 2024 alone would allow 1.85): verify by building with a 1.88 toolchain, then set `rust-version = "1.88"` and add a CI job pinned to 1.88 (closes the R37 remainder). If the toolchain cannot be installed in the implementing environment, do not claim the version — leave `rust-version` unset and report.
+  - The lint job gains `cargo clippy --locked --all-targets --no-default-features -- -D warnings` and the matrix gains `--no-default-features --features remote`.
+  - Pin third-party actions by full commit SHA (R24 policy) where the SHA can be resolved; keep version comments for dependabot.
+  - `.crate` content: exclude internal-only files (AGENT.md, EXECUTION.md, ROADMAP.md, `.github/`) via `package.exclude`; CHANGELOG.md and DESIGN.md stay.
+  - Regression tests: the 100-entry advisory-warning cap; `ParserError` messages carry the file offset.
+  Acceptance: CI matrix covers the three feature combinations with clippy and test; the two regression tests are in place.
+- **R44 [W4] Documentation truth pass.**
+  Findings C1–C12. The USAGE `--events` tables and the `EventType::PartialUpdateRows` rustdoc still claim the after image is "not decoded" (false since R33); stale "(Chinese)" markers in README.en/USAGE; DESIGN's verification-strategy clippy wording; the Contract section predates R26/R33 and must be annotated as the historical batch-1 spec; USAGE library section needs the crates.io dependency form; CHANGELOG `[0.3.0]`/`[0.2.0]`/`[0.1.0]` headings lack link definitions (drop the brackets — no tags exist for them); R23's version marker; explicit toolchain anchor in README.md; `--events` table ordering.
+  Acceptance: every documented statement matches behavior; the docs build clean; bilingual parity holds.
+- **R45 [W5 candidate] Error-semver pass for 0.5.0**: structured `ParserError` variants (at least `Checksum`) and `#[non_exhaustive]` on the public error/payload enums — decided once while the API is young; a breaking change by design.
+- **R46 [W5 candidate] Streaming TransactionPayload decoding**: iterator/callback API instead of buffering all inner events (~55M minimal events from one 64 MiB payload today).
+- **R47 [W5 candidate] Fuzz/property harness** over the hand-written wire-format mirrors (previous-GTIDs walk, table-map TLV prevalidation, payload-header prevalidation, jsonb conversion).
 
 ## Contract: API Specification for the First Parallel Implementation Batch
 
