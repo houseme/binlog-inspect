@@ -507,18 +507,62 @@ fn drain_request(stream: &mut std::net::TcpStream) {
     }
 }
 
+/// Runs the CLI against a freshly served loopback URL, retrying a few times.
+///
+/// Windows runners occasionally stall the very first outbound connection of
+/// a freshly linked unsigned binary (real-time scanner), so one failed
+/// attempt is retried on a new port. Returns the last output plus the server
+/// thread's panic message, if its accept deadline expired without ever
+/// seeing a connection — that combination is the diagnostic.
+#[cfg(feature = "remote")]
+fn download_with_retry(
+    extra_args: &[&str],
+    response: Vec<u8>,
+) -> (std::process::Output, Option<String>) {
+    const ATTEMPTS: usize = 3;
+    let mut output = None;
+    let mut server_panic = None;
+    for attempt in 0..ATTEMPTS {
+        let (url, server) = serve_hardened(response.clone());
+        let out = Command::new(env!("CARGO_BIN_EXE_binlog-inspect"))
+            .args(["--url", &url])
+            .args(extra_args)
+            .output()
+            .unwrap();
+        let joined = server.join();
+        // The server panics when the child never connected within its
+        // deadline; keep that message as diagnostic context instead of
+        // failing the test before the child's own stderr is examined.
+        server_panic = joined.err().and_then(|payload| {
+            payload
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+        });
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let connected = !stderr.contains("HTTP download failed") && !stderr.contains("timed out");
+        output = Some(out);
+        if connected || attempt + 1 == ATTEMPTS {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(3));
+    }
+    (output.unwrap(), server_panic)
+}
+
 #[cfg(feature = "remote")]
 #[test]
 fn remote_download_and_encrypted_rejection() {
-    let (url, server) = serve_hardened(b"\xfdbin".to_vec());
-    let output = Command::new(env!("CARGO_BIN_EXE_binlog-inspect"))
-        .args(["--url", &url])
-        .output()
-        .unwrap();
-    server.join().unwrap();
+    let (output, server_panic) = download_with_retry(&[], b"\xfdbin".to_vec());
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("encrypted binlog"), "{stderr}");
+    let server_note = server_panic
+        .map(|message| format!(" (server: {message})"))
+        .unwrap_or_default();
+    assert!(
+        stderr.contains("encrypted binlog"),
+        "server{server_note}: {stderr}"
+    );
 }
 
 #[test]
@@ -604,17 +648,12 @@ fn csv_quotes_row_values_and_table_filter() {
 fn remote_plaintext_is_parsed() {
     let mut body = b"\xfebin".to_vec();
     body.extend(event(16, &55u64.to_le_bytes()));
-    let (url, server) = serve_hardened(body);
-    let output = Command::new(env!("CARGO_BIN_EXE_binlog-inspect"))
-        .args(["--url", &url])
-        .output()
-        .unwrap();
-    server.join().unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    let (output, server_panic) = download_with_retry(&[], body);
+    let server_note = server_panic
+        .map(|message| format!(" (server: {message})"))
+        .unwrap_or_default();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "server{server_note}: {stderr}");
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value["payload"]["xid"], 55);
 }
