@@ -13,13 +13,18 @@ Third batch: partial JSON diff application, backlogged correctness and packaging
 - **Partial JSON updates (WL#2955) are fully decoded.** Binlogs produced with `binlog_row_value_options=PARTIAL_JSON` previously failed at the first row event because their table maps carry optional metadata types 14/15 that the underlying library does not know; those TLVs are now accepted (and transparently stripped before the library parses the table map, after checksum verification on the original bytes), and the JSON diff sequences in `partial_update_rows` after images are applied against the before image's JSON value: an applied column renders as a full JSON document (`"type": "json"`), a diff that cannot be applied renders as the new loss-marking value type `"type": "partial_json"` carrying the preserved diffs and the reason. New payload key `payload.after` on `partial_update_rows` (one applied row image or `null` per row, alongside the existing `before`).
 - Advisory `log_pos` continuity checking (R35): a header `log_pos` that does not land right after its event (a sign of tampering or splicing) prints a non-fatal `warning: log_pos … does not match …` line on stderr; parsing continues and the exit status is unaffected. The warning buffer is capped, and `BinlogParser::take_warnings` exposes it to library callers.
 - Column-count tolerance (R36), mirroring the MySQL applier: a row event may declare fewer columns than its table map records (the table grew after the event was written); missing tail columns render as explicit `absent` entries instead of failing the file. A row event declaring more columns than the table map remains an error.
-- `deny.toml` for `cargo deny check` (license and duplicate-crate policy); advisory scanning already runs daily in CI.
+- `deny.toml` for `cargo deny check` (license and duplicate-crate policy); both the RustSec advisory scan and `cargo deny check` run on a daily schedule in CI.
 
 ### Changed
 
 - **Library breaking**: `EventPayload::PartialUpdateRows` gains an `after: Vec<Option<RowImage>>` field.
 - **Packaging**: the CLI layer (clap, completions, datetime parsing, anyhow) moved behind a default-on `cli` feature (R37); library consumers can use `default-features = false` to drop it. The binary declares `required-features = ["cli"]`, so `--no-default-features` checks the library alone.
 - The hand-rolled loopback HTTP test servers drain the request before responding, fixing a rare macOS RST flake in the download tests.
+
+### Fixed
+
+- The remote download's 1 MiB copy chunk is heap-allocated: as a stack array it overflowed the default 1 MiB main-thread stack on Windows, so every `--url` download aborted the process immediately before any network I/O (Linux and macOS have 8 MiB main stacks and were unaffected).
+- The loopback test servers clear the inherited `O_NONBLOCK` flag on accepted sockets (a BSD/macOS behavior) and bound their accept wait, so a client that never connects fails fast with its own stderr instead of hanging the suite.
 
 ## [0.3.0] - 2026-11-05
 
@@ -89,4 +94,5 @@ First batch of review fixes (event classification, CLI reliability and safety, p
 
 - Initial release: an offline MySQL binlog inspection CLI and library, with event-by-event parsing of plaintext binlogs, typed decoding of format description/table map/query/XID/GTID/rotate and row events, JSON Lines/text/CSV output, event and table filters, CRC32 checksum verification, explicit rejection of encrypted files, and HTTP(S) download via the `remote` feature.
 
-<!-- Version comparison links to be added once the repository URL is settled (ROADMAP R32). -->
+[Unreleased]: https://github.com/houseme/binlog-inspect/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/houseme/binlog-inspect/releases/tag/v0.4.0

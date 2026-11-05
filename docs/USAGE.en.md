@@ -4,12 +4,13 @@
 
 ## Install and build
 
-The project is not published on crates.io yet; build or install from source. The current Rust stable toolchain is required (the project uses the Rust 2024 edition; its minimum supported version has not been verified):
+Install from crates.io, or build and install from source. The current Rust stable toolchain is required (the project uses the Rust 2024 edition; its minimum supported version has not been verified):
 
 ```sh
-cargo install --path .        # installs into ~/.cargo/bin
-# or build inside the project only
-cargo build --locked --release
+cargo install binlog-inspect --locked   # from crates.io, into ~/.cargo/bin
+# or from a source checkout
+cargo install --path .                  # installs into ~/.cargo/bin
+cargo build --locked --release          # or build inside the project only
 ./target/release/binlog-inspect --help
 ```
 

@@ -4,12 +4,13 @@
 
 ## 安装与构建
 
-本项目尚未发布到 crates.io，需从源码构建或安装。需要当前 Rust stable 工具链（项目使用 Rust 2024 edition，最低支持版本尚未验证）：
+从 crates.io 安装，或从源码构建、安装。需要当前 Rust stable 工具链（项目使用 Rust 2024 edition，最低支持版本尚未验证）：
 
 ```sh
-cargo install --path .        # 安装到 ~/.cargo/bin
-# 或仅在项目内构建
-cargo build --locked --release
+cargo install binlog-inspect --locked   # 来自 crates.io，安装到 ~/.cargo/bin
+# 或在源码检出目录中
+cargo install --path .                  # 安装到 ~/.cargo/bin
+cargo build --locked --release          # 或仅在项目内构建
 ./target/release/binlog-inspect --help
 ```
 

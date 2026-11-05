@@ -23,7 +23,13 @@
 
 ## 安装与快速开始
 
-尚未发布到 crates.io，请从源码构建或安装：
+从 crates.io 安装（需要当前 Rust stable 工具链；项目使用 Rust 2024 edition，最低支持版本尚未验证）：
+
+```sh
+cargo install binlog-inspect --locked
+```
+
+或从源码构建、安装：
 
 ```sh
 cargo build --locked --release
@@ -69,7 +75,7 @@ cargo run --locked --features remote -- --url https://example.com/mysql-bin.0000
 ## 文档与开发
 
 - [中文使用文档](docs/USAGE.zh-CN.md) | [English usage guide](docs/USAGE.en.md)
-- [设计文档](DESIGN.md)；[构建与验证记录](EXECUTION.md)（中文）
+- [设计文档](DESIGN.md)；[构建与验证记录](EXECUTION.md)
 - [ROADMAP](ROADMAP.md)；[更新日志](CHANGELOG.md)
 
 ```sh

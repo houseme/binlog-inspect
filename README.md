@@ -23,7 +23,13 @@ English | [简体中文](README.zh-CN.md)
 
 ## Install and quick start
 
-It is not published on crates.io yet; build or install from source:
+Install from crates.io (requires a current Rust stable toolchain; the project uses the Rust 2024 edition and has no verified MSRV yet):
+
+```sh
+cargo install binlog-inspect --locked
+```
+
+Or build and install from source:
 
 ```sh
 cargo build --locked --release
