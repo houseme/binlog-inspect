@@ -202,8 +202,11 @@ pub enum EventPayload {
     },
     /// Partial update row event (WL#2955).
     ///
-    /// Only the before image is decoded: it is a full row image. The after
-    /// image is a JSON diff that is intentionally left undecoded.
+    /// The before image is a full row image. The after image is a sequence of
+    /// JSON diffs per JSON column, which is applied against the before value:
+    /// an applied column renders as [`CellValue::Json`] with the full new
+    /// document, and a diff that cannot be applied renders as
+    /// [`CellValue::PartialJson`] with the preserved diffs and the reason.
     PartialUpdateRows {
         /// Table identifier from the preceding table map event.
         table_id: u64,
@@ -213,6 +216,9 @@ pub enum EventPayload {
         table: String,
         /// Full before image per affected row; `None` when the image is absent.
         before: Vec<Option<RowImage>>,
+        /// After image per affected row with diffs applied; `None` when the
+        /// image is absent.
+        after: Vec<Option<RowImage>>,
     },
     /// A row event whose table map was not available.
     Unresolved {
@@ -334,7 +340,7 @@ pub struct ColumnValue {
 ///
 /// When deserializing, [`CellValue::Bytes`] expects the lowercase hexadecimal
 /// encoding produced by serialization; no character decoding is performed.
-#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub enum CellValue {
     /// Column omitted from this image.
@@ -385,6 +391,32 @@ pub enum CellValue {
     },
     /// Decoded full JSON value.
     Json(serde_json::Value),
+    /// JSON column whose after image is a sequence of binlog JSON diffs that
+    /// could not be applied to a before value; the raw diffs are preserved.
+    ///
+    /// A successful diff application renders as [`CellValue::Json`]; this
+    /// variant records the loss and why it happened.
+    PartialJson {
+        /// The recorded diffs in stream order.
+        diffs: Vec<JsonDiffRecord>,
+        /// Why the diffs could not be applied to the before value.
+        reason: String,
+    },
+}
+
+/// One recorded JSON diff of a partial JSON update (WL#2955).
+///
+/// Binlog JSON diffs describe a logical change to a JSON document; the `path`
+/// uses the MySQL JSON path text form (for example `$.a[2]`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct JsonDiffRecord {
+    /// MySQL JSON path of the change.
+    pub path: String,
+    /// Operation name: `"replace"`, `"insert"`, or `"remove"`.
+    pub operation: String,
+    /// New value carried by replace and insert operations; remove carries none.
+    pub value: Option<serde_json::Value>,
 }
 
 /// Signedness carried by the table map, or unknown when metadata was omitted.

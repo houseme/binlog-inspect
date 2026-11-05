@@ -209,6 +209,32 @@ impl<R: Read> BinlogParser<R> {
             if head[4] == 40 {
                 validate_transaction_payload_header(body)?;
             }
+            // Table maps of partial-JSON binlogs (WL#2955) carry optional
+            // metadata types the library's lazily iterated metadata rejects;
+            // those entries are stripped from the bytes the library parses,
+            // so the stored table map stays acceptable for every later row
+            // event. The strip runs after the prevalidation of the original
+            // bytes, and only for table maps.
+            let mut stripped_tlv_bytes = 0usize;
+            if head[4] == 19 {
+                let header_len = self.reader.get_fde().get_event_type_header_length(
+                    mysql_common::binlog::consts::EventType::TABLE_MAP_EVENT,
+                );
+                let ranges = crate::row_decode::unsupported_tlv_ranges(body, header_len)?
+                    .unwrap_or_default();
+                if !ranges.is_empty() {
+                    // The checksum must be verified on the original bytes:
+                    // stripping changes everything the library would hash.
+                    if self.checksum_len(head[4]) > 0 {
+                        verify_event_checksum(&self.buffer)?;
+                    }
+                    stripped_tlv_bytes = remove_ranges(&mut self.buffer, 19, &ranges);
+                    let new_size = u32::try_from(self.buffer.len()).map_err(|_| {
+                        io::Error::new(io::ErrorKind::InvalidData, "invalid event size")
+                    })?;
+                    self.buffer[9..13].copy_from_slice(&new_size.to_le_bytes());
+                }
+            }
             let Some(event) = self.reader.read(&mut Cursor::new(self.buffer.as_slice()))? else {
                 return Ok(None);
             };
@@ -216,7 +242,8 @@ impl<R: Read> BinlogParser<R> {
                 .footer()
                 .get_checksum_alg()
                 .map_err(|err| io::Error::new(io::ErrorKind::Unsupported, err))?;
-            if let (Some(checksum), Some(alg)) = (event.checksum(), checksum_algorithm)
+            if stripped_tlv_bytes == 0
+                && let (Some(checksum), Some(alg)) = (event.checksum(), checksum_algorithm)
                 && u32::from_le_bytes(checksum) != event.calc_checksum(alg)
             {
                 return Err(io::Error::new(
@@ -225,20 +252,21 @@ impl<R: Read> BinlogParser<R> {
                 ));
             }
             let h = event.header();
+            // The header `event_size` reflects the stripped bytes; the
+            // original size is what positions the stream and the output.
+            self.offset += u64::from(size);
             // Advisory only (R35): on a master-written file each header's
             // log_pos lands right after its event. A mismatch suggests
             // tampering or a spliced file but does not stop parsing; a zero
             // log_pos is how artificial events mark "no position".
             const WARNING_CAP: usize = 100;
             let log_pos = u64::from(h.log_pos());
-            let expected = offset + u64::from(h.event_size());
+            let expected = offset + u64::from(size);
             if log_pos != 0 && log_pos != expected && self.warnings.len() < WARNING_CAP {
                 self.warnings.push(format!(
-                    "log_pos {log_pos} does not match offset {offset} + event size {}",
-                    h.event_size()
+                    "log_pos {log_pos} does not match offset {offset} + event size {size}"
                 ));
             }
-            self.offset += u64::from(h.event_size());
             let raw = h.event_type_raw();
             let event_type = EventType::from_raw(raw);
             // The mapping is shared with the events decompressed out of a
@@ -254,7 +282,7 @@ impl<R: Read> BinlogParser<R> {
                 event_type,
                 event_type_code: raw,
                 server_id: h.server_id(),
-                event_size: h.event_size(),
+                event_size: size,
                 log_pos: h.log_pos(),
                 payload,
             }))
@@ -335,50 +363,66 @@ impl<R: Read> BinlogParser<R> {
             },
             Some(EventData::RowsEvent(RowsEventData::PartialUpdateRowsEvent(e))) => {
                 // Partial update rows (WL#2955): the before image is a full
-                // row image, the after image is a JSON diff. The JSON-diff
-                // after-image decode is intentionally never invoked; only
-                // the before image is surfaced.
+                // row image, the after image carries JSON diffs per JSON
+                // column. The pair decode applies each diff sequence against
+                // the before value; unappliable diffs surface as loss-marked
+                // PartialJson cells instead of failing the event.
                 let id = e.table_id();
                 match self.reader.get_tme(id) {
                     Some(map) => {
-                        if e.num_columns() != map.columns_count() {
+                        // Mirror the MySQL applier: a row event may declare
+                        // fewer columns than the table map records (the table
+                        // grew after the event was written), but never more.
+                        if e.num_columns() > map.columns_count() {
                             return Err(io::Error::new(
                                 io::ErrorKind::InvalidData,
-                                "row event column count does not match table map",
+                                "row event column count exceeds the table map",
                             ));
                         }
                         let n = usize::try_from(map.columns_count()).map_err(|_| {
                             io::Error::new(io::ErrorKind::InvalidData, "column count overflow")
                         })?;
+                        let declared = usize::try_from(e.num_columns()).map_err(|_| {
+                            io::Error::new(io::ErrorKind::InvalidData, "column count overflow")
+                        })?;
+                        let pad = |bits: Vec<bool>| {
+                            let mut bits = bits;
+                            bits.resize(n, false);
+                            bits
+                        };
                         let before_bitmap = Some(e.columns_before_image())
-                            .map(|bits| crate::row_decode::present_bits(bits.iter().by_vals(), n))
+                            .map(|bits| {
+                                crate::row_decode::present_bits(bits.iter().by_vals(), declared)
+                                    .map(pad)
+                            })
+                            .transpose()?;
+                        let after_bitmap = Some(e.columns_after_image())
+                            .map(|bits| {
+                                crate::row_decode::present_bits(bits.iter().by_vals(), declared)
+                                    .map(pad)
+                            })
                             .transpose()?;
                         let signedness = crate::row_decode::signedness(map)?;
                         let mut before = Vec::new();
+                        let mut after = Vec::new();
                         for row in e.rows(map) {
-                            let (before_row, _json_diff_after) = row?;
-                            before.push(
-                                before_row
-                                    .map(|r| {
-                                        crate::row_decode::decode_row(
-                                            &r,
-                                            before_bitmap.as_deref().ok_or_else(|| {
-                                                io::Error::new(
-                                                    io::ErrorKind::InvalidData,
-                                                    "missing before bitmap",
-                                                )
-                                            })?,
-                                            &signedness,
-                                        )
-                                    })
-                                    .transpose()?,
-                            );
+                            let (before_row, after_row) = row?;
+                            let (before_image, after_image) = crate::row_decode::decode_rows_pair(
+                                before_row.as_ref(),
+                                after_row.as_ref(),
+                                before_bitmap.as_deref(),
+                                after_bitmap.as_deref(),
+                                &signedness,
+                            )?;
+                            before.push(before_image);
+                            after.push(after_image);
                         }
                         EventPayload::PartialUpdateRows {
                             table_id: id,
                             database: map.database_name().into_owned(),
                             table: map.table_name().into_owned(),
                             before,
+                            after,
                         }
                     }
                     None => EventPayload::Unresolved { table_id: id },
@@ -387,57 +431,55 @@ impl<R: Read> BinlogParser<R> {
             Some(EventData::RowsEvent(e)) => {
                 let id = e.table_id();
                 if let Some(map) = self.reader.get_tme(id) {
-                    if e.num_columns() != map.columns_count() {
+                    // See the PartialUpdateRows arm: a row event may
+                    // declare fewer columns than the table map, never
+                    // more; missing tail columns render as absent.
+                    if e.num_columns() > map.columns_count() {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
-                            "row event column count does not match table map",
+                            "row event column count exceeds the table map",
                         ));
                     }
                     let n = usize::try_from(map.columns_count()).map_err(|_| {
                         io::Error::new(io::ErrorKind::InvalidData, "column count overflow")
                     })?;
+                    let declared = usize::try_from(e.num_columns()).map_err(|_| {
+                        io::Error::new(io::ErrorKind::InvalidData, "column count overflow")
+                    })?;
+                    let pad = |bits: Vec<bool>| {
+                        let mut bits = bits;
+                        bits.resize(n, false);
+                        bits
+                    };
                     let before_bitmap = e
                         .columns_before_image()
-                        .map(|bits| crate::row_decode::present_bits(bits.iter().by_vals(), n))
+                        .map(|bits| {
+                            crate::row_decode::present_bits(bits.iter().by_vals(), declared)
+                                .map(pad)
+                        })
                         .transpose()?;
                     let after_bitmap = e
                         .columns_after_image()
-                        .map(|bits| crate::row_decode::present_bits(bits.iter().by_vals(), n))
+                        .map(|bits| {
+                            crate::row_decode::present_bits(bits.iter().by_vals(), declared)
+                                .map(pad)
+                        })
                         .transpose()?;
                     let signedness = crate::row_decode::signedness(map)?;
                     let mut changes = Vec::new();
                     for row in e.rows(map) {
-                        let (before, after) = row?;
-                        changes.push(RowChange {
-                            before: before
-                                .map(|r| {
-                                    crate::row_decode::decode_row(
-                                        &r,
-                                        before_bitmap.as_deref().ok_or_else(|| {
-                                            io::Error::new(
-                                                io::ErrorKind::InvalidData,
-                                                "missing before bitmap",
-                                            )
-                                        })?,
-                                        &signedness,
-                                    )
-                                })
-                                .transpose()?,
-                            after: after
-                                .map(|r| {
-                                    crate::row_decode::decode_row(
-                                        &r,
-                                        after_bitmap.as_deref().ok_or_else(|| {
-                                            io::Error::new(
-                                                io::ErrorKind::InvalidData,
-                                                "missing after bitmap",
-                                            )
-                                        })?,
-                                        &signedness,
-                                    )
-                                })
-                                .transpose()?,
-                        });
+                        let (before_row, after_row) = row?;
+                        // The pair decode applies partial-JSON after images
+                        // (WL#2955) to their before values; images without
+                        // diffs decode exactly like single images.
+                        let (before, after) = crate::row_decode::decode_rows_pair(
+                            before_row.as_ref(),
+                            after_row.as_ref(),
+                            before_bitmap.as_deref(),
+                            after_bitmap.as_deref(),
+                            &signedness,
+                        )?;
+                        changes.push(RowChange { before, after });
                     }
                     EventPayload::Rows {
                         table_id: id,
@@ -524,7 +566,8 @@ impl<R: Read> BinlogParser<R> {
                 event_type: EventType::from_raw(h.event_type_raw()),
                 event_type_code: h.event_type_raw(),
                 server_id,
-                event_size: h.event_size(),
+                // The declared size, not the stripped one the library saw.
+                event_size: stream.last_event_size(),
                 log_pos: h.log_pos(),
                 payload: self.payload_for(&inner)?,
             });
@@ -565,6 +608,9 @@ struct PayloadStream<'a> {
     /// Post-header length of table map events per the active format
     /// description, needed to prevalidate inner table maps.
     tme_header_len: u8,
+    /// Declared size of the most recently buffered inner event, before any
+    /// partial-JSON metadata stripping changed the buffered bytes.
+    last_event_size: u32,
 }
 
 impl<'a> PayloadStream<'a> {
@@ -583,6 +629,7 @@ impl<'a> PayloadStream<'a> {
             limit,
             max_event_size,
             tme_header_len,
+            last_event_size: 0,
         }
     }
 
@@ -590,6 +637,12 @@ impl<'a> PayloadStream<'a> {
     /// buffered inner event.
     fn last_event_offset(&self) -> u64 {
         self.event_start
+    }
+
+    /// Declared size (header included) of the most recently buffered inner
+    /// event, before any partial-JSON metadata stripping.
+    fn last_event_size(&self) -> u32 {
+        self.last_event_size
     }
 
     /// Buffers the next inner event. Returns `false` at a clean end of the
@@ -664,7 +717,29 @@ impl<'a> PayloadStream<'a> {
         if raw == 35 {
             validate_previous_gtids(body)?;
         }
+        // The offsets and sizes reported for inner events always refer to the
+        // original decompressed stream, including stripped bytes.
         self.event_start = self.position;
+        self.last_event_size = u32::try_from(size)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid inner event size"))?;
+        if raw == 19 {
+            // Inner table maps are stripped exactly like outer ones: the
+            // library's metadata iterator would reject the partial-JSON
+            // entries when decoding later row events. The inner stream
+            // carries no checksums (WL#3549), so nothing needs re-verification.
+            let ranges = crate::row_decode::unsupported_tlv_ranges(body, self.tme_header_len)?
+                .unwrap_or_default();
+            if !ranges.is_empty() {
+                let removed = remove_ranges(&mut self.pending, header.len(), &ranges);
+                let new_size = u32::try_from(self.pending.len()).map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid inner event size")
+                })?;
+                self.pending[9..13].copy_from_slice(&new_size.to_le_bytes());
+                // The stripped bytes never reach the reader, so the position
+                // is advanced here to keep the declared-size accounting exact.
+                self.position += u64::try_from(removed).unwrap_or(u64::MAX);
+            }
+        }
         Ok(true)
     }
 }
@@ -981,6 +1056,110 @@ fn read_strict_lenenc(buf: &[u8], pos: &mut usize) -> Option<u64> {
     let mut bytes = [0u8; 8];
     bytes[..extra].copy_from_slice(raw);
     Some(u64::from_le_bytes(bytes))
+}
+
+/// CRC-32 (IEEE 802.3, reflected) used for binlog event checksums.
+struct Crc32 {
+    state: u32,
+}
+
+impl Crc32 {
+    fn new() -> Self {
+        Self { state: !0 }
+    }
+
+    fn update(&mut self, data: &[u8]) {
+        for &byte in data {
+            let index = ((self.state ^ u32::from(byte)) & 0xff) as usize;
+            self.state = CRC32_TABLE[index] ^ (self.state >> 8);
+        }
+    }
+
+    fn finalize(self) -> u32 {
+        !self.state
+    }
+}
+
+/// Lookup table for [`Crc32`], built at compile time.
+const CRC32_TABLE: [u32; 256] = {
+    const fn build() -> [u32; 256] {
+        let mut table = [0u32; 256];
+        let mut i = 0;
+        while i < 256 {
+            let mut value = i as u32;
+            let mut bit = 0;
+            while bit < 8 {
+                value = if value & 1 != 0 {
+                    0xedb88320 ^ (value >> 1)
+                } else {
+                    value >> 1
+                };
+                bit += 1;
+            }
+            table[i] = value;
+            i += 1;
+        }
+        table
+    }
+    build()
+};
+
+/// Verifies the CRC32 checksum of an event directly on its raw bytes.
+///
+/// This mirrors the library's `Event::calc_checksum` (header with the
+/// "binlog in use" flag cleared, then the body). It is needed when a table
+/// map event body is modified by stripping before the library parses it: the
+/// library's own verification would then hash the modified bytes against the
+/// original checksum.
+fn verify_event_checksum(buffer: &[u8]) -> io::Result<()> {
+    // `EventFlags::LOG_EVENT_BINLOG_IN_USE_F` (0x0001) is cleared before the
+    // checksum is computed, both by the server when writing and by the
+    // library when verifying.
+    const BINLOG_IN_USE_FLAG: u16 = 0x0001;
+    let Some(body_len) = buffer.len().checked_sub(4) else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "short checksummed event",
+        ));
+    };
+    let mut header = [0u8; 19];
+    header.copy_from_slice(&buffer[..19]);
+    let mut flags = u16::from_le_bytes([header[17], header[18]]);
+    if flags & BINLOG_IN_USE_FLAG != 0 {
+        flags &= !BINLOG_IN_USE_FLAG;
+        header[17..19].copy_from_slice(&flags.to_le_bytes());
+    }
+    let mut crc = Crc32::new();
+    crc.update(&header);
+    crc.update(&buffer[19..body_len]);
+    let recorded = u32::from_le_bytes(buffer[body_len..].try_into().unwrap());
+    if crc.finalize() != recorded {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "event checksum mismatch",
+        ));
+    }
+    Ok(())
+}
+
+/// Removes the given byte ranges (relative to `base`) from `buffer` in place,
+/// returning the number of bytes removed. Ranges must be ascending and
+/// non-overlapping, which the TLV scan guarantees.
+fn remove_ranges(buffer: &mut Vec<u8>, base: usize, ranges: &[std::ops::Range<usize>]) -> usize {
+    let mut removed = 0;
+    let mut read = base;
+    let mut write = base;
+    for range in ranges {
+        let start = base + range.start;
+        let end = base + range.end;
+        buffer.copy_within(read..start, write);
+        write += start - read;
+        read = end;
+        removed += end - start;
+    }
+    buffer.copy_within(read.., write);
+    buffer.truncate(buffer.len() - removed);
+    removed
 }
 
 #[cfg(test)]

@@ -355,6 +355,73 @@ fn hostile_table_map_metadata_rejects_cleanly() {
     assert!(outcome.is_ok(), "hostile table map metadata caused a panic");
 }
 
+/// Hostile partial-JSON optional metadata (types 14 and 15) in the
+/// panic-corpus style: inflated declared lengths must return a clean
+/// `InvalidData` error and never abort the process, while well-formed
+/// entries of the same types pass the pre-validation walk.
+#[test]
+fn partial_json_table_map_metadata_follows_the_tolerance_policy() {
+    let table_map_body = |tlv: &[u8]| {
+        let mut body = vec![1, 0, 0, 0, 0, 0]; // table id
+        body.extend([0, 0]); // flags
+        body.extend([1, b'd', 0]); // database name
+        body.extend([1, b't', 0]); // table name
+        body.push(1); // one column
+        body.push(0x03); // LONG
+        body.push(0); // empty column metadata
+        body.push(1); // null bitmap
+        body.extend_from_slice(tlv);
+        body
+    };
+    for (name, tlv) in [
+        ("hostile partial json update length", {
+            let mut tlv = vec![14u8, 0xfe];
+            tlv.extend_from_slice(&u64::MAX.to_le_bytes());
+            tlv
+        }),
+        ("hostile updated column types length", {
+            let mut tlv = vec![15u8, 0xfd];
+            tlv.extend_from_slice(&[0xff; 3]);
+            tlv
+        }),
+    ] {
+        let mut bytes = b"\xfebin".to_vec();
+        bytes.extend(format_description(1));
+        bytes.extend(raw_event(19, &table_map_body(&tlv), true));
+        let f = file(&bytes);
+        let outcome = std::panic::catch_unwind(move || {
+            let mut parser = BinlogParser::open(f.path()).unwrap();
+            let mut events = parser.events();
+            assert!(events.next().unwrap().is_ok()); // format description
+            let err = events.next().unwrap().unwrap_err();
+            assert!(
+                err.to_string().contains("exceeds table map bounds"),
+                "unexpected error for {name}: {err}"
+            );
+        });
+        assert!(outcome.is_ok(), "{name} caused a panic");
+    }
+
+    // Well-formed partial-JSON entries are accepted by the walk (they are
+    // stripped from the library's view later).
+    let mut bytes = b"\xfebin".to_vec();
+    bytes.extend(format_description(1));
+    bytes.extend(raw_event(
+        19,
+        &table_map_body(&[14, 1, 0x80, 15, 2, 0x03, 0x00]),
+        true,
+    ));
+    let f = file(&bytes);
+    let mut parser = BinlogParser::open(f.path()).unwrap();
+    let event = parser.events().next().unwrap().unwrap();
+    assert!(matches!(
+        event.payload,
+        EventPayload::FormatDescription { .. }
+    ));
+    let event = parser.events().next().unwrap().unwrap();
+    assert!(matches!(event.payload, EventPayload::TableMap { .. }));
+}
+
 #[test]
 fn oversized_event_is_rejected() {
     let mut bytes = b"\xfebin".to_vec();

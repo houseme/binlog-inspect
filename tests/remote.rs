@@ -43,7 +43,7 @@ fn output_is_created_and_existing_input_is_never_overwritten() {
 #[cfg(feature = "remote")]
 fn serve_once(response: &'static [u8]) -> (String, std::thread::JoinHandle<()>) {
     use std::{
-        io::{Read, Write},
+        io::Write,
         net::TcpListener,
         time::{Duration, Instant},
     };
@@ -58,8 +58,7 @@ fn serve_once(response: &'static [u8]) -> (String, std::thread::JoinHandle<()>) 
                     stream
                         .set_read_timeout(Some(Duration::from_secs(2)))
                         .unwrap();
-                    let mut buf = [0; 2048];
-                    let _ = stream.read(&mut buf);
+                    drain_request(&mut stream);
                     let _ = stream.write_all(response);
                     break;
                 }
@@ -79,7 +78,7 @@ fn serve_once(response: &'static [u8]) -> (String, std::thread::JoinHandle<()>) 
 #[cfg(feature = "remote")]
 fn serve_bytes(body: &'static [u8]) -> (String, std::thread::JoinHandle<()>) {
     use std::{
-        io::{Read, Write},
+        io::Write,
         net::TcpListener,
         time::{Duration, Instant},
     };
@@ -94,8 +93,7 @@ fn serve_bytes(body: &'static [u8]) -> (String, std::thread::JoinHandle<()>) {
                     stream
                         .set_read_timeout(Some(Duration::from_secs(2)))
                         .unwrap();
-                    let mut buf = [0; 2048];
-                    let _ = stream.read(&mut buf);
+                    drain_request(&mut stream);
                     let _ = stream.write_all(
                         format!(
                             "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -117,6 +115,31 @@ fn serve_bytes(body: &'static [u8]) -> (String, std::thread::JoinHandle<()>) {
         format!("http://{addr}/file?token=secret-test-value"),
         handle,
     )
+}
+
+/// Reads until the end of the request headers before responding.
+///
+/// A single `read` may return early and leave request bytes unread; closing
+/// the socket with unread data sends an RST that can clobber the client's
+/// in-flight body read (a real macOS loopback flake), so drain the GET
+/// request first — it has no body, so the header terminator is the end.
+#[cfg(feature = "remote")]
+fn drain_request(stream: &mut std::net::TcpStream) {
+    use std::io::Read;
+    let mut received = Vec::new();
+    let mut chunk = [0; 2048];
+    loop {
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                received.extend_from_slice(&chunk[..n]);
+                if received.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
 }
 
 #[cfg(feature = "remote")]

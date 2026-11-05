@@ -583,6 +583,66 @@ fn table_map_and_write_rows_are_decoded() {
 }
 
 #[test]
+fn row_declaring_fewer_columns_renders_missing_tail_absent() {
+    // R36 tolerance, mirroring the MySQL applier: the table map records two
+    // columns while the row event declares only the first one (the table
+    // grew after the event was written). The missing tail column renders as
+    // an explicit absent entry instead of failing the file.
+    let mut map = vec![1, 0, 0, 0, 0, 0, 0, 0];
+    map.extend_from_slice(b"\x03app\0\x01t\0\x02\x03\x03\x00\x00");
+    let mut row = vec![1, 0, 0, 0, 0, 0, 0, 0];
+    row.extend_from_slice(&[2, 0, 1, 1, 0, 42, 0, 0, 0]);
+    let mut bytes = b"\xfebin".to_vec();
+    bytes.extend(event(19, &map));
+    bytes.extend(event(30, &row));
+    let f = file(&bytes);
+    let mut p = BinlogParser::open(f.path()).unwrap();
+    let mut events = p.events();
+    assert!(events.next().unwrap().is_ok());
+    let decoded = events.next().unwrap().unwrap();
+    let value = serde_json::to_value(decoded).unwrap();
+    let columns = &value["payload"]["changes"][0]["after"]["columns"];
+    assert_eq!(columns.as_array().unwrap().len(), 2);
+    assert_eq!(columns[0]["value"]["value"], 42);
+    assert_eq!(columns[1]["value"]["type"], "absent");
+}
+
+#[test]
+fn mismatched_log_pos_is_reported_as_an_advisory_warning() {
+    // R35: a header log_pos that does not land right after its event is a
+    // non-fatal warning; parsing continues and the exit status stays 0.
+    let body = 123u64.to_le_bytes().to_vec();
+    let size = 19 + body.len() as u32;
+    let good = event(16, &body);
+    let mut bad = good.clone();
+    let mut tail = event(16, &456u64.to_le_bytes());
+    // Header layout: ts(0..4) code(4) sid(5..9) size(9..13) log_pos(13..17)
+    // flags(17..19). The helper writes every log_pos as `4 + size`, so fix
+    // the tail event's log_pos to its real end (offset 58 + size) first, then
+    // break only the middle event's log_pos with an impossible 999.
+    tail[13..17].copy_from_slice(&(58u32 + size).to_le_bytes());
+    bad[13..17].copy_from_slice(&999u32.to_le_bytes());
+    let mut bytes = b"\xfebin".to_vec();
+    bytes.extend(good);
+    bytes.extend(bad);
+    bytes.extend(tail);
+    let f = file(&bytes);
+    let path = f.path().to_str().unwrap();
+    let out = run_cli(&[path]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("log_pos 999"), "{stderr}");
+    // Exactly one warning for the one broken event; the stream continued.
+    assert_eq!(stderr.matches("warning:").count(), 1);
+    assert_eq!(String::from_utf8_lossy(&out.stdout).lines().count(), 3);
+}
+
+#[test]
 fn row_column_count_must_match_table_map() {
     let mut map = vec![1, 0, 0, 0, 0, 0, 0, 0];
     map.extend_from_slice(b"\x03app\0\x01t\0\x01\x03\x00\x00");

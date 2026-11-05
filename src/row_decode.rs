@@ -10,25 +10,31 @@
 //! library's wire format exactly so no valid table map is rejected.
 use crate::event::{CellValue, ColumnValue, RowImage, Signedness};
 use mysql_common::{
-    binlog::{
-        events::{OptionalMetaExtractor, TableMapEvent},
-        row::BinlogRow,
-        value::BinlogValue,
-    },
+    binlog::{events::TableMapEvent, row::BinlogRow, value::BinlogValue},
     constants::ColumnType,
+    proto::MySerialize,
     value::Value,
 };
 use std::io;
 
-/// Optional metadata field types (TLV type codes) understood by the library.
+/// Optional metadata field types (TLV type codes) accepted by the
+/// pre-validation walk.
 ///
-/// Anything else is rejected by the library itself; mirroring the set keeps
-/// this pre-validation from rejecting files the library would accept.
-const KNOWN_TLV_TYPES: [u8; 13] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13];
+/// The underlying library only knows the types 1..=13; the partial-JSON types
+/// 14 and 15 (WL#2955) are accepted here and stripped from the event body
+/// before the library parses the table map, because its metadata iterator
+/// rejects unknown types. Anything else is rejected.
+const KNOWN_TLV_TYPES: [u8; 15] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+/// `SIGNEDNESS`: unsigned flags of numeric columns (MSB-first bitmap).
+const TLV_SIGNEDNESS: u8 = 1;
 /// `SET_STR_VALUE`: variant names of SET columns.
 const TLV_SET_STR_VALUE: u8 = 5;
 /// `ENUM_STR_VALUE`: variant names of ENUM columns.
 const TLV_ENUM_STR_VALUE: u8 = 6;
+/// `PARTIAL_JSON_UPDATE`: bitmap of columns logged as partial JSON updates.
+const TLV_PARTIAL_JSON_UPDATE: u8 = 14;
+/// `UPDATED_COLUMN_TYPES`: actual data types of updated columns.
+const TLV_UPDATED_COLUMN_TYPES: u8 = 15;
 
 /// Lowercase hex digits used for byte rendering.
 const HEX: [u8; 16] = *b"0123456789abcdef";
@@ -97,11 +103,16 @@ pub(crate) fn decode_row(
                 serde_json::Value::try_from(value.clone())
                     .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?,
             ),
-            BinlogValue::JsonDiff(_) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "partial JSON updates are not supported",
-                ));
+            BinlogValue::JsonDiff(diffs) => {
+                // Without a paired before image (see [`decode_rows_pair`])
+                // there is nothing to apply the diffs to; they are preserved
+                // as a recorded loss instead of failing the whole image.
+                let (diffs, problem) = json_diff::parse_diffs(diffs);
+                CellValue::PartialJson {
+                    diffs,
+                    reason: problem
+                        .unwrap_or_else(|| "no before image to apply diffs against".to_owned()),
+                }
             }
         };
         let mysql_type = column.column_type();
@@ -130,6 +141,93 @@ pub(crate) fn decode_row(
         ));
     }
     Ok(RowImage { columns })
+}
+
+/// Decodes the before and after images of an updated row as a pair.
+///
+/// Partial-JSON after images (WL#2955) carry a sequence of binlog JSON diffs
+/// per JSON column instead of a full document. Each such sequence is applied
+/// to the before image's decoded value at the same column index: on success
+/// the after cell becomes [`CellValue::Json`] with the full new document, on
+/// any failure it becomes [`CellValue::PartialJson`] with the preserved diffs
+/// and the reason. Images without diffs decode exactly like [`decode_row`].
+pub(crate) fn decode_rows_pair(
+    before_row: Option<&BinlogRow>,
+    after_row: Option<&BinlogRow>,
+    before_present: Option<&[bool]>,
+    after_present: Option<&[bool]>,
+    signedness: &[Option<bool>],
+) -> io::Result<(Option<RowImage>, Option<RowImage>)> {
+    let before = before_row
+        .map(|row| {
+            decode_row(
+                row,
+                before_present.ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "missing before bitmap")
+                })?,
+                signedness,
+            )
+        })
+        .transpose()?;
+    let mut after = after_row
+        .map(|row| {
+            decode_row(
+                row,
+                after_present.ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "missing after bitmap")
+                })?,
+                signedness,
+            )
+        })
+        .transpose()?;
+    if let (Some(before), Some(after)) = (&before, after.as_mut()) {
+        apply_pair(before, after);
+    }
+    Ok((before, after))
+}
+
+/// Replaces the provisional [`CellValue::PartialJson`] cells of the after
+/// image by applying their diffs against the before image's values.
+///
+/// Cells whose diffs were already resolved (or whose before counterpart
+/// offers no JSON value to apply against) keep their state.
+fn apply_pair(before: &RowImage, after: &mut RowImage) {
+    let pending: Vec<usize> = after
+        .columns
+        .iter()
+        .enumerate()
+        .filter(|(_, cell)| matches!(cell.value, CellValue::PartialJson { .. }))
+        .map(|(position, _)| position)
+        .collect();
+    for position in pending {
+        let (diffs, index) = match &after.columns[position].value {
+            CellValue::PartialJson { diffs, .. } => (diffs.to_vec(), after.columns[position].index),
+            _ => continue,
+        };
+        let Some(before_cell) = before.columns.iter().find(|cell| cell.index == index) else {
+            continue;
+        };
+        let replacement = match &before_cell.value {
+            CellValue::Json(before_value) => {
+                match json_diff::apply_json_diffs(before_value.clone(), &diffs) {
+                    Ok(applied) => CellValue::Json(applied),
+                    Err(error) => CellValue::PartialJson {
+                        diffs,
+                        reason: error.0,
+                    },
+                }
+            }
+            CellValue::Absent => CellValue::PartialJson {
+                diffs,
+                reason: "before column is absent".to_owned(),
+            },
+            _ => CellValue::PartialJson {
+                diffs,
+                reason: "before value is not JSON".to_owned(),
+            },
+        };
+        after.columns[position].value = replacement;
+    }
 }
 
 /// Collects the present-column bitmap, validating that it covers all `n` columns.
@@ -191,9 +289,14 @@ pub(crate) fn column_type_name(column_type: ColumnType) -> &'static str {
 }
 
 /// Extract signedness in table-column order; None means metadata is unavailable.
+///
+/// The SIGNEDNESS TLV is located with a direct walk of the re-serialized
+/// table map body instead of the library's metadata extractor: the library's
+/// iterator hard-errors on the partial-JSON metadata types (14, 15) that
+/// partial-JSON binlogs carry, which would defeat their handling.
 pub(crate) fn signedness(map: &TableMapEvent<'_>) -> io::Result<Vec<Option<bool>>> {
-    let metadata = OptionalMetaExtractor::new(map.iter_optional_meta())?;
-    let mut values = metadata.iter_signedness();
+    let bits = signedness_bits(map)?;
+    let mut numeric = 0usize;
     let mut result = Vec::new();
     for index in 0..map.columns_count() as usize {
         let ty = map
@@ -201,7 +304,9 @@ pub(crate) fn signedness(map: &TableMapEvent<'_>) -> io::Result<Vec<Option<bool>
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing column type"))?;
         result.push(if ty.is_numeric_type() {
-            values.next()
+            let bit = bitmap_bit(bits.as_deref(), numeric);
+            numeric += 1;
+            bit
         } else {
             None
         });
@@ -209,27 +314,57 @@ pub(crate) fn signedness(map: &TableMapEvent<'_>) -> io::Result<Vec<Option<bool>
     Ok(result)
 }
 
-/// Validates table map optional metadata against the raw event bytes before
-/// the library parses it.
+/// Reads the SIGNEDNESS (type 1) TLV value of a table map event, if any.
 ///
-/// Walks the same structure the library's `TableMapEvent` deserializer walks
-/// (identical field order and encodings), then checks every optional metadata
-/// TLV: declared lengths must fit the remaining bytes, only field types known
-/// to the library are accepted, and ENUM/SET variant counts must fit the TLV
-/// value (the library allocates from the declared count without bounding it).
+/// The event is serialized back into its wire body (always the current
+/// 6-byte-table-id form) and the optional metadata block is located with the
+/// same structural walk the pre-validation uses, so the raw TLV bytes can be
+/// scanned without going through the library's metadata iterator. The last
+/// SIGNEDNESS entry wins, mirroring the library's extraction.
+fn signedness_bits(map: &TableMapEvent<'_>) -> io::Result<Option<Vec<u8>>> {
+    let mut body = Vec::new();
+    map.serialize(&mut body);
+    let pos = walk_table_map_header(&body, 8)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "table map does not fit"))?;
+    let mut signedness = None;
+    for entry in collect_tlvs(&body[pos..])? {
+        if entry.field_type == TLV_SIGNEDNESS {
+            signedness = Some(body[pos + entry.value.start..pos + entry.value.end].to_vec());
+        }
+    }
+    Ok(signedness)
+}
+
+/// Reads one bit of an MSB-first bitmap (`0x80 >> (index % 8)` of byte
+/// `index / 8`, one bit per column of the covered kind in table order).
 ///
-/// Structural shortfalls deliberately return `Ok`: the library rejects those
-/// deterministically with an end-of-stream error, so there is nothing to
-/// prevent. Only cases that could abort the process are rejected here.
-pub(crate) fn validate_table_map_metadata(body: &[u8], tme_header_length: u8) -> io::Result<()> {
-    let pos = match walk_table_map_header(body, tme_header_length) {
-        Some(pos) => pos,
-        // The structure does not fit; the library will reject this event.
-        None => return Ok(()),
-    };
-    let meta = &body[pos..];
+/// Bits beyond the available bytes mean the metadata was absent or shorter
+/// than the column count; the library reports unknown signedness then, too.
+fn bitmap_bit(bytes: Option<&[u8]>, index: usize) -> Option<bool> {
+    let byte = *bytes?.get(index / 8)?;
+    Some(byte & (0x80 >> (index % 8)) != 0)
+}
+
+/// One scanned optional metadata TLV entry: its field type, the byte range of
+/// the whole entry (type byte, length prefix, and value), and the byte range
+/// of the value alone — both relative to the metadata block.
+struct TlvEntry {
+    field_type: u8,
+    entry: std::ops::Range<usize>,
+    value: std::ops::Range<usize>,
+}
+
+/// Scans the optional metadata block into its TLV entries.
+///
+/// Length prefixes are decoded with the library's strict reader, so a
+/// non-canonical `0xfb`/`0xff` prefix or a truncated prefix is an error, and a
+/// declared length that exceeds the metadata block is an error — mirroring the
+/// previous inline walk exactly.
+fn collect_tlvs(meta: &[u8]) -> io::Result<Vec<TlvEntry>> {
     let mut pos = 0;
+    let mut entries = Vec::new();
     while pos < meta.len() {
+        let start = pos;
         let field_type = meta[pos];
         pos += 1;
         let len = match read_lenenc(meta, &mut pos)? {
@@ -242,24 +377,82 @@ pub(crate) fn validate_table_map_metadata(body: &[u8], tme_header_length: u8) ->
                 ));
             }
         };
-        let Some(value) = pos.checked_add(len).and_then(|end| meta.get(pos..end)) else {
+        let value_start = pos;
+        let Some(value_end) = pos.checked_add(len).filter(|end| *end <= meta.len()) else {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "optional metadata TLV exceeds table map bounds",
             ));
         };
-        pos += len;
-        if !KNOWN_TLV_TYPES.contains(&field_type) {
+        entries.push(TlvEntry {
+            field_type,
+            entry: start..value_end,
+            value: value_start..value_end,
+        });
+        pos = value_end;
+    }
+    Ok(entries)
+}
+
+/// Validates table map optional metadata against the raw event bytes before
+/// the library parses it.
+///
+/// Walks the same structure the library's `TableMapEvent` deserializer walks
+/// (identical field order and encodings), then checks every optional metadata
+/// TLV: declared lengths must fit the remaining bytes, only field types known
+/// to the library or belonging to the partial-JSON extension are accepted, and
+/// ENUM/SET variant counts must fit the TLV value (the library allocates from
+/// the declared count without bounding it).
+///
+/// Structural shortfalls deliberately return `Ok`: the library rejects those
+/// deterministically with an end-of-stream error, so there is nothing to
+/// prevent. Only cases that could abort the process are rejected here.
+pub(crate) fn validate_table_map_metadata(body: &[u8], tme_header_length: u8) -> io::Result<()> {
+    let pos = match walk_table_map_header(body, tme_header_length) {
+        Some(pos) => pos,
+        // The structure does not fit; the library will reject this event.
+        None => return Ok(()),
+    };
+    for entry in collect_tlvs(&body[pos..])? {
+        if !KNOWN_TLV_TYPES.contains(&entry.field_type) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "unknown optional metadata field type",
             ));
         }
-        if field_type == TLV_SET_STR_VALUE || field_type == TLV_ENUM_STR_VALUE {
-            validate_enum_set_variants(value)?;
+        if entry.field_type == TLV_SET_STR_VALUE || entry.field_type == TLV_ENUM_STR_VALUE {
+            validate_enum_set_variants(&body[pos + entry.value.start..pos + entry.value.end])?;
         }
     }
     Ok(())
+}
+
+/// Byte ranges (relative to the table map event body) of the optional
+/// metadata entries the underlying library cannot iterate.
+///
+/// The library stores a table map's optional metadata raw and iterates it
+/// lazily when decoding rows; its iterator rejects the partial-JSON types 14
+/// (`PARTIAL_JSON_UPDATE`) and 15 (`UPDATED_COLUMN_TYPES`) with a hard error,
+/// so those entries must be removed from the event body before the library
+/// parses the table map. Returns `None` when the event structure does not fit
+/// the expected layout — the library rejects such events deterministically,
+/// so there is nothing to strip.
+pub(crate) fn unsupported_tlv_ranges(
+    body: &[u8],
+    tme_header_length: u8,
+) -> io::Result<Option<Vec<std::ops::Range<usize>>>> {
+    let Some(pos) = walk_table_map_header(body, tme_header_length) else {
+        return Ok(None);
+    };
+    let mut ranges = Vec::new();
+    for entry in collect_tlvs(&body[pos..])? {
+        if entry.field_type == TLV_PARTIAL_JSON_UPDATE
+            || entry.field_type == TLV_UPDATED_COLUMN_TYPES
+        {
+            ranges.push((pos + entry.entry.start)..(pos + entry.entry.end));
+        }
+    }
+    Ok(Some(ranges))
 }
 
 /// Walks the fixed part of a table map event and returns the offset of the
@@ -389,10 +582,722 @@ fn read_lenenc_lenient(buf: &[u8], pos: &mut usize) -> io::Result<u64> {
     }
 }
 
+/// Application of WL#2955 binlog JSON diffs to a before value.
+///
+/// A partial JSON after image stores, per JSON column, a sequence of logical
+/// changes (`replace`/`insert`/`remove`) that the MySQL applier replays
+/// against the before image's full document. This module parses the MySQL
+/// JSON path text form of each diff and applies the operations to a
+/// [`serde_json::Value`], matching the server's behavior of failing the whole
+/// application when a path cannot be traversed or a precondition (existing
+/// member, array bounds) does not hold.
+mod json_diff {
+    use crate::event::JsonDiffRecord;
+    use mysql_common::binlog::jsondiff::{JsonDiff, JsonDiffOperation};
+
+    /// Why a sequence of binlog JSON diffs could not be applied.
+    ///
+    /// The message is user-facing (it becomes the `reason` of
+    /// [`CellValue::PartialJson`]), so it always names the offending path.
+    #[derive(Debug, Clone, PartialEq)]
+    pub(super) struct ApplyError(pub(super) String);
+
+    /// The operation kind of a binlog JSON diff.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum Operation {
+        /// Set the value at the path.
+        Replace,
+        /// Add a new member or array element at the path.
+        Insert,
+        /// Delete the member or array element at the path.
+        Remove,
+    }
+
+    impl Operation {
+        fn name(self) -> &'static str {
+            match self {
+                Self::Replace => "replace",
+                Self::Insert => "insert",
+                Self::Remove => "remove",
+            }
+        }
+
+        fn parse(name: &str) -> Result<Self, ApplyError> {
+            match name {
+                "replace" => Ok(Self::Replace),
+                "insert" => Ok(Self::Insert),
+                "remove" => Ok(Self::Remove),
+                other => Err(ApplyError(format!("unknown diff operation `{other}`"))),
+            }
+        }
+    }
+
+    /// One segment of a concrete MySQL JSON path.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum Segment {
+        /// An object member, resolved by name.
+        Member(String),
+        /// An array element, resolved by zero-based index.
+        Index(usize),
+    }
+
+    /// Converts the library's parsed diffs of one column into model records.
+    ///
+    /// A diff whose binary JSON value cannot be represented as
+    /// [`serde_json::Value`] (for example an opaque value) yields `None` for
+    /// its value and is reported in the returned problem note instead of
+    /// failing the whole column.
+    pub(super) fn parse_diffs(diffs: &[JsonDiff<'_>]) -> (Vec<JsonDiffRecord>, Option<String>) {
+        let mut parsed = Vec::with_capacity(diffs.len());
+        let mut problem = None;
+        for diff in diffs {
+            let operation = match diff.operation() {
+                JsonDiffOperation::REPLACE => Operation::Replace,
+                JsonDiffOperation::INSERT => Operation::Insert,
+                JsonDiffOperation::REMOVE => Operation::Remove,
+            };
+            let value = match diff.value() {
+                Some(jsonb) => match serde_json::Value::try_from(jsonb.clone()) {
+                    Ok(value) => Some(value),
+                    Err(error) => {
+                        problem.get_or_insert_with(|| {
+                            format!("diff value is not representable as JSON ({error})")
+                        });
+                        None
+                    }
+                },
+                None => None,
+            };
+            parsed.push(JsonDiffRecord {
+                path: diff.path_str().into_owned(),
+                operation: operation.name().to_owned(),
+                value,
+            });
+        }
+        (parsed, problem)
+    }
+
+    /// Applies a sequence of diffs to a before value, in order.
+    ///
+    /// Mirrors the MySQL applier: the first failure aborts the whole
+    /// application, leaving no partial result behind.
+    pub(super) fn apply_json_diffs(
+        before: serde_json::Value,
+        diffs: &[JsonDiffRecord],
+    ) -> Result<serde_json::Value, ApplyError> {
+        let mut value = before;
+        for diff in diffs {
+            apply_one(&mut value, diff)?;
+        }
+        Ok(value)
+    }
+
+    /// Applies a single diff to a value in place.
+    fn apply_one(value: &mut serde_json::Value, diff: &JsonDiffRecord) -> Result<(), ApplyError> {
+        let at = |what: &'static str| ApplyError(format!("path `{}`: {what}", diff.path));
+        let operation = Operation::parse(&diff.operation)?;
+        let segments = parse_path(&diff.path)?;
+        let Some((last, parents)) = segments.split_last() else {
+            // The bare `$` path targets the whole document.
+            return match operation {
+                Operation::Replace => {
+                    let Some(new_value) = &diff.value else {
+                        return Err(at("the operation carries no value"));
+                    };
+                    *value = new_value.clone();
+                    Ok(())
+                }
+                Operation::Insert | Operation::Remove => {
+                    Err(at("cannot insert or remove the document root"))
+                }
+            };
+        };
+        let mut current = value;
+        for segment in parents {
+            current = match segment {
+                Segment::Member(key) => match current {
+                    serde_json::Value::Object(map) => map
+                        .get_mut(key)
+                        .ok_or_else(|| at("parent path element does not exist"))?,
+                    _ => return Err(at("parent path element is not an object")),
+                },
+                Segment::Index(index) => match current {
+                    serde_json::Value::Array(items) => items
+                        .get_mut(*index)
+                        .ok_or_else(|| at("parent path element does not exist"))?,
+                    _ => return Err(at("parent path element is not an array")),
+                },
+            };
+        }
+        let new_value = || {
+            diff.value
+                .clone()
+                .ok_or_else(|| at("the operation carries no value"))
+        };
+        match operation {
+            Operation::Replace => match (last, current) {
+                (Segment::Member(key), serde_json::Value::Object(map)) => {
+                    map.insert(key.clone(), new_value()?);
+                    Ok(())
+                }
+                (Segment::Index(index), serde_json::Value::Array(items))
+                    if *index < items.len() =>
+                {
+                    items[*index] = new_value()?;
+                    Ok(())
+                }
+                _ => Err(at("replace target does not exist")),
+            },
+            Operation::Insert => match (last, current) {
+                (Segment::Member(key), serde_json::Value::Object(map)) => {
+                    if map.contains_key(key) {
+                        return Err(at("insert on an existing member"));
+                    }
+                    map.insert(key.clone(), new_value()?);
+                    Ok(())
+                }
+                (Segment::Index(index), serde_json::Value::Array(items))
+                    if *index <= items.len() =>
+                {
+                    items.insert(*index, new_value()?);
+                    Ok(())
+                }
+                _ => Err(at("insert target is not applicable")),
+            },
+            Operation::Remove => match (last, current) {
+                (Segment::Member(key), serde_json::Value::Object(map)) => map
+                    .remove(key)
+                    .map(|_| ())
+                    .ok_or_else(|| at("remove target does not exist")),
+                (Segment::Index(index), serde_json::Value::Array(items))
+                    if *index < items.len() =>
+                {
+                    items.remove(*index);
+                    Ok(())
+                }
+                _ => Err(at("remove target does not exist")),
+            },
+        }
+    }
+
+    /// Parses the MySQL JSON path text form of a diff.
+    ///
+    /// Accepted accessors after the required `$`: bare member names
+    /// (`[A-Za-z0-9_$]+`, the MySQL bare-key set), quoted member names
+    /// (`."name"` and `["name"]`, double or single quotes, with backslash
+    /// escapes), and array indices (`[0]`). Wildcards (`$.*`, `$**`) are
+    /// rejected: binlog diffs always carry concrete paths.
+    fn parse_path(path: &str) -> Result<Vec<Segment>, ApplyError> {
+        let invalid =
+            |what: &'static str| ApplyError(format!("invalid JSON path `{path}`: {what}"));
+        let rest = path
+            .strip_prefix('$')
+            .ok_or_else(|| invalid("must start with `$`"))?;
+        let bytes = rest.as_bytes();
+        let mut pos = 0usize;
+        let mut segments = Vec::new();
+        while pos < bytes.len() {
+            match bytes[pos] {
+                b'.' => {
+                    pos += 1;
+                    if matches!(bytes.get(pos), Some(b'"') | Some(b'\'')) {
+                        let quote = bytes[pos];
+                        let key = read_quoted_member(rest, &mut pos, quote)?;
+                        segments.push(Segment::Member(key));
+                    } else {
+                        let start = pos;
+                        while bytes.get(pos).is_some_and(|byte| {
+                            byte.is_ascii_alphanumeric() || *byte == b'_' || *byte == b'$'
+                        }) {
+                            pos += 1;
+                        }
+                        if pos == start {
+                            return Err(invalid("empty member name"));
+                        }
+                        // Only ASCII was consumed, so slicing is valid UTF-8.
+                        segments.push(Segment::Member(rest[start..pos].to_owned()));
+                    }
+                }
+                b'[' => {
+                    pos += 1;
+                    if matches!(bytes.get(pos), Some(b'"') | Some(b'\'')) {
+                        let quote = bytes[pos];
+                        let key = read_quoted_member(rest, &mut pos, quote)?;
+                        if bytes.get(pos) != Some(&b']') {
+                            return Err(invalid("unterminated bracketed member"));
+                        }
+                        pos += 1;
+                        segments.push(Segment::Member(key));
+                    } else if bytes.get(pos).is_some_and(|byte| byte.is_ascii_digit()) {
+                        let start = pos;
+                        while bytes.get(pos).is_some_and(|byte| byte.is_ascii_digit()) {
+                            pos += 1;
+                        }
+                        let index: usize = rest[start..pos]
+                            .parse()
+                            .map_err(|_| invalid("array index overflow"))?;
+                        if bytes.get(pos) != Some(&b']') {
+                            return Err(invalid("unterminated array index"));
+                        }
+                        pos += 1;
+                        segments.push(Segment::Index(index));
+                    } else {
+                        return Err(invalid("expected a quoted member name or an array index"));
+                    }
+                }
+                _ => return Err(invalid("unsupported path syntax")),
+            }
+        }
+        Ok(segments)
+    }
+
+    /// Reads a quoted member name starting at the opening quote byte, which
+    /// may be `"` or `'`, advancing `pos` past the closing quote.
+    ///
+    /// Backslash escapes mirror the common JSON forms (`\"`, `\'`, `\\`,
+    /// `\n`, `\r`, `\t`, `\b`, `\0`, and `\uXXXX`); unknown escapes keep the
+    /// escaped byte verbatim. Non-ASCII bytes are collected raw and validated
+    /// as UTF-8 at the end.
+    fn read_quoted_member(rest: &str, pos: &mut usize, quote: u8) -> Result<String, ApplyError> {
+        let bytes = rest.as_bytes();
+        *pos += 1; // opening quote
+        let mut key = Vec::new();
+        loop {
+            let Some(&byte) = bytes.get(*pos) else {
+                return Err(ApplyError(format!(
+                    "invalid JSON path `${rest}`: unterminated quoted member name"
+                )));
+            };
+            *pos += 1;
+            match byte {
+                byte if byte == quote => break,
+                b'\\' => {
+                    let Some(&escape) = bytes.get(*pos) else {
+                        return Err(ApplyError(format!(
+                            "invalid JSON path `${rest}`: unterminated escape sequence"
+                        )));
+                    };
+                    *pos += 1;
+                    match escape {
+                        b'n' => key.push(b'\n'),
+                        b'r' => key.push(b'\r'),
+                        b't' => key.push(b'\t'),
+                        b'b' => key.push(b'\x08'),
+                        b'0' => key.push(0),
+                        b'u' => {
+                            let code = bytes
+                                .get(*pos..*pos + 4)
+                                .and_then(|raw| std::str::from_utf8(raw).ok())
+                                .and_then(|raw| u32::from_str_radix(raw, 16).ok());
+                            let Some(code) = code else {
+                                return Err(ApplyError(format!(
+                                    "invalid JSON path `${rest}`: invalid \\u escape"
+                                )));
+                            };
+                            *pos += 4;
+                            let Some(character) = char::from_u32(code) else {
+                                return Err(ApplyError(format!(
+                                    "invalid JSON path `${rest}`: invalid \\u escape"
+                                )));
+                            };
+                            let mut encoded = [0; 4];
+                            key.extend_from_slice(character.encode_utf8(&mut encoded).as_bytes());
+                        }
+                        other => key.push(other),
+                    }
+                }
+                other => key.push(other),
+            }
+        }
+        String::from_utf8(key).map_err(|_| {
+            ApplyError(format!(
+                "invalid JSON path `${rest}`: member name is not valid UTF-8"
+            ))
+        })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::event::JsonDiffRecord;
+
+        /// Builds a diff record the way the model stores them.
+        fn rec(path: &str, operation: &str, value: Option<serde_json::Value>) -> JsonDiffRecord {
+            JsonDiffRecord {
+                path: path.to_owned(),
+                operation: operation.to_owned(),
+                value,
+            }
+        }
+
+        #[test]
+        fn replaces_inserts_and_removes_members_and_elements() {
+            let doc = serde_json::json!({"a": 1, "b": [1, 2]});
+            let diffs = vec![
+                rec("$.b[1]", "replace", Some(serde_json::json!(99))),
+                rec("$.c", "insert", Some(serde_json::json!("x"))),
+                rec("$.a", "remove", None),
+            ];
+            let applied = apply_json_diffs(doc, &diffs).unwrap();
+            assert_eq!(applied, serde_json::json!({"b": [1, 99], "c": "x"}));
+        }
+
+        #[test]
+        fn array_insert_shifts_and_accepts_end_position() {
+            let doc = serde_json::json!([1, 2, 3]);
+            let insert = |index: usize| {
+                let diffs = [rec(
+                    &format!("$[{index}]"),
+                    "insert",
+                    Some(serde_json::json!(9)),
+                )];
+                apply_json_diffs(doc.clone(), &diffs)
+            };
+            assert_eq!(insert(1).unwrap(), serde_json::json!([1, 9, 2, 3]));
+            // Inserting at the length appends.
+            assert_eq!(insert(3).unwrap(), serde_json::json!([1, 2, 3, 9]));
+            assert!(insert(4).is_err());
+        }
+
+        #[test]
+        fn root_replace_swaps_the_document() {
+            let doc = serde_json::json!({"a": 1});
+            let diffs = [rec("$", "replace", Some(serde_json::json!([true])))];
+            assert_eq!(
+                apply_json_diffs(doc, &diffs).unwrap(),
+                serde_json::json!([true])
+            );
+            let remove_root = [rec("$", "remove", None)];
+            assert!(apply_json_diffs(serde_json::json!({}), &remove_root).is_err());
+        }
+
+        #[test]
+        fn failures_name_the_offending_path() {
+            let doc = serde_json::json!({"a": {"b": 1}});
+            let remove = [rec("$.a.zz", "remove", None)];
+            let error = apply_json_diffs(doc.clone(), &remove).unwrap_err();
+            assert_eq!(error.0, "path `$.a.zz`: remove target does not exist");
+            // A missing intermediate element is a failure, not a creation.
+            let insert = [rec("$.zz.c", "insert", Some(serde_json::json!(1)))];
+            let error = apply_json_diffs(doc, &insert).unwrap_err();
+            assert!(
+                error.0.contains("parent path element does not exist"),
+                "{}",
+                error.0
+            );
+        }
+
+        #[test]
+        fn insert_rejects_existing_members_and_replace_missing_ones() {
+            let doc = serde_json::json!({"a": 1});
+            let insert = [rec("$.a", "insert", Some(serde_json::json!(2)))];
+            assert!(
+                apply_json_diffs(doc.clone(), &insert)
+                    .unwrap_err()
+                    .0
+                    .contains("insert on an existing member")
+            );
+            // Object replace is an upsert, like the task's applier contract.
+            let replace = [rec("$.a", "replace", Some(serde_json::json!(2)))];
+            assert_eq!(
+                apply_json_diffs(doc, &replace).unwrap(),
+                serde_json::json!({"a": 2})
+            );
+            // Array replace past the end is a failure.
+            let doc = serde_json::json!([1]);
+            let replace = [rec("$[3]", "replace", Some(serde_json::json!(2)))];
+            assert!(
+                apply_json_diffs(doc, &replace)
+                    .unwrap_err()
+                    .0
+                    .contains("replace target does not exist")
+            );
+        }
+
+        #[test]
+        fn quoted_and_indexed_member_forms_are_accepted() {
+            let doc = serde_json::json!({"a b": {"c.d": 1}});
+            let diffs = [rec(
+                r#"$."a b"["c.d"]"#,
+                "replace",
+                Some(serde_json::json!(2)),
+            )];
+            let applied = apply_json_diffs(doc, &diffs).unwrap();
+            assert_eq!(applied, serde_json::json!({"a b": {"c.d": 2}}));
+        }
+
+        #[test]
+        fn escapes_are_decoded_in_quoted_members() {
+            let doc = serde_json::json!({"q\"k": 1});
+            let diffs = [rec(r#"$."q\"k""#, "replace", Some(serde_json::json!(2)))];
+            assert_eq!(
+                apply_json_diffs(doc, &diffs).unwrap(),
+                serde_json::json!({"q\"k": 2})
+            );
+        }
+
+        #[test]
+        fn unsupported_paths_are_rejected() {
+            for path in [
+                "a.b",                     // missing `$`
+                "$.a-b",                   // `-` needs the quoted form
+                "$..a",                    // ellipsis wildcard
+                "$.a*",                    // wildcard
+                "$[x]",                    // not an index
+                "$.a[",                    // truncated
+                "$.'a",                    // unterminated quote
+                "$[99999999999999999999]", // index overflow
+                "$.",                      // empty member
+                "$.a.",                    // trailing accessor
+            ] {
+                let diffs = [rec(path, "replace", Some(serde_json::json!(1)))];
+                let error = apply_json_diffs(serde_json::json!({}), &diffs).unwrap_err();
+                assert!(
+                    error.0.starts_with("invalid JSON path"),
+                    "{path}: {}",
+                    error.0
+                );
+            }
+        }
+
+        #[test]
+        fn unknown_operation_names_are_rejected() {
+            let diffs = [rec("$.a", "set", Some(serde_json::json!(1)))];
+            let error = apply_json_diffs(serde_json::json!({}), &diffs).unwrap_err();
+            assert!(error.0.contains("unknown diff operation"), "{}", error.0);
+        }
+
+        #[test]
+        fn records_match_the_model_shape() {
+            let records = [rec("$.a", "insert", Some(serde_json::json!(1)))];
+            let serialized = serde_json::to_value(&records).unwrap();
+            assert_eq!(serialized[0]["path"], "$.a");
+            assert_eq!(serialized[0]["operation"], "insert");
+            assert_eq!(serialized[0]["value"], 1);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mysql_common::{
+        binlog::{jsonb::Value as JsonbValue, jsondiff::JsonDiff},
+        io::ParseBuf,
+        proto::MyDeserialize,
+    };
     use mysql_common::{constants::ColumnType, packets::Column};
+
+    /// Parses binary jsonb bytes with the library, as a row value would be.
+    fn jsonb(bytes: &[u8]) -> JsonbValue<'static> {
+        let mut buf = ParseBuf(bytes);
+        JsonbValue::deserialize((), &mut buf).unwrap().into_owned()
+    }
+
+    /// Parses one binary JSON diff (operation byte, path, optional value).
+    fn diff(bytes: &[u8]) -> JsonDiff<'static> {
+        let mut buf = ParseBuf(bytes);
+        JsonDiff::deserialize((), &mut buf).unwrap().into_owned()
+    }
+
+    fn json_column() -> Column {
+        Column::new(ColumnType::MYSQL_TYPE_JSON).with_name(b"doc")
+    }
+
+    /// Binary jsonb for `{"a": 1, "b": [1, 2]}` (small object form).
+    ///
+    /// jsonb offsets are relative to the container start (its element-count
+    /// field), and the size field counts the container from that point.
+    const JSONB_DOC: &[u8] = &[
+        0x00, // small object
+        0x02, 0x00, // two members
+        0x1e, 0x00, // 30 bytes from the element-count field on
+        0x12, 0x00, 0x01, 0x00, // key entry: "a" at offset 18, length 1
+        0x13, 0x00, 0x01, 0x00, // key entry: "b" at offset 19, length 1
+        0x05, 0x01, 0x00, // value entry at offset 12: int16 1 (inlined)
+        0x02, 0x14, 0x00, // value entry at offset 15: small array at offset 20
+        b'a', b'b', // key bytes at offsets 18, 19
+        0x02, 0x00, 0x0a, 0x00, // small array: two elements, 10 bytes
+        0x05, 0x01, 0x00, // int16 1 (inlined)
+        0x05, 0x02, 0x00, // int16 2 (inlined)
+    ];
+
+    #[test]
+    fn jsonb_fixture_parses_as_expected() {
+        let value = serde_json::Value::try_from(jsonb(JSONB_DOC)).unwrap();
+        assert_eq!(value, serde_json::json!({"a": 1, "b": [1, 2]}));
+    }
+
+    /// REPLACE `$.b[1]` with 99, as written into a partial JSON after image.
+    fn replace_b1_with_99() -> JsonDiff<'static> {
+        diff(&[
+            0x00, // REPLACE
+            6, b'$', b'.', b'b', b'[', b'1', b']', // path
+            3, 0x05, 99, 0x00, // int16 99
+        ])
+    }
+
+    #[test]
+    fn pair_applies_a_replace_diff_to_the_before_value() {
+        let before = BinlogRow::new(
+            vec![Some(BinlogValue::Jsonb(jsonb(JSONB_DOC)))],
+            vec![json_column()].into(),
+        );
+        let after = BinlogRow::new(
+            vec![Some(BinlogValue::JsonDiff(vec![replace_b1_with_99()]))],
+            vec![json_column()].into(),
+        );
+        let (before, after) = decode_rows_pair(
+            Some(&before),
+            Some(&after),
+            Some(&[true]),
+            Some(&[true]),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            before.unwrap().columns[0].value,
+            CellValue::Json(serde_json::json!({"a": 1, "b": [1, 2]}))
+        );
+        assert_eq!(
+            after.unwrap().columns[0].value,
+            CellValue::Json(serde_json::json!({"a": 1, "b": [1, 99]}))
+        );
+    }
+
+    #[test]
+    fn pair_applies_a_multi_diff_sequence_in_order() {
+        let before = BinlogRow::new(
+            vec![Some(BinlogValue::Jsonb(jsonb(JSONB_DOC)))],
+            vec![json_column()].into(),
+        );
+        let after = BinlogRow::new(
+            vec![Some(BinlogValue::JsonDiff(vec![
+                replace_b1_with_99(),
+                // INSERT `$.c` = "x": string jsonb (type 0x0c, varlen "x").
+                diff(&[0x01, 3, b'$', b'.', b'c', 3, 0x0c, 1, b'x']),
+                // REMOVE `$.a`.
+                diff(&[0x02, 3, b'$', b'.', b'a']),
+            ]))],
+            vec![json_column()].into(),
+        );
+        let (_, after) = decode_rows_pair(
+            Some(&before),
+            Some(&after),
+            Some(&[true]),
+            Some(&[true]),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            after.unwrap().columns[0].value,
+            CellValue::Json(serde_json::json!({"b": [1, 99], "c": "x"}))
+        );
+    }
+
+    #[test]
+    fn pair_records_a_loss_when_the_diff_cannot_apply() {
+        let before = BinlogRow::new(
+            vec![Some(BinlogValue::Jsonb(jsonb(JSONB_DOC)))],
+            vec![json_column()].into(),
+        );
+        let after = BinlogRow::new(
+            vec![Some(BinlogValue::JsonDiff(vec![
+                // REMOVE `$.zz`: the member does not exist in the before value.
+                diff(&[0x02, 4, b'$', b'.', b'z', b'z']),
+            ]))],
+            vec![json_column()].into(),
+        );
+        let (_, after) = decode_rows_pair(
+            Some(&before),
+            Some(&after),
+            Some(&[true]),
+            Some(&[true]),
+            &[],
+        )
+        .unwrap();
+        let CellValue::PartialJson { diffs, reason } = after.unwrap().columns[0].value.clone()
+        else {
+            panic!("expected a partial JSON record");
+        };
+        assert_eq!(reason, "path `$.zz`: remove target does not exist");
+        assert_eq!(diffs.len(), 1);
+        assert_eq!(diffs[0].path, "$.zz");
+        assert_eq!(diffs[0].operation, "remove");
+        assert_eq!(diffs[0].value, None);
+    }
+
+    #[test]
+    fn pair_records_a_loss_for_a_missing_or_non_json_before_value() {
+        let diffs = || vec![replace_b1_with_99()];
+        // The before image lacks the column entirely.
+        let before = BinlogRow::new(vec![], vec![json_column()].into());
+        let after = BinlogRow::new(
+            vec![Some(BinlogValue::JsonDiff(diffs()))],
+            vec![json_column()].into(),
+        );
+        let (_, after) = decode_rows_pair(
+            Some(&before),
+            Some(&after),
+            Some(&[false]),
+            Some(&[true]),
+            &[],
+        )
+        .unwrap();
+        let CellValue::PartialJson { reason, .. } = after.unwrap().columns[0].value.clone() else {
+            panic!("expected a partial JSON record");
+        };
+        assert_eq!(reason, "before column is absent");
+
+        // The before image has no row at all.
+        let after = BinlogRow::new(
+            vec![Some(BinlogValue::JsonDiff(diffs()))],
+            vec![json_column()].into(),
+        );
+        let (_, after) = decode_rows_pair(None, Some(&after), None, Some(&[true]), &[]).unwrap();
+        let CellValue::PartialJson { reason, .. } = after.unwrap().columns[0].value.clone() else {
+            panic!("expected a partial JSON record");
+        };
+        assert_eq!(reason, "no before image to apply diffs against");
+
+        // The before value is an integer, not JSON.
+        let before = BinlogRow::new(
+            vec![Some(BinlogValue::Value(Value::Int(7)))],
+            vec![json_column()].into(),
+        );
+        let after = BinlogRow::new(
+            vec![Some(BinlogValue::JsonDiff(diffs()))],
+            vec![json_column()].into(),
+        );
+        let (_, after) = decode_rows_pair(
+            Some(&before),
+            Some(&after),
+            Some(&[true]),
+            Some(&[true]),
+            &[],
+        )
+        .unwrap();
+        let CellValue::PartialJson { reason, .. } = after.unwrap().columns[0].value.clone() else {
+            panic!("expected a partial JSON record");
+        };
+        assert_eq!(reason, "before value is not JSON");
+    }
+
+    #[test]
+    fn without_a_pair_context_diffs_are_recorded_not_fatal() {
+        let row = BinlogRow::new(
+            vec![Some(BinlogValue::JsonDiff(vec![replace_b1_with_99()]))],
+            vec![json_column()].into(),
+        );
+        let image = decode_row(&row, &[true], &[]).unwrap();
+        let CellValue::PartialJson { diffs, reason } = image.columns[0].value.clone() else {
+            panic!("expected a partial JSON record");
+        };
+        assert_eq!(diffs.len(), 1);
+        assert_eq!(diffs[0].operation, "replace");
+        assert_eq!(diffs[0].value, Some(serde_json::json!(99)));
+        assert_eq!(reason, "no before image to apply diffs against");
+    }
 
     #[test]
     fn distinguishes_absent_null_and_arbitrary_bytes() {
@@ -544,7 +1449,7 @@ mod tests {
         // TLV lengths go through the library's strict reader, so 0xff there
         // is an error, not a zero.
         let tlv = vec![1u8, 0xff, 0];
-        let mut body = vec![0u8; 6 + 2];
+        let mut body = vec![0u8; 6 + 2]; // table id + flags
         body.push(1);
         body.extend_from_slice(b"d\0");
         body.push(1);
@@ -556,5 +1461,87 @@ mod tests {
         body.extend_from_slice(&tlv);
         let err = validate_table_map_metadata(&body, 8).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    /// Builds a table map body with one LONG and one JSON column whose
+    /// optional metadata block is `tlv`.
+    fn body_with_long_and_json(tlv: &[u8]) -> Vec<u8> {
+        let mut body = vec![0u8; 6 + 2]; // table id + flags
+        body.push(1);
+        body.extend_from_slice(b"d\0");
+        body.push(1);
+        body.extend_from_slice(b"t\0");
+        body.push(2); // two columns
+        body.extend_from_slice(&[0x03, 0xf9]); // LONG, JSON
+        body.push(0); // no column metadata
+        body.push(1); // one null-bitmap byte
+        body.extend_from_slice(tlv);
+        body
+    }
+
+    #[test]
+    fn partial_json_tlv_types_are_accepted() {
+        // SIGNEDNESS (one numeric column, unsigned), PARTIAL_JSON_UPDATE
+        // (one bit per column: only the JSON column is partial), and
+        // UPDATED_COLUMN_TYPES (an opaque per-column type list).
+        let mut tlv = vec![1u8, 1, 0x80];
+        tlv.extend_from_slice(&[14, 1, 0x40]);
+        tlv.extend_from_slice(&[15, 2, 0xf9, 0x00]);
+        let body = body_with_long_and_json(&tlv);
+        validate_table_map_metadata(&body, 8).unwrap();
+        let ranges = unsupported_tlv_ranges(&body, 8).unwrap().unwrap();
+        assert_eq!(ranges.len(), 2);
+        // First range: the PARTIAL_JSON_UPDATE entry (type, length, value).
+        let tlv_offset = body.len() - tlv.len();
+        assert_eq!(ranges[0].start, tlv_offset + 3);
+        assert_eq!(ranges[0].end, tlv_offset + 6);
+        // Second range: the UPDATED_COLUMN_TYPES entry.
+        assert_eq!(ranges[1].start, tlv_offset + 6);
+        assert_eq!(ranges[1].end, tlv_offset + 6 + 4);
+    }
+
+    #[test]
+    fn hostile_partial_json_tlv_lengths_are_rejected() {
+        // PARTIAL_JSON_UPDATE declaring an 8-byte length-encoded size that
+        // exceeds the body; the value length prefix must never overflow.
+        let mut tlv = vec![14u8, 0xfe];
+        tlv.extend_from_slice(&u64::MAX.to_le_bytes());
+        let err = validate_table_map_metadata(&body_with_long_and_json(&tlv), 8).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("exceeds table map bounds"));
+        // Same abuse for UPDATED_COLUMN_TYPES.
+        let mut tlv = vec![15u8, 0xfe];
+        tlv.extend_from_slice(&u64::MAX.to_le_bytes());
+        let err = validate_table_map_metadata(&body_with_long_and_json(&tlv), 8).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn signedness_is_read_from_the_walk_not_the_library() {
+        // Serialize a parsed table map whose metadata block carries
+        // SIGNEDNESS plus the partial-JSON types the library rejects, then
+        // check that signedness() still extracts the unsigned flag.
+        let mut tlv = vec![1u8, 1, 0x80];
+        tlv.extend_from_slice(&[14, 1, 0x40]);
+        tlv.extend_from_slice(&[15, 2, 0xf9, 0x00]);
+        let body = body_with_long_and_json(&tlv);
+        let mut reader = mysql_common::binlog::EventStreamReader::new(
+            mysql_common::binlog::consts::BinlogVersion::Version4,
+        );
+        let mut event = Vec::new();
+        event.extend_from_slice(&0u32.to_le_bytes());
+        event.push(19); // TABLE_MAP_EVENT
+        event.extend_from_slice(&1u32.to_le_bytes()); // server id
+        event.extend_from_slice(&(19 + body.len() as u32).to_le_bytes());
+        event.extend_from_slice(&0u32.to_le_bytes()); // log pos
+        event.extend_from_slice(&0u16.to_le_bytes()); // flags
+        event.extend_from_slice(&body);
+        reader
+            .read(&mut std::io::Cursor::new(event))
+            .unwrap()
+            .unwrap();
+        let map = reader.get_tme(0).unwrap();
+        let signedness = signedness(map).unwrap();
+        assert_eq!(signedness, vec![Some(true), None]);
     }
 }

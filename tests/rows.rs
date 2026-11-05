@@ -2,7 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use binlog_inspect::{
-    event::{CellValue, ColumnValue, EventPayload, EventType, ParsedEvent, RowChange, RowImage},
+    event::{
+        CellValue, ColumnValue, EventPayload, EventType, JsonDiffRecord, ParsedEvent, RowChange,
+        RowImage,
+    },
     formatter::{CsvFormatter, Formatter, JsonLinesFormatter},
 };
 use std::io::Cursor;
@@ -99,11 +102,72 @@ fn cell_values_round_trip_through_json() {
             micros: 6,
         },
         CellValue::Json(serde_json::json!({"k": [1, null]})),
+        CellValue::PartialJson {
+            diffs: vec![
+                JsonDiffRecord {
+                    path: "$.b[1]".into(),
+                    operation: "replace".into(),
+                    value: Some(serde_json::json!(99)),
+                },
+                JsonDiffRecord {
+                    path: "$.a".into(),
+                    operation: "remove".into(),
+                    value: None,
+                },
+            ],
+            reason: "before value is not JSON".into(),
+        },
     ] {
         let text = serde_json::to_string(&value).unwrap();
         let parsed: CellValue = serde_json::from_str(&text).unwrap();
         assert_eq!(parsed, value, "{text}");
     }
+}
+
+#[test]
+fn partial_json_cell_serializes_with_stable_field_names() {
+    let value = CellValue::PartialJson {
+        diffs: vec![JsonDiffRecord {
+            path: "$.c".into(),
+            operation: "insert".into(),
+            value: Some(serde_json::json!("x")),
+        }],
+        reason: "no before image to apply diffs against".into(),
+    };
+    let json = serde_json::to_value(&value).unwrap();
+    assert_eq!(json["type"], "partial_json");
+    assert_eq!(
+        json["value"]["reason"],
+        "no before image to apply diffs against"
+    );
+    assert_eq!(json["value"]["diffs"][0]["path"], "$.c");
+    assert_eq!(json["value"]["diffs"][0]["operation"], "insert");
+    assert_eq!(json["value"]["diffs"][0]["value"], "x");
+
+    let event = sample_event();
+    let event_with_loss = ParsedEvent {
+        payload: EventPayload::Rows {
+            table_id: 1,
+            database: "db".into(),
+            table: "t".into(),
+            changes: vec![RowChange {
+                before: None,
+                after: Some(RowImage {
+                    columns: vec![ColumnValue {
+                        index: 0,
+                        name: Some("doc".into()),
+                        mysql_type: Some("JSON".into()),
+                        signedness: None,
+                        value,
+                    }],
+                }),
+            }],
+        },
+        ..event
+    };
+    let text = serde_json::to_string(&event_with_loss).unwrap();
+    let parsed: ParsedEvent = serde_json::from_str(&text).unwrap();
+    assert_eq!(parsed, event_with_loss);
 }
 
 #[test]
