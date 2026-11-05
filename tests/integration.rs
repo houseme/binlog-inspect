@@ -426,26 +426,99 @@ fn output_is_atomic_mode_0600_and_never_overwrites() {
     );
 }
 #[cfg(feature = "remote")]
-#[test]
-fn remote_download_and_encrypted_rejection() {
-    use std::{io::Read, net::TcpListener, thread};
+/// Serves `response` once on an ephemeral loopback port.
+///
+/// Hardened the same way as tests/remote.rs: the request is fully drained
+/// before responding so closing never sends an RST over unread data, and
+/// the accept wait is bounded so a child that never connects fails fast
+/// with its own stderr instead of hanging the test on `join()`.
+fn serve_hardened(response: Vec<u8>) -> (String, std::thread::JoinHandle<()>) {
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        time::{Duration, Instant},
+    };
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
-    let server = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        let mut req = [0; 2048];
-        let _ = stream.read(&mut req);
-        stream
-            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\n\xfdbin")
-            .unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let handle = std::thread::spawn(move || {
+        let end = Instant::now() + Duration::from_secs(60);
+        loop {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    // On macOS/BSD an accepted stream inherits the listener's
+                    // O_NONBLOCK; clear it so the reads below actually block
+                    // (otherwise the server responds before the request and
+                    // closes with unread data, resetting the child).
+                    stream.set_nonblocking(false).unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(30)))
+                        .unwrap();
+                    drain_request(&mut stream);
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        response.len()
+                    );
+                    let _ = stream.write_all(head.as_bytes());
+                    let _ = stream.write_all(&response);
+                    // Do not close first: an immediate close can drop the
+                    // buffered body before the child reads it (macOS and
+                    // Windows loopback flakes). Wait for the child to finish
+                    // reading and close, bounded so a wedged child cannot
+                    // hang the test.
+                    let until = Instant::now() + Duration::from_secs(30);
+                    let mut sink = [0u8; 2048];
+                    while Instant::now() < until {
+                        match stream.read(&mut sink) {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => {}
+                        }
+                    }
+                    break;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < end => {
+                    std::thread::sleep(Duration::from_millis(10))
+                }
+                Err(e) => panic!("test server accept failed: {e}"),
+            }
+        }
     });
+    (format!("http://{addr}/file"), handle)
+}
+
+/// Reads until the end of the request headers before responding; see
+/// tests/remote.rs for the rationale.
+#[cfg(feature = "remote")]
+fn drain_request(stream: &mut std::net::TcpStream) {
+    use std::io::Read;
+    let mut received = Vec::new();
+    let mut chunk = [0; 2048];
+    loop {
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                received.extend_from_slice(&chunk[..n]);
+                if received.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+}
+
+#[cfg(feature = "remote")]
+#[test]
+fn remote_download_and_encrypted_rejection() {
+    let (url, server) = serve_hardened(b"\xfdbin".to_vec());
     let output = Command::new(env!("CARGO_BIN_EXE_binlog-inspect"))
-        .args(["--url", &format!("http://{addr}/file")])
+        .args(["--url", &url])
         .output()
         .unwrap();
     server.join().unwrap();
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("encrypted binlog"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("encrypted binlog"), "{stderr}");
 }
 
 #[test]
@@ -529,25 +602,11 @@ fn csv_quotes_row_values_and_table_filter() {
 #[cfg(feature = "remote")]
 #[test]
 fn remote_plaintext_is_parsed() {
-    use std::{io::Read, net::TcpListener, thread};
     let mut body = b"\xfebin".to_vec();
     body.extend(event(16, &55u64.to_le_bytes()));
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
-    let server = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        let mut req = [0; 2048];
-        let _ = stream.read(&mut req);
-        write!(
-            stream,
-            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            body.len()
-        )
-        .unwrap();
-        stream.write_all(&body).unwrap();
-    });
+    let (url, server) = serve_hardened(body);
     let output = Command::new(env!("CARGO_BIN_EXE_binlog-inspect"))
-        .args(["--url", &format!("http://{addr}/file")])
+        .args(["--url", &url])
         .output()
         .unwrap();
     server.join().unwrap();

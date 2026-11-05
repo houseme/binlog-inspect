@@ -43,7 +43,7 @@ fn output_is_created_and_existing_input_is_never_overwritten() {
 #[cfg(feature = "remote")]
 fn serve_once(response: &'static [u8]) -> (String, std::thread::JoinHandle<()>) {
     use std::{
-        io::Write,
+        io::{Read, Write},
         net::TcpListener,
         time::{Duration, Instant},
     };
@@ -51,15 +51,31 @@ fn serve_once(response: &'static [u8]) -> (String, std::thread::JoinHandle<()>) 
     let addr = server.local_addr().unwrap();
     server.set_nonblocking(true).unwrap();
     let handle = std::thread::spawn(move || {
-        let end = Instant::now() + Duration::from_secs(5);
+        let end = Instant::now() + Duration::from_secs(30);
         loop {
             match server.accept() {
                 Ok((mut stream, _)) => {
+                    // On macOS/BSD an accepted stream inherits the listener's
+                    // O_NONBLOCK; clear it so the reads below actually block
+                    // (otherwise the server responds before the request and
+                    // closes with unread data, resetting the child).
+                    stream.set_nonblocking(false).unwrap();
                     stream
-                        .set_read_timeout(Some(Duration::from_secs(2)))
+                        .set_read_timeout(Some(Duration::from_secs(30)))
                         .unwrap();
                     drain_request(&mut stream);
                     let _ = stream.write_all(response);
+                    // Do not close first: an immediate close can drop the
+                    // buffered body before the child reads it. Wait for the
+                    // child to finish reading and close instead, bounded.
+                    let until = Instant::now() + Duration::from_secs(30);
+                    let mut sink = [0u8; 2048];
+                    while Instant::now() < until {
+                        match stream.read(&mut sink) {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => {}
+                        }
+                    }
                     break;
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < end => {
@@ -78,7 +94,7 @@ fn serve_once(response: &'static [u8]) -> (String, std::thread::JoinHandle<()>) 
 #[cfg(feature = "remote")]
 fn serve_bytes(body: &'static [u8]) -> (String, std::thread::JoinHandle<()>) {
     use std::{
-        io::Write,
+        io::{Read, Write},
         net::TcpListener,
         time::{Duration, Instant},
     };
@@ -86,12 +102,17 @@ fn serve_bytes(body: &'static [u8]) -> (String, std::thread::JoinHandle<()>) {
     let addr = server.local_addr().unwrap();
     server.set_nonblocking(true).unwrap();
     let handle = std::thread::spawn(move || {
-        let end = Instant::now() + Duration::from_secs(5);
+        let end = Instant::now() + Duration::from_secs(30);
         loop {
             match server.accept() {
                 Ok((mut stream, _)) => {
+                    // On macOS/BSD an accepted stream inherits the listener's
+                    // O_NONBLOCK; clear it so the reads below actually block
+                    // (otherwise the server responds before the request and
+                    // closes with unread data, resetting the child).
+                    stream.set_nonblocking(false).unwrap();
                     stream
-                        .set_read_timeout(Some(Duration::from_secs(2)))
+                        .set_read_timeout(Some(Duration::from_secs(30)))
                         .unwrap();
                     drain_request(&mut stream);
                     let _ = stream.write_all(
@@ -102,6 +123,17 @@ fn serve_bytes(body: &'static [u8]) -> (String, std::thread::JoinHandle<()>) {
                         .as_bytes(),
                     );
                     let _ = stream.write_all(body);
+                    // Do not close first: an immediate close can drop the buffered
+                    // body before the child reads it (macOS/Windows loopback flakes).
+                    // Wait for the child to finish reading and close instead.
+                    let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                    let mut sink = [0u8; 2048];
+                    while std::time::Instant::now() < until {
+                        match stream.read(&mut sink) {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => {}
+                        }
+                    }
                     break;
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < end => {
