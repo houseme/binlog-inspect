@@ -345,6 +345,34 @@ fn none_payload_with_inner_event_decodes() {
     assert_eq!(inner[0].offset, 0);
 }
 
+/// NONE payloads carry uncompressed_size = 0 on the wire; their decompressed
+/// stream is the payload bytes themselves, so the size limit must be the
+/// actual payload size, not the declared zero. A valid uncompressed payload
+/// larger than the 1 MiB slack once slipped through as "exceeds declared
+/// size" (reachable when the server's zstd threshold is raised above 1 MiB).
+#[test]
+fn large_none_payload_within_payload_size_decodes() {
+    let content = inner_xid(1).repeat(40_000); // ~1.08 MiB of inner events
+    assert!(content.len() > 1024 * 1024);
+    let f = binlog(&[format_description(), {
+        library_payload_event(TransactionPayloadCompressionType::NONE, 0, &content)
+    }]);
+    let mut parser = BinlogParser::open(f.path()).unwrap();
+    let mut events = parser.events();
+    assert!(events.next().unwrap().is_ok());
+    let event = events.next().unwrap().unwrap();
+    let EventPayload::TransactionPayload {
+        compression,
+        events: inner,
+        ..
+    } = event.payload
+    else {
+        panic!("expected a transaction payload, got {:?}", event.payload);
+    };
+    assert_eq!(compression, "NONE");
+    assert_eq!(inner.len(), 40_000);
+}
+
 /// An unknown compression algorithm byte would unwrap() into a panic inside
 /// mysql_common 0.38.2; the framing prevalidation must reject it cleanly.
 #[test]

@@ -464,13 +464,26 @@ impl<R: Read> BinlogParser<R> {
                 "compressed payload declares excessive uncompressed size",
             ));
         }
+        // The library only writes uncompressed_size for compressed payloads
+        // (NONE payloads carry 0 on the wire); for NONE the decompressed
+        // stream is the payload bytes themselves, so the exact payload size
+        // is the honest limit. Compressed payloads get the declared size plus
+        // a small slack so a bomb must lie by more than the slack to pass.
+        let limit = match payload.algorithm() {
+            TransactionPayloadCompressionType::NONE => u64::from(event.header().event_size())
+                .saturating_sub(19)
+                .saturating_add(PAYLOAD_SIZE_SLACK),
+            TransactionPayloadCompressionType::ZSTD => {
+                uncompressed_size.saturating_add(PAYLOAD_SIZE_SLACK)
+            }
+        };
         let tme_header_len = self
             .reader
             .get_fde()
             .get_event_type_header_length(mysql_common::binlog::consts::EventType::TABLE_MAP_EVENT);
         let mut stream = PayloadStream::new(
             payload.decompressed()?,
-            uncompressed_size.saturating_add(PAYLOAD_SIZE_SLACK),
+            limit,
             u64::from(self.max_event_size),
             tme_header_len,
         );
