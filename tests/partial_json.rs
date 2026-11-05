@@ -10,6 +10,7 @@
 
 use binlog_inspect::{
     event::{CellValue, EventPayload, EventType, Signedness},
+    filter::EventFilter,
     parser::BinlogParser,
 };
 use mysql_common::{
@@ -151,8 +152,13 @@ fn json_column_value(jsonb: &[u8]) -> Vec<u8> {
     out
 }
 
-/// A write rows event inserting one row (unsigned LONG, full JSON document).
-fn write_rows(table_id: u64, long_value: u32, jsonb: &[u8]) -> Vec<u8> {
+/// The body of a write rows event inserting one row (unsigned LONG, full
+/// JSON document). Used for both the V2 (code 30) and V1 (code 23) events:
+/// the fixture's format description leaves the post-header length array
+/// zeroed, so the library reads the V1 event with the V2 layout (6-byte
+/// table id, extra-data length present) — real V1 files declare a post
+/// header of 8 and carry no extra-data field.
+fn write_rows_body(table_id: u64, long_value: u32, jsonb: &[u8]) -> Vec<u8> {
     let mut body = Vec::new();
     body.extend_from_slice(&table_id.to_le_bytes()[..6]);
     body.extend_from_slice(&0u16.to_le_bytes()); // flags
@@ -162,7 +168,17 @@ fn write_rows(table_id: u64, long_value: u32, jsonb: &[u8]) -> Vec<u8> {
     body.push(0); // null bitmap
     body.extend_from_slice(&long_value.to_le_bytes());
     body.extend_from_slice(&json_column_value(jsonb));
-    raw_event(30, &body, true)
+    body
+}
+
+/// A write rows event inserting one row (unsigned LONG, full JSON document).
+fn write_rows(table_id: u64, long_value: u32, jsonb: &[u8]) -> Vec<u8> {
+    raw_event(30, &write_rows_body(table_id, long_value, jsonb), true)
+}
+
+/// A V1 write rows event (code 23, MySQL 5.5 era) with the same body layout.
+fn v1_write_rows(table_id: u64, long_value: u32, jsonb: &[u8]) -> Vec<u8> {
+    raw_event(23, &write_rows_body(table_id, long_value, jsonb), true)
 }
 
 /// An update rows event whose images carry full JSON documents (a partial
@@ -767,4 +783,42 @@ fn json_diff_edge_case_semantics_are_pinned() {
     assert_eq!(diffs[1].path, "$.b[2]");
     assert_eq!(diffs[1].operation, "insert");
     assert_eq!(diffs[1].value, Some(serde_json::json!(3)));
+}
+
+/// A V1 write rows event (code 23, MySQL 5.5 era) is labeled `write_rows`
+/// and decodes a full row payload like its V2 counterpart (code 30), and the
+/// `--events write_rows` whitelist — the library `EventFilter` keyed on the
+/// canonical event type — selects it.
+#[test]
+fn v1_write_rows_are_labeled_and_decoded() {
+    let mut parser = BinlogParser::open(
+        binlog(&[
+            format_description(),
+            table_map(1, false, true),
+            v1_write_rows(1, 9, JSONB_DOC),
+        ])
+        .path(),
+    )
+    .unwrap();
+    let mut events = parser.events();
+    assert!(events.next().unwrap().is_ok()); // format description
+    assert!(events.next().unwrap().is_ok()); // table map
+    let event = events.next().unwrap().unwrap();
+    assert_eq!(event.event_type_code, 23);
+    assert_eq!(event.event_type, EventType::WriteRows);
+    let EventPayload::Rows { changes, .. } = &event.payload else {
+        panic!("expected rows payload");
+    };
+    let after = changes[0].after.as_ref().unwrap();
+    assert_eq!(after.columns[0].value, CellValue::Int(9));
+    assert_eq!(after.columns[0].signedness, Some(Signedness::Unsigned));
+    assert_eq!(
+        after.columns[1].value,
+        CellValue::Json(serde_json::json!({"a": 1, "b": [1, 2]}))
+    );
+    let filter = EventFilter {
+        kinds: [EventType::WriteRows].into_iter().collect(),
+        ..Default::default()
+    };
+    assert!(filter.keep(&event));
 }

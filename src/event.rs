@@ -17,14 +17,16 @@ pub enum EventType {
     FormatDescription,
     /// Table identifier and its schema.
     TableMap,
-    /// Inserted row images.
+    /// Inserted row images (V1 codes 23 and V2 code 30).
     WriteRows,
-    /// Updated row image pairs.
+    /// Updated row image pairs (V1 code 24 and V2 code 31).
     UpdateRows,
-    /// Deleted row images.
+    /// Deleted row images (V1 code 25 and V2 code 32).
     DeleteRows,
-    /// Partial update row events: only before images are full row images,
-    /// after images are JSON diffs that are not decoded.
+    /// Partial update row events: only the before images are full row
+    /// images; the after image's JSON diffs are applied against the before
+    /// values, and unappliable diffs render as the loss-marking
+    /// `partial_json` value.
     PartialUpdateRows,
     /// Statement event.
     Query,
@@ -107,8 +109,10 @@ impl EventType {
 
     /// Maps a raw binlog event type number to the canonical event type.
     ///
-    /// Pre-GA row events (codes 23-25) and MariaDB-only codes (160+) have no
-    /// stable cross-server meaning and are reported as [`EventType::Unknown`].
+    /// V1 row events (codes 23-25, MySQL 5.5 era) map onto the same variants
+    /// as their V2 counterparts (codes 30-32). The pre-GA row events (codes
+    /// 20-22) and MariaDB-only codes (160+) have no stable cross-server
+    /// meaning and are reported as [`EventType::Unknown`].
     pub fn from_raw(code: u8) -> Self {
         match code {
             2 => Self::Query,
@@ -122,6 +126,9 @@ impl EventType {
             17 => Self::BeginLoadQuery,
             18 => Self::ExecuteLoadQuery,
             19 => Self::TableMap,
+            23 => Self::WriteRows,
+            24 => Self::UpdateRows,
+            25 => Self::DeleteRows,
             26 => Self::Incident,
             27 | 41 => Self::Heartbeat,
             28 => Self::Ignorable,
@@ -467,6 +474,9 @@ mod tests {
             (17, "begin_load_query"),
             (18, "execute_load_query"),
             (19, "table_map"),
+            (23, "write_rows"),
+            (24, "update_rows"),
+            (25, "delete_rows"),
             (26, "incident"),
             (27, "heartbeat"),
             (28, "ignorable"),
@@ -488,9 +498,7 @@ mod tests {
         for (code, name) in expected {
             assert_eq!(EventType::from_raw(code).as_str(), name, "code {code}");
         }
-        for code in [
-            0u8, 1, 6, 7, 8, 9, 10, 11, 12, 20, 21, 22, 23, 24, 25, 43, 160, 255,
-        ] {
+        for code in [0u8, 1, 6, 7, 8, 9, 10, 11, 12, 20, 21, 22, 43, 160, 255] {
             assert_eq!(EventType::from_raw(code), EventType::Unknown, "code {code}");
         }
     }
