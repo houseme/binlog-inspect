@@ -29,11 +29,12 @@ jobs:
       matrix:
         os: [ ubuntu-latest, macos-latest, windows-latest ]
         include:
-          # Default feature set (includes `remote` — the reqwest fetcher).
+          # Default features (`cli`) — builds the library and the binary.
           - features: "default"
-          # All features — same set today; guards future feature additions.
+          # All features — adds `remote` (ureq HTTP(S) download + loopback tests).
           - features: "all"
-          # Local-only build without reqwest (README "Install", exit-2 message).
+          # No default features — library only; mirrors the README build gate
+          # and guards the `cli` feature gate (R37).
           - features: "no-default-features"
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
@@ -43,20 +44,26 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+
       - name: Build (lib + bin)
         run: cargo build --locked ${{ matrix.features == 'default' && '' || (matrix.features == 'all' && '--all-features' || '--no-default-features') }}
 
-      - name: Verify both targets are produced
+      - name: Verify the binary and the library are both produced
         if: matrix.os == 'ubuntu-latest' && matrix.features == 'default'
         run: |
-          test -f target/debug/utf8-forge || { echo "bin target missing"; exit 1; }
-          test -f target/debug/libutf8_forge.rlib || { echo "lib target missing"; exit 1; }
-          ./target/debug/utf8-forge --version
+          test -f target/debug/binlog-inspect || { echo "bin target missing"; exit 1; }
+          test -f target/debug/libbinlog_inspect.rlib || { echo "lib target missing"; exit 1; }
+          ./target/debug/binlog-inspect --version
+
+      - name: Verify the library-only build produces no binary
+        if: matrix.os == 'ubuntu-latest' && matrix.features == 'no-default-features'
+        run: test ! -e target/debug/binlog-inspect
 
       - name: Test
         run: cargo test --locked ${{ matrix.features == 'default' && '' || (matrix.features == 'all' && '--all-features' || '--no-default-features') }}
 
-  # ── Functional smoke: scan → dry-run → convert → verify → idempotence ───────
+  # ── Functional smoke: parse → formatters → filters → layered exit codes ─────
 
   smoke:
     name: Functional smoke (${{ matrix.os }})
@@ -71,48 +78,49 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+
       - name: Build release
         run: cargo build --locked --release
 
-      - name: Run the full rollout loop (scan → dry-run → convert → verify) on a mixed tree
+      - name: Exercise the CLI end to end on a synthetic binlog
         shell: bash
         run: |
           set -euo pipefail
-          BIN=./target/release/utf8-forge
-          ROOT=$(mktemp -d)/server
-          mkdir -p "$ROOT/dep"
+          BIN=./target/release/binlog-inspect
 
-          # GBK, UTF-8 BOM, UTF-16LE, plain UTF-8, unknown, protected dir.
-          printf '// \xC4\xE3\xBA\xC3\n'   > "$ROOT/gbk.cpp"
-          printf '\xEF\xBB\xBF// bom\n'    > "$ROOT/bom.h"
-          printf '\xFF\xFEh\0i\0'          > "$ROOT/le.rs"
-          printf 'ascii\n'                 > "$ROOT/plain.md"
-          printf '\xFF\xFF\xFF'            > "$ROOT/broken.cpp"
-          printf 'dep\n'                   > "$ROOT/dep/lib.cpp"
+          "$BIN" --version
+          "$BIN" --completions bash | grep -q binlog-inspect
 
-          # scan: unknown present → exit 1; convert dry-run: issues → exit 1;
-          # real convert: decode_error remains → exit 1.
-          "$BIN" scan    --root "$ROOT" --report scan.json --verbose && exit 1 || test $? -eq 1
-          "$BIN" convert --root "$ROOT" --dry-run        --report dry.json  && exit 1 || test $? -eq 1
-          "$BIN" convert --root "$ROOT" --backup-dir backup                 && exit 1 || test $? -eq 1
+          # Synthetic binlog: 4-byte magic followed by one XID event
+          # (19-byte header + 8-byte body) — the same bytes as the library
+          # doctest in src/lib.rs.
+          BINLOG=$(mktemp)
+          printf '\376bin\001\000\000\000\020\007\000\000\000\033\000\000\000\037\000\000\000\000\000\052\000\000\000\000\000\000\000' > "$BINLOG"
 
-          # Protected and unknown files keep their original bytes.
-          cmp "$ROOT/dep/lib.cpp"  <(printf 'dep\n')
-          cmp "$ROOT/broken.cpp"   <(printf '\xFF\xFF\xFF')
-          # Converted files are now UTF-8 without BOM (G1).
-          cmp "$ROOT/gbk.cpp"      <(printf '// \xE4\xBD\xA0\xE5\xA5\xBD\n')
-          cmp "$ROOT/bom.h"        <(printf '// bom\n')
-          cmp "$ROOT/le.rs"        <(printf 'hi')
-          # Backup holds the pre-conversion bytes, mirrored (§7 rollback).
-          find backup -type f | grep -q 'gbk.cpp' || { echo "backup missing originals"; exit 1; }
+          # JSON Lines: one typed XID event (xid=42, server_id=7, log_pos=31).
+          "$BIN" "$BINLOG" | grep -q '"event_type":"xid"'
+          "$BIN" "$BINLOG" | grep -q '"xid":42'
 
-          # Idempotence: second convert changes 0 bytes;
-          # it still exits 1 because the unknown file is intentionally left.
-          "$BIN" convert --root "$ROOT" --report second.json -q && exit 1 || test $? -eq 1
-          python3 -c "import json;d=json.load(open('second.json'));assert d['summary']['converted']==0, d['summary']"
+          # Text and CSV formatters.
+          "$BIN" "$BINLOG" --format text | grep -q 'xid server=7 pos=31'
+          "$BIN" "$BINLOG" --format csv > rows.csv
+          grep -q '^timestamp,event_type,database,table,before,after' rows.csv
+          test "$(wc -l < rows.csv)" -eq 1  # XID is not a row event: header only
 
-          # Gate: verify flags only the unknown file (exit 3).
-          "$BIN" verify --root "$ROOT" && exit 1 || test $? -eq 3
+          # Filters: a valid but non-matching event type still exits 0.
+          test -z "$("$BIN" "$BINLOG" --events rotate)"
+
+          # Statistics.
+          "$BIN" "$BINLOG" --stats | grep -q '"events_total":1'
+
+          # Layered exit codes: 2 usage error, 1 hard error.
+          rc=0; "$BIN" "$BINLOG" --events bogus >/dev/null 2>&1 || rc=$?
+          test "$rc" -eq 2
+          rc=0; "$BIN" "$BINLOG" --table no_dot >/dev/null 2>&1 || rc=$?
+          test "$rc" -eq 2
+          rc=0; printf '' | "$BIN" - >/dev/null 2>&1 || rc=$?
+          test "$rc" -eq 1
 
   # ── Lint: fmt + clippy quality gates ──────────────────────────────────────
 
@@ -127,10 +135,15 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+
       - name: Rustfmt
         run: cargo fmt --all -- --check
 
-      - name: Clippy (all targets, -D warnings)
+      - name: Clippy (default features, all targets, -D warnings)
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Clippy (all features, all targets, -D warnings)
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
   # ── Documentation ───────────────────────────────────────────────────────────
@@ -143,6 +156,8 @@ jobs:
       - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
 
       - name: Check doc warnings
         run: cargo doc --locked --no-deps
@@ -162,11 +177,15 @@ jobs:
         with:
           targets: x86_64-unknown-linux-musl
 
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: musl
+
       - name: Install musl toolchain
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
       - name: Build (musl, static, default features)
         run: cargo build --locked --release --target x86_64-unknown-linux-musl
 
-      - name: Build (musl, static, no reqwest)
-        run: cargo build --locked --release --target x86_64-unknown-linux-musl --no-default-features
+      - name: Build (musl, static, all features incl. remote)
+        run: cargo build --locked --release --target x86_64-unknown-linux-musl --all-features
