@@ -9,26 +9,40 @@ categories = ["database", "command-line-utilities"]
 license = "Apache-2.0"
 repository = "https://github.com/houseme/binlog-inspect"
 
+# The binary lives in the CLI layer; building it requires the cli feature,
+# so `--no-default-features` checks the library alone (R37).
+[[bin]]
+name = "binlog-inspect"
+path = "src/main.rs"
+required-features = ["cli"]
+
 [features]
-default = []
+# The CLI layer (clap, completions, datetime parsing) is a default feature so
+# a plain dependency build still yields the binary; library consumers can use
+# default-features = false to drop it (R37).
+default = ["cli"]
+cli = ["dep:clap", "dep:clap_complete", "dep:jiff", "dep:anyhow"]
 remote = ["dep:ureq", "dep:tempfile"]
 
 [dependencies]
 mysql_common = { version = "0.38.2", features = ["binlog"] }
-clap = { version = "4.6.7", features = ["derive"] }
-clap_complete = "4"
+clap = { version = "4.6.7", features = ["derive"], optional = true }
+clap_complete = { version = "4", optional = true }
 # Only system-timezone datetime parsing is needed; no serde or named-zone
 # lookup support (R26 --start-datetime/--stop-datetime).
-jiff = { version = "0.2", default-features = false, features = ["std", "tz-system"] }
+jiff = { version = "0.2", default-features = false, features = ["std", "tz-system"], optional = true }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 thiserror = "2.0.21"
-anyhow = "1.0.104"
+anyhow = { version = "1.0.104", optional = true }
 ureq = { version = "3.5.1", optional = true }
 tempfile = { version = "3.27.0", optional = true }
 
 [dev-dependencies]
 tempfile = "3.27.0"
+# Integration tests drive the CLI through CARGO_BIN_EXE, which requires the
+# cli feature to be part of the dev build.
+clap = { version = "4.6.7", features = ["derive"] }
 
 [profile.release]
 lto = "thin"

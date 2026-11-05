@@ -8,9 +8,10 @@ use serde::{Deserialize, Serialize};
 ///
 /// The JSON output renders the snake_case variant name, which matches the
 /// historical string values byte for byte.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, clap::ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "cli", derive(clap::ValueEnum))]
 #[serde(rename_all = "snake_case")]
-#[value(rename_all = "snake_case")]
+#[cfg_attr(feature = "cli", value(rename_all = "snake_case"))]
 pub enum EventType {
     /// Layout description for the rest of the binlog file.
     FormatDescription,
