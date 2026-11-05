@@ -65,6 +65,7 @@ pub struct BinlogParser<R: Read = File> {
     stopped: bool,
     buffer: Vec<u8>,
     max_event_size: u32,
+    warnings: Vec<String>,
 }
 
 impl BinlogParser<File> {
@@ -106,6 +107,7 @@ impl<R: Read> BinlogParser<R> {
             stopped: false,
             buffer: Vec::new(),
             max_event_size: MAX_EVENT_SIZE,
+            warnings: Vec::new(),
         })
     }
 
@@ -113,6 +115,16 @@ impl<R: Read> BinlogParser<R> {
     pub fn with_max_event_size(mut self, cap: u32) -> Self {
         self.max_event_size = cap;
         self
+    }
+
+    /// Drains the advisory warnings collected so far.
+    ///
+    /// Warnings are non-fatal observations that do not stop parsing — most
+    /// notably a header `log_pos` that does not land right after its event.
+    /// The buffer is bounded, so a corrupt file cannot grow it without limit;
+    /// call this periodically (the CLI drains after each input).
+    pub fn take_warnings(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.warnings)
     }
 
     /// Iterate over events; a framing or decoding error terminates the stream.
@@ -213,6 +225,19 @@ impl<R: Read> BinlogParser<R> {
                 ));
             }
             let h = event.header();
+            // Advisory only (R35): on a master-written file each header's
+            // log_pos lands right after its event. A mismatch suggests
+            // tampering or a spliced file but does not stop parsing; a zero
+            // log_pos is how artificial events mark "no position".
+            const WARNING_CAP: usize = 100;
+            let log_pos = u64::from(h.log_pos());
+            let expected = offset + u64::from(h.event_size());
+            if log_pos != 0 && log_pos != expected && self.warnings.len() < WARNING_CAP {
+                self.warnings.push(format!(
+                    "log_pos {log_pos} does not match offset {offset} + event size {}",
+                    h.event_size()
+                ));
+            }
             self.offset += u64::from(h.event_size());
             let raw = h.event_type_raw();
             let event_type = EventType::from_raw(raw);

@@ -313,6 +313,9 @@ fn process<R: Read>(
     out: &mut dyn Write,
     strict: bool,
 ) -> Result<Outcome> {
+    // Failures are collected instead of returned from inside the loop so the
+    // iterator borrow ends before the advisory warnings are drained.
+    let mut failure: Option<(bool, binlog_inspect::parser::ParserError)> = None;
     for result in parser.events() {
         match result {
             Ok(event) => {
@@ -325,18 +328,23 @@ fn process<R: Read>(
                     }
                 }
             }
-            Err(err) if strict => {
-                return Err(err).with_context(|| format!("cannot fully parse {name}"));
-            }
             Err(err) => {
-                return Ok(Outcome::Partial {
-                    file: name.to_owned(),
-                    error: err.to_string(),
-                });
+                failure = Some((strict, err));
+                break;
             }
         }
     }
-    Ok(Outcome::Complete)
+    for warning in parser.take_warnings() {
+        eprintln!("warning: {warning}");
+    }
+    match failure {
+        Some((true, err)) => Err(err).with_context(|| format!("cannot fully parse {name}")),
+        Some((false, err)) => Ok(Outcome::Partial {
+            file: name.to_owned(),
+            error: err.to_string(),
+        }),
+        None => Ok(Outcome::Complete),
+    }
 }
 /// Runs every input and flushes the output writer.
 ///
