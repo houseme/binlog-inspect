@@ -10,7 +10,7 @@
 //! library's wire format exactly so no valid table map is rejected.
 use crate::event::{CellValue, ColumnValue, RowImage, Signedness};
 use mysql_common::{
-    binlog::{events::TableMapEvent, row::BinlogRow, value::BinlogValue},
+    binlog::{events::TableMapEvent, jsonb, row::BinlogRow, value::BinlogValue},
     constants::ColumnType,
     proto::MySerialize,
     value::Value,
@@ -38,6 +38,85 @@ const TLV_UPDATED_COLUMN_TYPES: u8 = 15;
 
 /// Lowercase hex digits used for byte rendering.
 const HEX: [u8; 16] = *b"0123456789abcdef";
+
+/// Maximum jsonb nesting depth accepted by the conversion.
+///
+/// MySQL's JSON implementation rejects documents nested deeper than 100
+/// levels, so values written by a real server never exceed this; anything
+/// deeper is hostile input. The cap also bounds the recursion of
+/// [`jsonb_to_serde`], so over-deep input returns a clean `InvalidData`
+/// error instead of overflowing the stack.
+const MAX_JSONB_DEPTH: usize = 100;
+
+/// Converts a library jsonb value into the serde_json model.
+///
+/// Containers are converted here so the conversion recursion is capped at
+/// [`MAX_JSONB_DEPTH`]; deeper (hostile) input returns `InvalidData` instead
+/// of overflowing the stack. Every scalar — including the opaque values
+/// MySQL writes for decimal literals and DECIMAL column values, and for
+/// DATE/TIME/DATETIME values inside JSON — is converted through the
+/// library's own [`jsonb::Value::parse`] rendering, whose documented rules
+/// turn `NEWDECIMAL` opaques into their decimal text form,
+/// DATE/TIME/DATETIME opaques into their text form, and every other opaque
+/// into a `base64:type<id>:<data>` string. Legitimate data therefore never
+/// fails the event.
+fn jsonb_to_serde(value: &jsonb::Value<'_>, depth: usize) -> io::Result<serde_json::Value> {
+    match value {
+        jsonb::Value::SmallArray(container) => {
+            if depth > MAX_JSONB_DEPTH {
+                return Err(jsonb_too_deep());
+            }
+            let mut items = Vec::with_capacity(container.element_count() as usize);
+            for item in container.iter() {
+                items.push(jsonb_to_serde(&item?, depth + 1)?);
+            }
+            Ok(serde_json::Value::Array(items))
+        }
+        jsonb::Value::LargeArray(container) => {
+            if depth > MAX_JSONB_DEPTH {
+                return Err(jsonb_too_deep());
+            }
+            let mut items = Vec::with_capacity(container.element_count() as usize);
+            for item in container.iter() {
+                items.push(jsonb_to_serde(&item?, depth + 1)?);
+            }
+            Ok(serde_json::Value::Array(items))
+        }
+        jsonb::Value::SmallObject(container) => {
+            if depth > MAX_JSONB_DEPTH {
+                return Err(jsonb_too_deep());
+            }
+            let mut members = serde_json::Map::new();
+            for entry in container.iter() {
+                let (key, value) = entry?;
+                members.insert(key.value().into_owned(), jsonb_to_serde(&value, depth + 1)?);
+            }
+            Ok(serde_json::Value::Object(members))
+        }
+        jsonb::Value::LargeObject(container) => {
+            if depth > MAX_JSONB_DEPTH {
+                return Err(jsonb_too_deep());
+            }
+            let mut members = serde_json::Map::new();
+            for entry in container.iter() {
+                let (key, value) = entry?;
+                members.insert(key.value().into_owned(), jsonb_to_serde(&value, depth + 1)?);
+            }
+            Ok(serde_json::Value::Object(members))
+        }
+        // Scalars carry no recursion, so they are converted through the
+        // library's own JsonDom rendering (including its opaque string rules).
+        other => Ok(serde_json::Value::from(other.clone().parse()?)),
+    }
+}
+
+/// The rejection error for jsonb input nested deeper than [`MAX_JSONB_DEPTH`].
+fn jsonb_too_deep() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("jsonb nesting depth exceeds the MySQL limit of {MAX_JSONB_DEPTH} levels"),
+    )
+}
 
 pub(crate) fn decode_row(
     row: &BinlogRow,
@@ -99,10 +178,7 @@ pub(crate) fn decode_row(
                     micros: *micros,
                 },
             },
-            BinlogValue::Jsonb(value) => CellValue::Json(
-                serde_json::Value::try_from(value.clone())
-                    .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?,
-            ),
+            BinlogValue::Jsonb(value) => CellValue::Json(jsonb_to_serde(value, 1)?),
             BinlogValue::JsonDiff(diffs) => {
                 // Without a paired before image (see [`decode_rows_pair`])
                 // there is nothing to apply the diffs to; they are preserved
@@ -643,10 +719,11 @@ mod json_diff {
 
     /// Converts the library's parsed diffs of one column into model records.
     ///
-    /// A diff whose binary JSON value cannot be represented as
-    /// [`serde_json::Value`] (for example an opaque value) yields `None` for
-    /// its value and is reported in the returned problem note instead of
-    /// failing the whole column.
+    /// A diff whose binary JSON value cannot be converted at all (invalid
+    /// UTF-8 in a string member, or nesting beyond the jsonb depth cap)
+    /// yields `None` for its value and is reported in the returned problem
+    /// note instead of failing the whole column; opaque values convert like
+    /// any other scalar (see [`super::jsonb_to_serde`]).
     pub(super) fn parse_diffs(diffs: &[JsonDiff<'_>]) -> (Vec<JsonDiffRecord>, Option<String>) {
         let mut parsed = Vec::with_capacity(diffs.len());
         let mut problem = None;
@@ -657,7 +734,7 @@ mod json_diff {
                 JsonDiffOperation::REMOVE => Operation::Remove,
             };
             let value = match diff.value() {
-                Some(jsonb) => match serde_json::Value::try_from(jsonb.clone()) {
+                Some(jsonb) => match super::jsonb_to_serde(jsonb, 1) {
                     Ok(value) => Some(value),
                     Err(error) => {
                         problem.get_or_insert_with(|| {
@@ -693,6 +770,14 @@ mod json_diff {
     }
 
     /// Applies a single diff to a value in place.
+    ///
+    /// Edge-case semantics, pinned to the server's applier (MySQL
+    /// `sql/json_diff.cc`): an object REPLACE behaves as an upsert (it also
+    /// adds the member when it is absent), and an array INSERT accepts
+    /// index == length (append) but not beyond. Real server diffs always
+    /// target existing paths, so these edges only decide how malformed or
+    /// hostile diff sequences render; the tests in this module and in
+    /// `tests/partial_json.rs` pin them.
     fn apply_one(value: &mut serde_json::Value, diff: &JsonDiffRecord) -> Result<(), ApplyError> {
         let at = |what: &'static str| ApplyError(format!("path `{}`: {what}", diff.path));
         let operation = Operation::parse(&diff.operation)?;
@@ -1126,6 +1211,105 @@ mod tests {
     fn jsonb_fixture_parses_as_expected() {
         let value = serde_json::Value::try_from(jsonb(JSONB_DOC)).unwrap();
         assert_eq!(value, serde_json::json!({"a": 1, "b": [1, 2]}));
+    }
+
+    /// Binary jsonb for a top-level opaque `NEWDECIMAL` value (what MySQL
+    /// writes for a decimal literal or a DECIMAL column value inside JSON):
+    /// type byte 0x0f, the column type (NEWDECIMAL = 246), a variable-length
+    /// data length, and the packed binlog decimal (precision, scale, packed
+    /// digits).
+    fn opaque_decimal_jsonb() -> Vec<u8> {
+        let dec = mysql_common::binlog::decimal::Decimal::parse_str_bytes(b"12.5").unwrap();
+        let mut out = vec![0x0f, 0xf6, 4]; // OPAQUE, NEWDECIMAL, data length
+        out.extend_from_slice(&[3, 1]); // precision 3, scale 1
+        dec.write_bin(&mut out).unwrap();
+        out
+    }
+
+    #[test]
+    fn opaque_decimal_jsonb_renders_as_a_string_not_a_failure() {
+        let value = jsonb_to_serde(&jsonb(&opaque_decimal_jsonb()), 1).unwrap();
+        assert_eq!(value, serde_json::json!("12.5"));
+    }
+
+    /// A nested large jsonb array holding three elements: element 0 is the
+    /// child container (or, at the bottom of a chain, another inlined
+    /// int16), elements 1 and 2 are inlined int16s. Nested values carry no
+    /// type byte of their own — the value entry names the type and points
+    /// at the payload, so the payload starts with the element count field.
+    fn nested_large_array(child: Option<&[u8]>) -> Vec<u8> {
+        let mut out = vec![0x03, 0x00, 0x00, 0x00]; // payload: element count = 3
+        let size_pos = out.len();
+        out.extend(0u32.to_le_bytes()); // size counts from the element-count field
+        if child.is_some() {
+            out.push(0x03); // element 0: the child container
+            out.extend(23u32.to_le_bytes()); // offset from the element-count field
+        } else {
+            out.push(0x05); // element 0: inlined int16
+            out.extend(1i16.to_le_bytes());
+            out.extend([0, 0]);
+        }
+        out.push(0x05); // elements 1 and 2: inlined int16s
+        out.extend(1i16.to_le_bytes());
+        out.extend([0, 0]);
+        out.push(0x05);
+        out.extend(1i16.to_le_bytes());
+        out.extend([0, 0]);
+        if let Some(child) = child {
+            out.extend(child);
+        }
+        let total = out.len() as u32;
+        out[size_pos..size_pos + 4].copy_from_slice(&total.to_le_bytes());
+        out
+    }
+
+    /// A top-level large array wrapping a chain of `depth - 1` nested
+    /// containers, so `depth` counts the containers in total. Large arrays
+    /// carry 4-byte offsets and sizes, so deep chains cannot be built from
+    /// the small format.
+    fn deep_jsonb(depth: usize) -> Vec<u8> {
+        let mut chain = nested_large_array(None);
+        for _ in 1..depth - 1 {
+            chain = nested_large_array(Some(&chain));
+        }
+        let mut out = vec![0x03];
+        out.extend(3u32.to_le_bytes()); // real element count
+        let size_pos = out.len();
+        out.extend(0u32.to_le_bytes()); // size counts from the count field
+        out.push(0x03); // element 0: the nested chain
+        out.extend(23u32.to_le_bytes()); // offset from the count field
+        out.push(0x05); // elements 1 and 2: inlined int16s
+        out.extend(1i16.to_le_bytes());
+        out.extend([0, 0]);
+        out.push(0x05);
+        out.extend(1i16.to_le_bytes());
+        out.extend([0, 0]);
+        out.extend(chain);
+        let total = (out.len() - 1) as u32;
+        out[size_pos..size_pos + 4].copy_from_slice(&total.to_le_bytes());
+        out
+    }
+
+    #[test]
+    fn jsonb_at_the_depth_cap_converts_and_beyond_is_rejected() {
+        // MySQL's own limit is 100 nesting levels: 100 containers convert.
+        // Every container holds its child plus two int16 scalars.
+        let at_cap = jsonb(&deep_jsonb(MAX_JSONB_DEPTH));
+        let mut expected = serde_json::json!([1, 1, 1]);
+        for _ in 1..MAX_JSONB_DEPTH {
+            expected = serde_json::Value::Array(vec![
+                expected,
+                serde_json::json!(1),
+                serde_json::json!(1),
+            ]);
+        }
+        assert_eq!(jsonb_to_serde(&at_cap, 1).unwrap(), expected);
+        // One level deeper is hostile input: a clean InvalidData error, not
+        // a stack overflow.
+        let over = jsonb(&deep_jsonb(MAX_JSONB_DEPTH + 1));
+        let err = jsonb_to_serde(&over, 1).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("nesting depth"), "{}", err);
     }
 
     /// REPLACE `$.b[1]` with 99, as written into a partial JSON after image.

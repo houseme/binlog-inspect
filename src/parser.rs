@@ -534,8 +534,11 @@ impl<R: Read> BinlogParser<R> {
         // The library only writes uncompressed_size for compressed payloads
         // (NONE payloads carry 0 on the wire); for NONE the decompressed
         // stream is the payload bytes themselves, so the exact payload size
-        // is the honest limit. Compressed payloads get the declared size plus
-        // a small slack so a bomb must lie by more than the slack to pass.
+        // is the honest limit — the limit below is looser than exact by the
+        // header TLV bytes the framing already consumed, a difference the
+        // 1 MiB slack covers intentionally. Compressed payloads get the
+        // declared size plus a small slack so a bomb must lie by more than
+        // the slack to pass.
         let limit = match payload.algorithm() {
             TransactionPayloadCompressionType::NONE => u64::from(event.header().event_size())
                 .saturating_sub(19)
