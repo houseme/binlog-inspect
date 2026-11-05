@@ -8,7 +8,7 @@ use binlog_inspect::{
     parser::{BinlogParser, MAX_EVENT_SIZE, ParserError},
 };
 use std::{
-    io::Write,
+    io::{Read, Write},
     process::{Command, Output, Stdio},
 };
 
@@ -285,6 +285,49 @@ fn stdin_dash_is_parsed() {
     );
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["payload"]["xid"], 99);
+}
+
+#[test]
+fn broken_pipe_from_a_piped_reader_exits_zero() {
+    // R40: `binlog-inspect big.binlog | head -c 100` must exit 0 on every
+    // write path. The JSONL formatter surfaces writer failures as
+    // FormatterError::Json(serde_json::Error), which hides the underlying io
+    // error one level down, so the graceful-exit check has to see through it.
+    // 2000 events produce far more output than any OS pipe buffer, so the
+    // child is guaranteed to hit the closed pipe while still writing.
+    let mut bytes = b"\xfebin".to_vec();
+    for index in 0..2000u64 {
+        bytes.extend(event(16, &index.to_le_bytes()));
+    }
+    let f = file(&bytes);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_binlog-inspect"))
+        .arg(f.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Read a few bytes, then close the read end while the child is still
+    // producing output.
+    {
+        let mut stdout = child.stdout.take().unwrap();
+        let mut first = [0u8; 16];
+        stdout.read_exact(&mut first).unwrap();
+    }
+    let output = child.wait_with_output().unwrap();
+    // std maps a closed pipe to ErrorKind::BrokenPipe on every platform
+    // (Windows ERROR_BROKEN_PIPE included), so the exit-0 contract is
+    // asserted uniformly.
+    assert!(
+        output.status.success(),
+        "exit {:?}: {}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("panicked"),
+        "a broken pipe must not panic: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 #[test]
 fn gtid_events_expose_kind_gtid_value_and_tag() {
