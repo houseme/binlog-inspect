@@ -1,8 +1,7 @@
-# cargo-deny policy (R38). Advisory scanning already runs daily in CI
-# (.github/workflows/audit.yml); this file adds the license and duplicate
-# checks for local runs: `cargo deny check`.
-# Note: cargo-deny is not wired into CI because the audit workflow covers
-# advisories; run `cargo deny check` locally before a release.
+# cargo-deny policy (R38). The audit workflow runs both the RustSec
+# advisory scan and `cargo deny check` (advisories, licenses, bans,
+# sources) on a daily schedule and on manual dispatch; run
+# `cargo deny check` locally before a release as well.
 
 [advisories]
 version = 2
