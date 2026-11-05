@@ -193,7 +193,7 @@ Common fields of every JSON object:
 | `format_description` | `format_description` | `server_version`: string, truncated at the first NUL. |
 | `table_map` | `table_map` | `table_id`, `database`, `table` (strings), `column_count`: integer. |
 | `rows` | `write_rows` / `update_rows` / `delete_rows` | `table_id`: integer; `database`, `table`: strings; `changes`: array, one `{"before": image or null, "after": image or null}` per row. A write normally has only an `after` image, a delete only a `before` image, and an update both. |
-| `partial_update_rows` | `partial_update_rows` | `table_id`, `database`, `table`; `before`: array, one full row image or `null` (when the image is absent) per row. The JSON-diff after image is intentionally not decoded. |
+| `partial_update_rows` | `partial_update_rows` | `table_id`, `database`, `table`; `before`: array, one full row image or `null` (when the image is absent) per row; `after`: array, one row image or `null` per row, with the WL#2955 JSON diffs applied against the before values — an applied JSON column is a full document, an unappliable one is a `partial_json` value preserving the diffs and the reason. |
 | `unresolved` | `write_rows` / `update_rows` / `delete_rows` / `partial_update_rows` (no table map) | `table_id`: integer. |
 | `query` | `query` | `database`, `sql`: strings. |
 | `xid` | `xid` | `xid`: integer. |
@@ -238,6 +238,7 @@ Each column (`ColumnValue`):
 | `date` | `{year, month, day, hour, minute, second, micros}` | Date/time components, including zero dates. |
 | `time` | `{negative, days, hours, minutes, seconds, micros}` | Signed TIME components, possibly exceeding 24 hours. |
 | `json` | any JSON | Fully decoded JSON value. |
+| `partial_json` | `{diffs, reason}` | A JSON column whose binlog diff sequence could not be applied: `diffs` preserves every transmitted diff (`path`, `operation` as `replace`/`insert`/`remove`, `value`), `reason` says why (no before value, missing path, invalid operation, …). |
 
 ## Filtering
 
@@ -269,7 +270,7 @@ Framing (event sizes, checksums) and decoding errors are reported with the file 
 
 Unknown events retain their type code and `raw_len`; the `previous_gtids` event that every standard MySQL 5.7+/8.0 binlog contains is classified normally. These cases do not necessarily cause a nonzero exit, so success does not mean all content was decoded. Older versions, server variants and all types have not been comprehensively validated.
 
-When the server sets `binlog_row_value_options=PARTIAL_JSON`, table maps carry optional metadata types (14/15) that the underlying library does not support, so such files fail at the first table map; this is a known library boundary, not something introduced by the pre-validation.
+When the server sets `binlog_row_value_options=PARTIAL_JSON`, table maps carry optional metadata types (14/15) and `partial_update_rows` after images carry JSON diff sequences; both are supported — the metadata is accepted (and stripped for the underlying library after checksum verification), and the diffs are applied against the before image, with unappliable ones preserved as `partial_json` values.
 
 `--output` does not overwrite files, but shell `>` redirection is controlled by the shell and can overwrite its target.
 

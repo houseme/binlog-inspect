@@ -4,6 +4,23 @@ This project follows the [Keep a Changelog](https://keepachangelog.com/en/1.1.0/
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-05
+
+Third batch: partial JSON diff application, backlogged correctness and packaging items.
+
+### Added
+
+- **Partial JSON updates (WL#2955) are fully decoded.** Binlogs produced with `binlog_row_value_options=PARTIAL_JSON` previously failed at the first row event because their table maps carry optional metadata types 14/15 that the underlying library does not know; those TLVs are now accepted (and transparently stripped before the library parses the table map, after checksum verification on the original bytes), and the JSON diff sequences in `partial_update_rows` after images are applied against the before image's JSON value: an applied column renders as a full JSON document (`"type": "json"`), a diff that cannot be applied renders as the new loss-marking value type `"type": "partial_json"` carrying the preserved diffs and the reason. New payload key `payload.after` on `partial_update_rows` (one applied row image or `null` per row, alongside the existing `before`).
+- Advisory `log_pos` continuity checking (R35): a header `log_pos` that does not land right after its event (a sign of tampering or splicing) prints a non-fatal `warning: log_pos … does not match …` line on stderr; parsing continues and the exit status is unaffected. The warning buffer is capped, and `BinlogParser::take_warnings` exposes it to library callers.
+- Column-count tolerance (R36), mirroring the MySQL applier: a row event may declare fewer columns than its table map records (the table grew after the event was written); missing tail columns render as explicit `absent` entries instead of failing the file. A row event declaring more columns than the table map remains an error.
+- `deny.toml` for `cargo deny check` (license and duplicate-crate policy); advisory scanning already runs daily in CI.
+
+### Changed
+
+- **Library breaking**: `EventPayload::PartialUpdateRows` gains an `after: Vec<Option<RowImage>>` field.
+- **Packaging**: the CLI layer (clap, completions, datetime parsing, anyhow) moved behind a default-on `cli` feature (R37); library consumers can use `default-features = false` to drop it. The binary declares `required-features = ["cli"]`, so `--no-default-features` checks the library alone.
+- The hand-rolled loopback HTTP test servers drain the request before responding, fixing a rare macOS RST flake in the download tests.
+
 ## [0.3.0] - 2026-11-05
 
 Second batch: compressed transaction support, range filters, statistics, completions, and download/event size limits.

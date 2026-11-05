@@ -78,12 +78,12 @@ Status markers: `[done W1]` implemented in the first batch, `[done W2]` implemen
 
 - **R31 [done] LICENSE choice: Apache-2.0**, confirmed through the repository's own git history (LICENSE file, `license = "Apache-2.0"`, SPDX headers in commit 95d2422 / 3f27b0e). Swap by replacing LICENSE and the Cargo.toml field if the choice ever changes.
 - **R32 [pending user decision] crates.io publishing**: licensing and the repository URL now exist; only the publish act (and a maintainer-owned `repository = "https://github.com/houseme/binlog-inspect"` confirmation) remains. The README/USAGE already advertise library reuse.
-- **R33 [backlog] Partial JSON diff application** (merging WL#2955 diffs into full values). High effort; W2 delivers only R6's honest presentation.
-- **R34 [backlog] MariaDB-specific event types** (GTID 163 etc.). Requires MariaDB reference implementation and samples.
-- **R35 [backlog] Advisory `log_pos` continuity checking** (needs artificial-flag awareness to avoid false positives).
-- **R36 [backlog] Tolerance policy for row-event `num_columns` ≤ table-map column count** (currently strict equality, always true for single-primary binlogs; keep as-is and document).
-- **R37 [backlog] MSRV verification / rust-toolchain pinning**; move `clap` behind a `cli` feature (if `EventType` derives `ValueEnum` when implementing R1, defer this item).
-- **R38 [backlog] `cargo deny`/audit integration; split into a virtual workspace with lib/bin crates.**
+- **R33 [done W3] Partial JSON diff application**: TLV 14/15 accepted (and stripped for the library after checksum verification), diffs applied against before values in the code 39 after image (`payload.after`), unappliable diffs preserved as loss-marking `partial_json` values.
+- **R34 [backlog] MariaDB-specific event types** (GTID 163 etc.). Requires MariaDB reference implementation and samples; not implementable from this repository alone.
+- **R35 [done W3] Advisory `log_pos` continuity checking**: non-fatal stderr warnings (offset + size mismatch, zero log_pos ignored, buffer capped) and `BinlogParser::take_warnings` for library callers.
+- **R36 [done W3] Tolerance policy**: a row event may declare fewer columns than the table map (missing tail columns render as `absent`); declaring more is still an error.
+- **R37 [partially done W3] The CLI layer moved behind a default-on `cli` feature** (clap, clap_complete, jiff, anyhow; binary declares `required-features = ["cli"]`). MSRV verification / rust-toolchain pinning remains [backlog].
+- **R38 [partially done W3] `deny.toml` added for local `cargo deny check`** (advisory scanning already runs daily via the audit workflow); the virtual workspace lib/bin split remains [backlog].
 
 ## Contract: API Specification for the First Parallel Implementation Batch
 

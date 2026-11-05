@@ -54,9 +54,9 @@ Strict parsing of the user-provided plaintext MySQL 8.0.30-format sample read to
 
 The row-value comparison covered only the 445 comparable integers among the first 53 row images: 443 matched, and the remaining two belonged to the before/after images of the same unsigned INT column — identical in the low 32 bits but displayed with different signs by this tool and the MariaDB tool. MariaDB's `-vv` output exited early on this sample and did not cover the whole file; the Oracle MySQL tooling or a real table schema is needed for further verification. Values of other event types and multi-row events have not been adequately compared. This record contains no business data, and agreement in event counts must not be read as full value correctness.
 
-## Local Sample Validation Record (2026-11-05, v0.3.0)
+## Local Sample Validation Record (2026-11-05, v0.3.0 / re-validated v0.4.0)
 
-Re-validation of the same user-provided MySQL 8.0.30-format sample (moved out of the repository tree; accessed read-only in place) with the 0.3.0 build. Only aggregate statistics were captured; no business data was printed or stored.
+Re-validation of the same user-provided MySQL 8.0.30-format sample (moved out of the repository tree; accessed read-only in place) with the 0.3.0 build, then re-confirmed unchanged on the 0.4.0 build: strict parse exit 0, 620,173 events, stderr empty (the new log_pos advisory stays silent on a genuine file), by_type identical. Only aggregate statistics were captured; no business data was printed or stored.
 
 Strict parsing (`--strict > /dev/null`) read to EOF and exited 0 in about 1.3 s for the 79 MB file. `--stats` reported 620,173 events, `bytes_total` 79,685,521 (file size minus the 4-byte magic), `errors: 0`, and 116 distinct `database.table` entries. An independent 19-byte-header traversal counted exactly the same total (620,173) with the same per-code distribution, and every code maps onto the reported `by_type` counts: query(2)=124,034, rotate(4)=1, format_description(15)=1, xid(16)=124,034, table_map(19)=124,034, write_rows(30)=31,340, update_rows(31)=86,415, delete_rows(32)=6,279, gtid(33)=124,034, previous_gtids(35)=1. `previous_gtids` is now classified (it counted as `unknown` in the 2026-11-04 record); no other type appeared. The MariaDB build of `mysqlbinlog --verify-binlog-checksum` again completed and exited 0.
 

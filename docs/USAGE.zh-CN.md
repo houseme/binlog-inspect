@@ -193,7 +193,7 @@ timestamp,event_type,database,table,before,after
 | `format_description` | `format_description` | `server_version`：字符串，已在首个 NUL 处截断。 |
 | `table_map` | `table_map` | `table_id`、`database`、`table`（字符串）、`column_count`：数字。 |
 | `rows` | `write_rows` / `update_rows` / `delete_rows` | `table_id`：数字；`database`、`table`：字符串；`changes`：数组，每项 `{"before": 镜像或 null, "after": 镜像或 null}`。写入通常只有 `after`，删除通常只有 `before`，更新两者都有。 |
-| `partial_update_rows` | `partial_update_rows` | `table_id`、`database`、`table`；`before`：数组，每项为完整行镜像或 `null`（镜像缺失时）。after 的 JSON 差异有意不解码。 |
+| `partial_update_rows` | `partial_update_rows` | `table_id`、`database`、`table`；`before`：数组，每项为完整行镜像或 `null`（镜像缺失时）；`after`：数组，每项为行镜像或 `null`，其中 WL#2955 的 JSON 差异已应用到 before 值——应用成功的 JSON 列是完整文档，无法应用的为保留差异与原因的 `partial_json` 值。 |
 | `unresolved` | `write_rows` / `update_rows` / `delete_rows` / `partial_update_rows`（无表映射时） | `table_id`：数字。 |
 | `query` | `query` | `database`、`sql`：字符串。 |
 | `xid` | `xid` | `xid`：数字。 |
@@ -238,6 +238,7 @@ timestamp,event_type,database,table,before,after
 | `date` | `{year, month, day, hour, minute, second, micros}` | 日期/时间分量，含零日期。 |
 | `time` | `{negative, days, hours, minutes, seconds, micros}` | 有符号 TIME 分量，可超过 24 小时。 |
 | `json` | 任意 JSON | 解码后的完整 JSON 值。 |
+| `partial_json` | `{diffs, reason}` | 无法应用 binlog 差异序列的 JSON 列：`diffs` 保留每条已传输的差异（`path`、`operation` 为 `replace`/`insert`/`remove`、`value`），`reason` 说明原因（无 before 值、路径不存在、操作非法等）。 |
 
 ## 过滤
 
@@ -269,7 +270,7 @@ timestamp,event_type,database,table,before,after
 
 未知事件保留类型码与 `raw_len`；标准 MySQL 5.7+/8.0 binlog 必含的 `previous_gtids` 事件会正常分类。这些情况不一定导致非零退出，不能将成功退出视为所有内容均已解码。旧版本、变体服务端及所有类型尚未全面验证。
 
-服务器开启 `binlog_row_value_options=PARTIAL_JSON` 时，表映射会携带底层库尚不支持的 optional metadata 类型（14/15），文件在第一个表映射处即报错退出；这是底层库的已知边界，而非本工具的预校验引入。
+服务器开启 `binlog_row_value_options=PARTIAL_JSON` 时，表映射会携带 optional metadata 类型（14/15），`partial_update_rows` 的 after 镜像携带 JSON 差异序列；两者均已支持——元数据被接受（并经校验和验证后为底层库剥离），差异应用到 before 镜像上，无法应用的以 `partial_json` 值保留。
 
 `--output` 不覆盖文件，但 shell 的 `>` 重定向由 shell 控制，可能覆盖目标。
 
