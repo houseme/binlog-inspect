@@ -16,6 +16,21 @@ name = "binlog-inspect"
 path = "src/main.rs"
 required-features = ["cli"]
 
+# These suites drive the CLI through CARGO_BIN_EXE, so building them
+# requires the cli feature (R37); cargo skips them without it instead of
+# failing at runtime on the missing binary.
+[[test]]
+name = "compressed"
+required-features = ["cli"]
+
+[[test]]
+name = "integration"
+required-features = ["cli"]
+
+[[test]]
+name = "remote"
+required-features = ["cli"]
+
 [features]
 # The CLI layer (clap, completions, datetime parsing) is a default feature so
 # a plain dependency build still yields the binary; library consumers can use
