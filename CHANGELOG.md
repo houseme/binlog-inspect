@@ -4,6 +4,32 @@ This project follows the [Keep a Changelog](https://keepachangelog.com/en/1.1.0/
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-05
+
+Second batch: compressed transaction support, range filters, statistics, completions, and download/event size limits.
+
+### Added
+
+- **Compressed transaction payloads (code 40, WL#3549)** are now decoded instead of rejected: the compression header is hand-pre-validated before the underlying crate parses it (unknown algorithm bytes, oversized TLV skips and other hostile shapes are clean errors instead of crate panics), decompression always streams (the pre-allocating danger API is never used) and is bounded — a declared uncompressed size above 1 GiB is rejected up front, and decompressed output beyond the declared size plus a 1 MiB slack is rejected (bomb resistance); for `NONE` payloads the limit is the actual payload size plus slack, since the wire declares 0. Inner events are pre-validated like outer events and share table-map state; inner events that would rewrite parser state (nested format description, rotate, nested payload) are rejected. New payload `transaction_payload { compression, uncompressed_size, events }` where `events` are full event objects whose `offset` counts from the start of the decompressed stream.
+- Range filters, all applied post-parse and combinable with every other filter: `--start-position` (inclusive) / `--stop-position` (exclusive, mysqlbinlog convention), `--start-datetime` / `--stop-datetime` (inclusive; `YYYY-MM-DD HH:MM:SS` in the system time zone or RFC3339), and `--include-gtid` (exact-match `uuid:gno` or `uuid:tag:gno`, repeatable; UUIDs lowercased, tags validated per MySQL tag rules, GNOs ≥ 1; only the GTID event is kept, not the whole transaction).
+- `--stats`: one JSON statistics object (`files`, `events_total`, `bytes_total`, `transactions`, `by_type`, `by_table`, `errors`) over the kept events after all inputs; respects every other filter; `--format` is accepted but ignored.
+- `--completions <bash|elvish|fish|powershell|zsh>`: print shell completions and exit before opening any input.
+- `--max-download-size <BYTES>` (remote feature, default 4 GiB): a download exceeding the cap is aborted without leaking the URL.
+- `--max-event-size <BYTES>` (default 67108864, hard limit 1 GiB, minimum 19): adjusts the per-event cap via the library's `with_max_event_size`.
+
+### Changed
+
+- `--events transaction_payload` is selectable again (it was rejected in 0.2.0 because the event was then rejected at the framing layer).
+- A closed stdout (for example when piping into `head`) is treated as a normal end (exit 0) instead of a broken-pipe error.
+
+### Fixed
+
+- Previous-GTIDs intervals with degenerate endpoints (`start = 0` or `end <= start`) are rejected during pre-validation instead of overflowing the set-string renderer.
+- Table-map pre-validation now mirrors the crate's `ParseBuf` lenenc semantics for header counts and ENUM/SET variant counts (`0xfb`/`0xff` decode as 0), so non-canonical encodings the crate accepts are no longer bypassed or falsely rejected; TLV length prefixes remain strict.
+- A failed `--output` publish no longer leaves the temporary file behind.
+- Large uncompressed (`NONE`) transaction payloads (above the old 1 MiB slack) are no longer falsely rejected.
+- `--include-gtid` validation tightened: tag length (≤ 32) and charset per MySQL rules; GNO 0 rejected.
+
 ## [0.2.0] - 2026-11-05
 
 First batch of review fixes (event classification, CLI reliability and safety, performance, library quality, documentation, and engineering).

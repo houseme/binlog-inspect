@@ -28,13 +28,24 @@ cargo build --locked --release --features remote
 | 参数 | 说明 |
 | --- | --- |
 | `[FILES]...` | 本地 binlog 文件路径；`-` 表示从标准输入读取。 |
-| `-f, --format <FORMAT>` | 输出格式：`jsonl`（默认）、`text` 或 `csv`。 |
+| `-f, --format <FORMAT>` | 输出格式：`jsonl`（默认）、`text` 或 `csv`。指定 `--stats` 时被忽略。 |
 | `-o, --output <FILE>` | 写入新文件而非标准输出；已有文件不会被覆盖。 |
 | `--events <EVENTS>` | 逗号分隔的事件类型，可重复；不指定则包含所有类型。 |
 | `--table <database.table>` | 按 `database.table` 过滤，可重复；不指定则包含所有表和非表事件。 |
+| `--start-position <OFFSET>` | 保留起始字节偏移 ≥ `OFFSET` 的事件（含边界）。 |
+| `--stop-position <OFFSET>` | 保留起始字节偏移 < `OFFSET` 的事件（不含边界，mysqlbinlog 惯例）。 |
+| `--start-datetime <DATETIME>` | 保留时间戳 ≥ `DATETIME` 的事件（含边界）。`DATETIME` 为系统时区的 `YYYY-MM-DD HH:MM:SS` 或 RFC3339 时间戳。 |
+| `--stop-datetime <DATETIME>` | 保留时间戳 ≤ `DATETIME` 的事件（含边界；注意 mysqlbinlog 的 stop-datetime 不含边界）。 |
+| `--include-gtid <GTID>` | 仅保留 `payload.gtid` 与 `GTID` 完全相等（`uuid:gno` 或 `uuid:tag:gno`）的 GTID 事件；可重复；不支持区间或集合运算。 |
+| `--stats` | 输出单个 JSON 统计对象代替事件行：仅统计被保留的事件，全部输入处理完后输出。 |
+| `--completions <SHELL>` | 输出 `bash`、`elvish`、`fish`、`powershell` 或 `zsh` 的补全脚本并退出；忽略其他参数，不打开任何输入。 |
+| `--max-event-size <BYTES>` | 超过 `BYTES` 字节的单个事件按 "invalid or oversized" 拒绝（默认 67108864；不得超过 1 GiB 检查上限）。 |
 | `--strict` | 任一输入出现第一个错误即中止全部（退出码 1）；不指定时错误停止当前文件，其余文件继续处理，最终退出码为 3。 |
 | `--url <URL>` | HTTP(S) 文件地址，可重复；仅在构建时启用 `remote` 后可用。 |
+| `--max-download-size <BYTES>` | 下载超过 `BYTES` 字节时中止（默认 4294967296）；仅在构建时启用 `remote` 后可用。 |
 | `-h, --help` / `-V, --version` | 显示帮助 / 版本。 |
+
+所有过滤器（`--events`、`--table`、位置、时间与 GTID 过滤）以 AND 组合，在解析完成后应用，不影响解析状态。
 
 ### --events 全部取值
 
@@ -68,12 +79,7 @@ cargo build --locked --release --features remote
 | `view_change` | 组复制视图变更（未解码）。 |
 | `xa_prepare` | XA 事务准备（未解码）。 |
 | `unknown` | 本版本未命名的事件类型（含 MariaDB 专有的 160+ 类型码）。 |
-
-`transaction_payload` 也是 `EventType` 的取值之一，但**不能**用于 `--events`：压缩事务事件在事件框架层被拒绝，尚未支持。选中它会在参数解析期报错并以退出码 2 结束：
-
-```text
-error: invalid value 'transaction_payload' for '--events <EVENTS>': compressed transaction payload events are not selectable; they are rejected at the framing layer (see DESIGN.md)
-```
+| `transaction_payload` | 压缩事务 payload（WL#3549，MySQL 8）；在安全的解压限制下解码。 |
 
 未知取值同样在参数解析期报错（退出码 2），错误消息列出全部合法值：
 
@@ -92,6 +98,14 @@ error: invalid value 'bogus' for '--events <EVENTS>': unknown event type; valid 
 ./target/release/binlog-inspect mysql-bin.000001 --events query,xid --format text
 # 从标准输入读取
 cat mysql-bin.000001 | ./target/release/binlog-inspect - --events xid
+# 字节偏移窗口（start 含边界，stop 不含）
+./target/release/binlog-inspect mysql-bin.000001 --start-position 4 --stop-position 1073741824
+# 时间窗口与精确 GTID
+./target/release/binlog-inspect mysql-bin.000001 --start-datetime "2026-01-01 00:00:00" --include-gtid 3E11FA47-71CA-11E1-9E33-C80AA9429562:23
+# 输出单个 JSON 统计对象代替事件行
+./target/release/binlog-inspect mysql-bin.000001 --stats
+# shell 补全（bash、elvish、fish、powershell、zsh）
+./target/release/binlog-inspect --completions zsh > ~/.zfunc/_binlog-inspect
 # 需要 remote feature 的构建
 ./target/release/binlog-inspect --url https://example.com/mysql-bin.000001 --format csv --output rows.csv
 ```
@@ -190,6 +204,7 @@ timestamp,event_type,database,table,before,after
 | `rows_query` | `rows_query` | `sql`：字符串。 |
 | `incident` | `incident` | `incident_type`：字符串（如 `INCIDENT_LOST_EVENTS`，未识别的类型码为 `UNKNOWN(n)`）；`message`：字符串。 |
 | `intvar` | `intvar` | `var_type`：字符串（`INVALID_INT_EVENT` / `LAST_INSERT_ID_EVENT` / `INSERT_ID_EVENT`）；`value`：数字。 |
+| `transaction_payload` | `transaction_payload` | `compression`：字符串（`NONE` 或 `ZSTD`）；`uncompressed_size`：payload 头声明的数字（`NONE` 时为 `0`）；`events`：完整事件对象数组（结构与顶层事件相同），其 `offset` 从解压流起点计数，`timestamp`/`server_id` 继承压缩事件头。 |
 | `unknown` | `rand`、`user_var`、`begin_load_query`、`execute_load_query`、`heartbeat`、`ignorable`、`transaction_context`、`view_change`、`xa_prepare`、`unknown` 及所有 MariaDB 专有类型 | `raw_len`：数字，保留的事件数据长度。 |
 
 ### 行镜像结构
@@ -226,16 +241,29 @@ timestamp,event_type,database,table,before,after
 
 ## 过滤
 
-事件类型过滤与表过滤同时生效，分别在各自列表内做匹配；过滤在解析之后进行，不能绕过解析错误。
+所有过滤器以 AND 组合；过滤在解析之后进行，不能绕过解析错误，也不影响解析状态。
 
 - `--events`：保留列出的 `event_type`；不指定则保留所有类型。
 - `--table`：只保留匹配的 table map、行事件与部分 JSON 更新事件；Query、XID、GTID 等非表事件会被排除，没有表映射的行事件（`unresolved`）因不携带表名也永不匹配。值在第一个 `.` 处拆分为 `(database, table)` 后按字符串精确比较，不做大小写归一化。
+- `--start-position` / `--stop-position`：保留字节偏移 `>= start` 且 `< stop` 的事件（start 含边界，stop 不含）。与 mysqlbinlog 在 stop 位置停止读文件不同，后续事件仍会流经解析器，只是被过滤掉。
+- `--start-datetime` / `--stop-datetime`：保留时间戳 `>= start` 且 `<= stop` 的事件（两端均含边界；mysqlbinlog 的 stop-datetime 不含边界，本工具按帮助文本所述为含边界）。时间在参数解析期完成换算，早于窗口或时间戳为零的事件自然不匹配。
+- `--include-gtid`：对 GTID 事件的 `payload.gtid` 做精确匹配白名单。UUID 部分归一化为小写，tag 区分大小写且须满足 MySQL tag 规则（1–32 个字符，以字母或下划线开头），GNO 从 1 开始。只保留 GTID 事件本身——与 mysqlbinlog 的 `--include-gtids` 不同，不会保留整个事务。
 
-基于位置、时间或 GTID 的范围过滤尚未提供（计划见 [ROADMAP](../ROADMAP.md)）。
+### 统计模式
+
+`--stats` 用单个 JSON 对象代替事件输出，汇总所有输入处理后仍被保留的事件：
+
+```json
+{"files":1,"events_total":4,"bytes_total":127,"transactions":0,"by_type":{"table_map":1,"write_rows":1,"xid":2},"by_table":{"d.t":1},"errors":0}
+```
+
+（样例为合成四事件文件——XID、table map、write rows、XID——的真实输出。）计数仅覆盖被保留的事件，因此统计遵循所有其他过滤器。`files` 为处理的输入数；`bytes_total` 为保留事件的 `event_size` 之和；`transactions` 为 GTID payload 事件数（含匿名事务；XID 不计入）；`by_table` 按 `database.table` 统计行变更数（write/update/delete rows 与 `partial_update_rows` 的 before 镜像）；`errors` 为部分解析失败的输入数（进程仍以退出码 3 结束并在标准错误输出逐文件错误摘要）。该模式下 `--format` 被接受但忽略；JSON 对象照常写入标准输出或 `--output` 文件。
 
 ## 错误、输入和安全
 
-事件逐个读取，单个事件上限为 64 MiB，内存占用与文件大小无关。明文文件头为 `FE 62 69 6E`；加密文件（`FD 62 69 6E`）被明确拒绝，提示通过 MySQL 服务器使用 `mysqlbinlog --read-from-remote-server` 获取明文，但应保护传输及副本。HTTP(S) 下载会先写入自动清理的临时文件，需要足够磁盘空间；HTTPS URL 的重定向不能降级到 HTTP。下载并不会解密数据。
+事件逐个读取，单个事件上限为 64 MiB（可用 `--max-event-size` 调整，硬上限 1 GiB），内存占用与文件大小无关。明文文件头为 `FE 62 69 6E`；加密文件（`FD 62 69 6E`）被明确拒绝，提示通过 MySQL 服务器使用 `mysqlbinlog --read-from-remote-server` 获取明文，但应保护传输及副本。HTTP(S) 下载会先写入自动清理的临时文件，需要足够磁盘空间；下载超过 `--max-download-size`（默认 4 GiB）即中止。HTTPS URL 的重定向不能降级到 HTTP。下载并不会解密数据。
+
+压缩事务 payload（code 40）安全解码：压缩头在底层库解析前完成校验（未知算法是干净的错误）；解压流式进行且有界（声明超过 1 GiB 直接拒绝，解压输出超出声明大小加少量余量即拒绝）；内层事件与外层事件一样做预校验。会改写解析器状态的内层事件（内层 format description、rotate 或嵌套压缩 payload）被拒绝。
 
 事件框架（事件大小、校验和）与解码错误会带文件偏移报告：previous-GTIDs 头部声明的 SID 数与表映射 optional metadata（含 ENUM/SET 变体数）在交给底层解码前做上界预校验，敌意构造的输入返回错误而不是进程崩溃。CRC32 校验和不匹配同样报错。错误按[退出码](#退出码)一节分层处理。
 
@@ -249,7 +277,7 @@ timestamp,event_type,database,table,before,after
 
 - 定位不同：本工具是离线明文 binlog 检查器，不实现 MySQL 服务端协议，也不解密；需要从服务器获取明文时请使用 `mysqlbinlog --read-from-remote-server`。
 - 输出面向机器：JSON Lines / CSV 每事件一条记录，行镜像区分缺失列与 SQL NULL；适合管道与脚本处理，不追求 mysqlbinlog 的 SQL 重放输出。
-- 功能子集：没有 `--start-position` / `--stop-position` / `--start-datetime` / `--include-gtid` 等范围过滤（计划见 [ROADMAP](../ROADMAP.md)），不生成重放语句，不跟随 Rotate，压缩事务在框架层拒绝。
+- 功能子集：范围过滤更简单（位置窗口只过滤而非停止读取，时间边界两端均含，GTID 选择按事件精确匹配而非按事务），不生成重放语句，不跟随 Rotate，压缩 payload 内的事务不会解压成可重放 SQL。
 - 校验行为：逐事件验证 CRC32 校验和，并对敌意构造的事件头和表映射元数据做 fail-closed 预校验；`partial_update_rows` 只给出 before 镜像。
 
 ## 作为 Rust 库使用

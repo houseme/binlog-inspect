@@ -58,7 +58,7 @@ cargo run --locked --features remote -- --url https://example.com/mysql-bin.0000
 ## 限制
 
 - 仅支持明文文件；加密 binlog 会被明确拒绝，HTTP 下载不会解密，也不是 MySQL 复制协议。
-- 压缩事务（code 40）在事件框架层拒绝，计划后续支持；`--events transaction_payload` 不可选。
+- 压缩事务（code 40）已安全解码：压缩头在解码前预校验，解压流式且有界（声明大小 + 余量；超过 1 GiB 的声明直接拒绝），内层事件与解析器共享表映射状态。
 - `partial_update_rows` 只解码 before 镜像；after 的 JSON 差异有意不解码。
 - Rotate 事件只报告不跟随，需自行列出下一个文件。
 - MariaDB 专有事件类型（160+）保持 `unknown`；`rand`、`user_var` 等命名类型只保留类型与 `raw_len`。
@@ -69,8 +69,8 @@ cargo run --locked --features remote -- --url https://example.com/mysql-bin.0000
 ## 文档与开发
 
 - [中文使用文档](docs/USAGE.zh-CN.md) | [English usage guide](docs/USAGE.en.md)
-- [设计文档](DESIGN.md)（中文）；[构建与验证记录](EXECUTION.md)（中文）
-- [ROADMAP](ROADMAP.md)（中文）；[更新日志](CHANGELOG.md)
+- [设计文档](DESIGN.md)；[构建与验证记录](EXECUTION.md)（中文）
+- [ROADMAP](ROADMAP.md)；[更新日志](CHANGELOG.md)
 
 ```sh
 cargo clippy --locked --all-targets -- -D warnings

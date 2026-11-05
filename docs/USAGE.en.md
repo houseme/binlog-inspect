@@ -28,13 +28,24 @@ The table matches `binlog-inspect --help`:
 | Option | Description |
 | --- | --- |
 | `[FILES]...` | Local binlog file paths; `-` reads from standard input. |
-| `-f, --format <FORMAT>` | Output format: `jsonl` (default), `text`, or `csv`. |
+| `-f, --format <FORMAT>` | Output format: `jsonl` (default), `text`, or `csv`. Ignored when `--stats` is set. |
 | `-o, --output <FILE>` | Write to a new file instead of stdout; existing files are not overwritten. |
 | `--events <EVENTS>` | Comma-separated event types; repeatable. Omit to include all types. |
 | `--table <database.table>` | Filter to `database.table`; repeatable. Omit to include all tables and non-table events. |
+| `--start-position <OFFSET>` | Keep events starting at byte offset `OFFSET` (inclusive). |
+| `--stop-position <OFFSET>` | Keep events starting before byte offset `OFFSET` (exclusive, mysqlbinlog convention). |
+| `--start-datetime <DATETIME>` | Keep events with timestamp at or after `DATETIME`; inclusive. `DATETIME` is `YYYY-MM-DD HH:MM:SS` in the system time zone or an RFC3339 timestamp. |
+| `--stop-datetime <DATETIME>` | Keep events with timestamp at or before `DATETIME`; inclusive (note: mysqlbinlog's stop-datetime is exclusive). |
+| `--include-gtid <GTID>` | Keep only GTID payload events whose GTID is exactly `GTID` (`uuid:gno` or `uuid:tag:gno`); repeatable; no interval or set algebra. |
+| `--stats` | Print one JSON statistics object instead of event lines: counts over the kept events only, after all inputs. |
+| `--completions <SHELL>` | Print shell completions for `bash`, `elvish`, `fish`, `powershell` or `zsh` and exit; all other options are ignored and no input is opened. |
+| `--max-event-size <BYTES>` | Reject single events larger than `BYTES` bytes as "invalid or oversized" (default 67108864; may not exceed the 1 GiB inspection limit). |
 | `--strict` | Abort on the first error in any input (exit code 1); without it an error stops the current file, remaining files are still processed, and the exit code is 3. |
 | `--url <URL>` | HTTP(S) file URL; repeatable and available only when built with `remote`. |
+| `--max-download-size <BYTES>` | Abort a download that exceeds `BYTES` bytes (default 4294967296); available only when built with `remote`. |
 | `-h, --help` / `-V, --version` | Show help / version. |
+
+All filters (`--events`, `--table`, position, datetime and GTID filters) combine with AND and are applied after parsing, so they cannot affect parser state.
 
 ### All --events values
 
@@ -68,12 +79,7 @@ The values map one-to-one to the library `EventType` enum, which is also the set
 | `view_change` | Group replication view change (undecoded). |
 | `xa_prepare` | XA transaction prepare (undecoded). |
 | `unknown` | Event type this version does not name (including MariaDB-specific 160+ codes). |
-
-`transaction_payload` is also an `EventType` value but **cannot** be used with `--events`: compressed transaction payload events are rejected at the framing layer and are not supported yet. Selecting it fails at argument parsing with exit code 2:
-
-```text
-error: invalid value 'transaction_payload' for '--events <EVENTS>': compressed transaction payload events are not selectable; they are rejected at the framing layer (see DESIGN.md)
-```
+| `transaction_payload` | Compressed transaction payload (WL#3549, MySQL 8); decoded with safe decompression limits. |
 
 Unknown values also fail at argument parsing (exit code 2); the error message lists every valid value:
 
@@ -92,6 +98,14 @@ A `--table` value must split at the first `.` into a non-empty database and tabl
 ./target/release/binlog-inspect mysql-bin.000001 --events query,xid --format text
 # Read from standard input
 cat mysql-bin.000001 | ./target/release/binlog-inspect - --events xid
+# A byte-offset window (start inclusive, stop exclusive)
+./target/release/binlog-inspect mysql-bin.000001 --start-position 4 --stop-position 1073741824
+# A timestamp window and an exact GTID
+./target/release/binlog-inspect mysql-bin.000001 --start-datetime "2026-01-01 00:00:00" --include-gtid 3E11FA47-71CA-11E1-9E33-C80AA9429562:23
+# One JSON statistics object instead of event lines
+./target/release/binlog-inspect mysql-bin.000001 --stats
+# Shell completions (bash, elvish, fish, powershell, zsh)
+./target/release/binlog-inspect --completions zsh > ~/.zfunc/_binlog-inspect
 # Requires a build with the remote feature
 ./target/release/binlog-inspect --url https://example.com/mysql-bin.000001 --format csv --output rows.csv
 ```
@@ -190,6 +204,7 @@ Common fields of every JSON object:
 | `rows_query` | `rows_query` | `sql`: string. |
 | `incident` | `incident` | `incident_type`: string (for example `INCIDENT_LOST_EVENTS`; unrecognized codes render as `UNKNOWN(n)`); `message`: string. |
 | `intvar` | `intvar` | `var_type`: string (`INVALID_INT_EVENT` / `LAST_INSERT_ID_EVENT` / `INSERT_ID_EVENT`); `value`: integer. |
+| `transaction_payload` | `transaction_payload` | `compression`: string (`NONE` or `ZSTD`); `uncompressed_size`: integer as declared in the payload header (`0` for `NONE`); `events`: array of full event objects (same shape as top-level events) whose `offset` counts from the start of the decompressed stream and whose `timestamp`/`server_id` are inherited from the compressed event's header. |
 | `unknown` | `rand`, `user_var`, `begin_load_query`, `execute_load_query`, `heartbeat`, `ignorable`, `transaction_context`, `view_change`, `xa_prepare`, `unknown`, and all MariaDB-specific types | `raw_len`: integer, length of the retained event data. |
 
 ### Row image structure
@@ -226,16 +241,29 @@ Each column (`ColumnValue`):
 
 ## Filtering
 
-Event-type and table filters both apply; each accepts any member of its own list. Filtering happens after parsing and cannot bypass parsing errors.
+All filters combine with AND. Filtering happens after parsing and cannot bypass parsing errors or affect parser state.
 
 - `--events`: keeps the listed `event_type` values; omit to keep all types.
 - `--table`: keeps only matching table-map, row and partial-update events; non-table events such as Query, XID and GTID are excluded, and row events without a table map (`unresolved`) carry no table name so they never match. The value is split at the first `.` into `(database, table)` and compared exactly, without case normalization.
+- `--start-position` / `--stop-position`: keep events whose byte offset is `>= start` and `< stop` (start inclusive, stop exclusive). Unlike mysqlbinlog, which stops reading the file at the stop position, later events still stream through the parser; they are just filtered out.
+- `--start-datetime` / `--stop-datetime`: keep events whose timestamp is `>= start` and `<= stop` (both ends inclusive; mysqlbinlog's stop-datetime is exclusive — this tool is inclusive, as its help states). Datetimes are parsed at argument time, so files with pre-epoch or zero timestamps simply never match a realistic window.
+- `--include-gtid`: exact-match allowlist for `payload.gtid` of GTID events. The UUID part is normalized to lowercase, tags are case-sensitive and must satisfy the MySQL tag rules (1–32 characters, starting with a letter or underscore), and GNOs start at 1. Only the GTID event itself is kept — unlike mysqlbinlog's `--include-gtids`, not the whole transaction.
 
-Range filters based on position, time or GTID are not available yet (planned; see the [ROADMAP](../ROADMAP.md)).
+### Statistics mode
+
+`--stats` replaces event output with a single JSON object summarizing the kept events after all inputs:
+
+```json
+{"files":1,"events_total":4,"bytes_total":127,"transactions":0,"by_type":{"table_map":1,"write_rows":1,"xid":2},"by_table":{"d.t":1},"errors":0}
+```
+
+(The sample is the real output for a synthetic four-event file: XID, table map, write rows, XID.) Counts cover kept events only, so statistics respect every other filter. `files` counts inputs processed, `bytes_total` sums `event_size` over kept events, `transactions` counts GTID payload events including anonymous ones (XID events are not counted), `by_table` counts row changes (write/update/delete rows plus `partial_update_rows` before images) per `database.table`, and `errors` counts partial parse failures (the process still exits 3 and prints the per-file error summary on stderr). `--format` is accepted but ignored in this mode; the JSON object is written to stdout or to the `--output` file as usual.
 
 ## Errors, input and safety
 
-Events are read one at a time, with a 64 MiB maximum per event; memory use does not scale with file size. Plaintext files begin with `FE 62 69 6E`; encrypted files (`FD 62 69 6E`) are explicitly rejected with a hint to obtain plaintext through the MySQL server using `mysqlbinlog --read-from-remote-server`, taking care to protect the transfer and copy. HTTP(S) downloads are first written to an automatically cleaned temporary file and require sufficient disk space. Redirects from an HTTPS URL cannot downgrade to HTTP. Downloading does not decrypt data.
+Events are read one at a time, with a 64 MiB maximum per event (adjustable with `--max-event-size`, hard limit 1 GiB); memory use does not scale with file size. Plaintext files begin with `FE 62 69 6E`; encrypted files (`FD 62 69 6E`) are explicitly rejected with a hint to obtain plaintext through the MySQL server using `mysqlbinlog --read-from-remote-server`, taking care to protect the transfer and copy. HTTP(S) downloads are first written to an automatically cleaned temporary file and require sufficient disk space; a download is aborted once it exceeds `--max-download-size` (default 4 GiB). Redirects from an HTTPS URL cannot downgrade to HTTP. Downloading does not decrypt data.
+
+Compressed transaction payloads (code 40) are decoded safely: the compression header is validated before the underlying library parses it (unknown algorithms are a clean error), decompression streams and is bounded (a declaration above 1 GiB is rejected outright, and decompressed output beyond the declared size plus a small slack is rejected), and inner events are pre-validated like outer ones. Inner events that would rewrite parser state (a nested format description, a rotate or another compressed payload) are rejected.
 
 Framing (event sizes, checksums) and decoding errors are reported with the file offset: the SID count declared by previous-GTIDs headers and table-map optional metadata (including ENUM/SET variant counts) are bounds-checked before the underlying decoder runs, so hostile input produces an error instead of a crash. A CRC32 checksum mismatch is an error too. Errors are layered as described in [Exit codes](#exit-codes).
 
@@ -249,7 +277,7 @@ When the server sets `binlog_row_value_options=PARTIAL_JSON`, table maps carry o
 
 - Different positioning: this tool is an offline plaintext binlog inspector; it does not implement the MySQL server protocol and does not decrypt. Use `mysqlbinlog --read-from-remote-server` against the server to obtain plaintext.
 - Machine-oriented output: JSON Lines / CSV with one record per event, and row images that distinguish absent columns from SQL NULL; suitable for piping and scripting rather than mysqlbinlog's SQL replay output.
-- Feature subset: no range filters such as `--start-position` / `--stop-position` / `--start-datetime` / `--include-gtid` (planned; see the [ROADMAP](../ROADMAP.md)), no replay-statement generation, no Rotate following, and compressed transactions are rejected at the framing layer.
+- Feature subset: range filters are simpler (position windows filter rather than stop reading, datetime bounds are inclusive on both ends, and GTID selection is exact-match per event rather than per transaction), there is no replay-statement generation, Rotate is not followed, and transactions inside a compressed payload are not decompressed into replayable SQL.
 - Verification behavior: CRC32 checksums are verified per event, and hostile event headers and table-map metadata are pre-validated fail-closed; `partial_update_rows` exposes only the before image.
 
 ## Use as a Rust library

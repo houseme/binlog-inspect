@@ -56,7 +56,7 @@ Requires a current Rust stable toolchain. The project uses the Rust 2024 edition
 ## Limitations
 
 - Only plaintext files are supported. Encrypted binlogs are rejected; HTTP download neither decrypts them nor implements the MySQL replication protocol.
-- Compressed transactions (code 40) are rejected at the framing layer; support is planned for a later release, and `--events transaction_payload` is not selectable.
+- Compressed transactions (code 40) are decoded safely: the compression header is pre-validated, decompression is streamed and bounded (declared size + slack; >1 GiB declarations rejected), and inner events share the parser's table-map state.
 - `partial_update_rows` decodes only the before image; the JSON-diff after image is intentionally not decoded.
 - Rotate events are reported but not followed; list the next file yourself.
 - MariaDB-specific event types (160+) remain `unknown`; named types such as `rand` and `user_var` keep only the type and `raw_len`.

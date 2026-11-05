@@ -19,7 +19,7 @@ cargo run --locked -- path/to/mysql-bin.000001 --table app.orders --format csv -
 cargo run --locked --features remote -- --url https://example.com/mysql-bin.000001
 ```
 
-Multiple local files, multiple URLs, `-` (stdin), and repeated `--table` options are supported. Output goes to stdout by default; `--output` writes atomically and never overwrites an existing file. `--events` takes a comma-separated list; see `--help` or the [usage guide](docs/USAGE.en.md) for all values; `transaction_payload` is not selectable. Exit codes are layered: 0 success, 1 hard error, 2 usage error, 3 partial parse failure; when errors occur the output may be incomplete, so check the exit status. See `DESIGN.md` for the data format, errors, and unsupported scenarios.
+Multiple local files, multiple URLs, `-` (stdin), and repeated `--table` options are supported. Output goes to stdout by default; `--output` writes atomically and never overwrites an existing file. `--events` takes a comma-separated list; see `--help` or the [usage guide](docs/USAGE.en.md) for all values. Position, datetime and exact-GTID filters, `--stats`, `--completions`, `--max-event-size` and `--max-download-size` are documented in the usage guide. Exit codes are layered: 0 success, 1 hard error, 2 usage error, 3 partial parse failure; when errors occur the output may be incomplete, so check the exit status. See `DESIGN.md` for the data format, errors, and unsupported scenarios.
 
 ## Quality Gates
 
@@ -53,3 +53,11 @@ The following record was produced before the 0.2.0 event reclassification, when 
 Strict parsing of the user-provided plaintext MySQL 8.0.30-format sample read to EOF and exited with status 0. An independent event-header scan agreed with the parser on event types and totals — 620,173 events in total; there were no unresolved table maps. The MariaDB build of `mysqlbinlog --verify-binlog-checksum` completed and exited 0.
 
 The row-value comparison covered only the 445 comparable integers among the first 53 row images: 443 matched, and the remaining two belonged to the before/after images of the same unsigned INT column — identical in the low 32 bits but displayed with different signs by this tool and the MariaDB tool. MariaDB's `-vv` output exited early on this sample and did not cover the whole file; the Oracle MySQL tooling or a real table schema is needed for further verification. Values of other event types and multi-row events have not been adequately compared. This record contains no business data, and agreement in event counts must not be read as full value correctness.
+
+## Local Sample Validation Record (2026-11-05, v0.3.0)
+
+Re-validation of the same user-provided MySQL 8.0.30-format sample (moved out of the repository tree; accessed read-only in place) with the 0.3.0 build. Only aggregate statistics were captured; no business data was printed or stored.
+
+Strict parsing (`--strict > /dev/null`) read to EOF and exited 0 in about 1.3 s for the 79 MB file. `--stats` reported 620,173 events, `bytes_total` 79,685,521 (file size minus the 4-byte magic), `errors: 0`, and 116 distinct `database.table` entries. An independent 19-byte-header traversal counted exactly the same total (620,173) with the same per-code distribution, and every code maps onto the reported `by_type` counts: query(2)=124,034, rotate(4)=1, format_description(15)=1, xid(16)=124,034, table_map(19)=124,034, write_rows(30)=31,340, update_rows(31)=86,415, delete_rows(32)=6,279, gtid(33)=124,034, previous_gtids(35)=1. `previous_gtids` is now classified (it counted as `unknown` in the 2026-11-04 record); no other type appeared. The MariaDB build of `mysqlbinlog --verify-binlog-checksum` again completed and exited 0.
+
+Scope caveats carried over: the sample contains no compressed transactions, tagged GTIDs, partial JSON updates, anonymous GTIDs or minimal row images, so the 0.3.0 features are exercised only by synthetic tests; value-level comparison against reference tooling remains limited to the 2026-11-04 record. Count agreement is not value correctness.
