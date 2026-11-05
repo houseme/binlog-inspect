@@ -1,0 +1,172 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  # Daily catch-up with Rust toolchain regressions
+  schedule:
+    - cron: "17 03 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+
+# ── Build & Test ─────────────────────────────────────────────────────────────
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }}, ${{ matrix.features }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-latest, macos-latest, windows-latest ]
+        include:
+          # Default feature set (includes `remote` — the reqwest fetcher).
+          - features: "default"
+          # All features — same set today; guards future feature additions.
+          - features: "all"
+          # Local-only build without reqwest (README "Install", exit-2 message).
+          - features: "no-default-features"
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build (lib + bin)
+        run: cargo build --locked ${{ matrix.features == 'default' && '' || (matrix.features == 'all' && '--all-features' || '--no-default-features') }}
+
+      - name: Verify both targets are produced
+        if: matrix.os == 'ubuntu-latest' && matrix.features == 'default'
+        run: |
+          test -f target/debug/utf8-forge || { echo "bin target missing"; exit 1; }
+          test -f target/debug/libutf8_forge.rlib || { echo "lib target missing"; exit 1; }
+          ./target/debug/utf8-forge --version
+
+      - name: Test
+        run: cargo test --locked ${{ matrix.features == 'default' && '' || (matrix.features == 'all' && '--all-features' || '--no-default-features') }}
+
+  # ── Functional smoke: scan → dry-run → convert → verify → idempotence ───────
+
+  smoke:
+    name: Functional smoke (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-latest, macos-latest, windows-latest ]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release
+        run: cargo build --locked --release
+
+      - name: Run the full rollout loop (scan → dry-run → convert → verify) on a mixed tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN=./target/release/utf8-forge
+          ROOT=$(mktemp -d)/server
+          mkdir -p "$ROOT/dep"
+
+          # GBK, UTF-8 BOM, UTF-16LE, plain UTF-8, unknown, protected dir.
+          printf '// \xC4\xE3\xBA\xC3\n'   > "$ROOT/gbk.cpp"
+          printf '\xEF\xBB\xBF// bom\n'    > "$ROOT/bom.h"
+          printf '\xFF\xFEh\0i\0'          > "$ROOT/le.rs"
+          printf 'ascii\n'                 > "$ROOT/plain.md"
+          printf '\xFF\xFF\xFF'            > "$ROOT/broken.cpp"
+          printf 'dep\n'                   > "$ROOT/dep/lib.cpp"
+
+          # scan: unknown present → exit 1; convert dry-run: issues → exit 1;
+          # real convert: decode_error remains → exit 1.
+          "$BIN" scan    --root "$ROOT" --report scan.json --verbose && exit 1 || test $? -eq 1
+          "$BIN" convert --root "$ROOT" --dry-run        --report dry.json  && exit 1 || test $? -eq 1
+          "$BIN" convert --root "$ROOT" --backup-dir backup                 && exit 1 || test $? -eq 1
+
+          # Protected and unknown files keep their original bytes.
+          cmp "$ROOT/dep/lib.cpp"  <(printf 'dep\n')
+          cmp "$ROOT/broken.cpp"   <(printf '\xFF\xFF\xFF')
+          # Converted files are now UTF-8 without BOM (G1).
+          cmp "$ROOT/gbk.cpp"      <(printf '// \xE4\xBD\xA0\xE5\xA5\xBD\n')
+          cmp "$ROOT/bom.h"        <(printf '// bom\n')
+          cmp "$ROOT/le.rs"        <(printf 'hi')
+          # Backup holds the pre-conversion bytes, mirrored (§7 rollback).
+          find backup -type f | grep -q 'gbk.cpp' || { echo "backup missing originals"; exit 1; }
+
+          # Idempotence: second convert changes 0 bytes;
+          # it still exits 1 because the unknown file is intentionally left.
+          "$BIN" convert --root "$ROOT" --report second.json -q && exit 1 || test $? -eq 1
+          python3 -c "import json;d=json.load(open('second.json'));assert d['summary']['converted']==0, d['summary']"
+
+          # Gate: verify flags only the unknown file (exit 3).
+          "$BIN" verify --root "$ROOT" && exit 1 || test $? -eq 3
+
+  # ── Lint: fmt + clippy quality gates ──────────────────────────────────────
+
+  lint:
+    name: Lint (fmt + clippy)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Rustfmt
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (all targets, -D warnings)
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+  # ── Documentation ───────────────────────────────────────────────────────────
+
+  doc:
+    name: Documentation
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Check doc warnings
+        run: cargo doc --locked --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  # ── Cross-compilation (musl, static CLI binary) ─────────────────────────────
+
+  cross-musl:
+    name: Cross (x86_64-unknown-linux-musl)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Install musl toolchain
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Build (musl, static, default features)
+        run: cargo build --locked --release --target x86_64-unknown-linux-musl
+
+      - name: Build (musl, static, no reqwest)
+        run: cargo build --locked --release --target x86_64-unknown-linux-musl --no-default-features

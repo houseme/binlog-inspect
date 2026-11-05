@@ -1,0 +1,33 @@
+[package]
+name = "binlog-inspect"
+version = "0.3.0"
+edition = "2024"
+description = "Offline inspector for plaintext MySQL binary logs with JSON Lines, text and CSV output"
+readme = "README.md"
+keywords = ["mysql", "binlog", "database", "cli", "replication"]
+categories = ["database", "command-line-utilities"]
+
+[features]
+default = []
+remote = ["dep:ureq", "dep:tempfile"]
+
+[dependencies]
+mysql_common = { version = "0.38.2", features = ["binlog"] }
+clap = { version = "4.6.7", features = ["derive"] }
+clap_complete = "4"
+# Only system-timezone datetime parsing is needed; no serde or named-zone
+# lookup support (R26 --start-datetime/--stop-datetime).
+jiff = { version = "0.2", default-features = false, features = ["std", "tz-system"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+anyhow = "1.0.104"
+ureq = { version = "3.5.1", optional = true }
+tempfile = { version = "3.27.0", optional = true }
+
+[dev-dependencies]
+tempfile = "3.27.0"
+
+[profile.release]
+lto = "thin"
+strip = true

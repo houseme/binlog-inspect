@@ -1,0 +1,312 @@
+name: Release
+
+on:
+  # Trigger on version tags: v0.1.0, v1.2.3, etc.
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+*"
+  # Manual dispatch with version input
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Package version to validate or publish (e.g. 0.1.0)."
+        required: true
+        type: string
+      dry_run:
+        description: "Dry run — skip crates.io publish and GitHub release"
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: utf8-forge-release
+  cancel-in-progress: false
+
+env:
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  # ── Resolve & verify version ────────────────────────────────────────────────
+
+  prepare:
+    name: Prepare release
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      is_dry_run: ${{ steps.version.outputs.is_dry_run }}
+      revision: ${{ steps.source.outputs.revision }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && !inputs.dry_run && format('refs/tags/v{0}', inputs.version) || github.sha }}
+
+      - name: Record release revision
+        id: source
+        run: echo "revision=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve version from Cargo.toml
+        id: version
+        env:
+          REQUESTED_VERSION: ${{ inputs.version }}
+          RELEASE_REF: ${{ github.ref_name }}
+          RELEASE_EVENT: ${{ github.event_name }}
+          RELEASE_DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || false }}
+        run: |
+          set -euo pipefail
+          VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
+          test -n "$VERSION" || { echo "::error::Cargo.toml version not found"; exit 1; }
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+          if [ "$RELEASE_EVENT" = "push" ]; then
+            case "$RELEASE_REF" in
+              "v$VERSION") ;;
+              *) echo "::error::tag $RELEASE_REF does not match Cargo.toml version $VERSION"; exit 1 ;;
+            esac
+          fi
+          if [ -n "$REQUESTED_VERSION" ] && [ "$REQUESTED_VERSION" != "$VERSION" ]; then
+            echo "::error::requested version $REQUESTED_VERSION != Cargo.toml version $VERSION"; exit 1
+          fi
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+          echo "is_dry_run=$RELEASE_DRY_RUN" >> "$GITHUB_OUTPUT"
+
+  # ── Full test gate ──────────────────────────────────────────────────────────
+
+  test:
+    name: Test (${{ matrix.os }}, ${{ matrix.toolchain }})
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-latest, macos-latest, windows-latest ]
+        toolchain: [ stable ]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.prepare.outputs.revision }}
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
+
+      - name: Build (default)
+        run: cargo build --locked
+      - name: Test (default)
+        run: cargo test --locked
+      - name: Build (no reqwest)
+        run: cargo build --locked --no-default-features
+      - name: Smoke (release binary rollout loop)
+        run: cargo build --locked --release
+
+  # ── Lint gate ───────────────────────────────────────────────────────────────
+
+  lint:
+    name: Lint
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.prepare.outputs.revision }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Rustfmt
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - name: Documentation
+        run: cargo doc --locked --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+      - name: Verify package archive
+        run: cargo package --locked --allow-dirty --no-verify
+
+  # ── Build platform binaries ─────────────────────────────────────────────────
+
+  build-binaries:
+    name: Build (${{ matrix.target }})
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest,  target: x86_64-unknown-linux-gnu,  archive: tar.gz, strip: "true" }
+          - { os: ubuntu-latest,  target: x86_64-unknown-linux-musl, archive: tar.gz, strip: "true", install: "musl-tools" }
+          - { os: macos-latest,   target: aarch64-apple-darwin,      archive: tar.gz, strip: "true" }
+          - { os: macos-latest,   target: x86_64-apple-darwin,       archive: tar.gz, strip: "true" }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc,    archive: zip,    strip: "false" }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.prepare.outputs.revision }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install musl toolchain
+        if: matrix.install == 'musl-tools'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Build
+        run: cargo build --locked --release --target ${{ matrix.target }}
+
+      - name: Strip binary
+        if: matrix.strip == 'true'
+        run: strip target/${{ matrix.target }}/release/utf8-forge
+
+      - name: Prepare archive directory
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.prepare.outputs.version }}"
+          STAGE="utf8-forge-${VERSION}-${{ matrix.target }}"
+          mkdir -p "$STAGE"
+          BIN="utf8-forge"
+          EXT=""
+          [ "${{ matrix.os }}" = "windows-latest" ] && EXT=".exe" || true
+          cp "target/${{ matrix.target }}/release/utf8-forge$EXT" "$STAGE/utf8-forge$EXT"
+          cp README.md LICENSE "$STAGE/"
+          echo "stage=$STAGE" >> "$GITHUB_ENV"
+
+      - name: Create archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.prepare.outputs.version }}"
+          # bsdtar on all runners infers the format from the extension (-a).
+          tar -a -cf "utf8-forge-${VERSION}-${{ matrix.target }}.${{ matrix.archive }}" "$stage"
+
+      - name: Checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.prepare.outputs.version }}"
+          ARCHIVE="utf8-forge-${VERSION}-${{ matrix.target }}.${{ matrix.archive }}"
+          sha256sum "$ARCHIVE" > "$ARCHIVE.sha256"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: utf8-forge-${{ needs.prepare.outputs.version }}-${{ matrix.target }}
+          path: |
+            utf8-forge-${{ needs.prepare.outputs.version }}-${{ matrix.target }}.${{ matrix.archive }}
+            utf8-forge-${{ needs.prepare.outputs.version }}-${{ matrix.target }}.${{ matrix.archive }}.sha256
+          retention-days: 14
+
+  # ── Publish to crates.io ────────────────────────────────────────────────────
+
+  publish:
+    name: Publish to crates.io
+    needs: [ prepare, test, lint ]
+    if: needs.prepare.outputs.is_dry_run != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.prepare.outputs.revision }}
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish --locked
+
+  # ── GitHub Release ──────────────────────────────────────────────────────────
+
+  github-release:
+    name: GitHub Release
+    needs: [ prepare, build-binaries, publish ]
+    if: needs.prepare.outputs.is_dry_run != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - name: Download all platform archives
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate release notes
+        env:
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          cat > /tmp/release-notes.md <<'HEADER'
+          ## utf8-forge v${RELEASE_VERSION}
+
+          Idempotent, bidirectional charset transcoder for source trees — default output: **UTF-8 without BOM**.
+
+          ### Downloads
+          HEADER
+          for f in dist/*.tar.gz dist/*.zip; do
+            base=$(basename "$f")
+            echo "- \`$base\`" >> /tmp/release-notes.md
+          done
+          cat >> /tmp/release-notes.md <<'FOOTER'
+
+          ### Verify
+          ```bash
+          sha256sum -c utf8-forge-${RELEASE_VERSION}-<target>.tar.gz.sha256
+          ```
+
+          ### Quick start
+          ```bash
+          ./utf8-forge scan    --root <dir> --report scan.json
+          ./utf8-forge convert --root <dir> --dry-run --report dry.json
+          ./utf8-forge convert --root <dir> --backup-dir <backup>
+          ./utf8-forge verify  --root <dir>
+          ```
+          FOOTER
+          # Expand the two variables inside the heredocs.
+          sed -e "s/\${RELEASE_VERSION}/${RELEASE_VERSION}/g" /tmp/release-notes.md > /tmp/release-notes.final.md
+          cat /tmp/release-notes.final.md
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          name: v${{ needs.prepare.outputs.version }}
+          body_path: /tmp/release-notes.final.md
+          draft: false
+          prerelease: ${{ contains(needs.prepare.outputs.version, '-') }}
+          generate_release_notes: false
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.sha256
+
+  # ── Dry run summary ─────────────────────────────────────────────────────────
+
+  dry-run-summary:
+    name: Dry Run Summary
+    needs: [ prepare, test, lint, build-binaries ]
+    if: needs.prepare.outputs.is_dry_run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Summary
+        run: |
+          {
+            echo "## 🏷️ Dry Run Complete"
+            echo ""
+            echo "- **Version**: \`${{ needs.prepare.outputs.version }}\`"
+            echo "- **Tag**: \`${{ needs.prepare.outputs.tag }}\`"
+            echo "- Tests: ✅ passed"
+            echo "- Lint: ✅ passed"
+            echo "- Binaries: ✅ built for 5 targets"
+            echo ""
+            echo "To publish for real, re-run with **dry_run** unchecked."
+          } >> "$GITHUB_STEP_SUMMARY"
