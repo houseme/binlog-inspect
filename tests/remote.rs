@@ -40,6 +40,30 @@ fn output_is_created_and_existing_input_is_never_overwritten() {
     assert!(!result.status.success());
 }
 
+/// Whether a raw response promises more body bytes than it carries.
+///
+/// A body shorter than its Content-Length leaves the child waiting for the
+/// missing bytes; if the server then also waits for the child to close, the
+/// two wait on each other until the drain bound. Such responses are
+/// known-truncated and take the shutdown path in `serve_once` instead (B10).
+#[cfg(feature = "remote")]
+fn is_truncated(response: &[u8]) -> bool {
+    let Some(split) = response.windows(4).position(|window| window == b"\r\n\r\n") else {
+        return false;
+    };
+    let (head, body) = response.split_at(split + 4);
+    head.split(|&byte| byte == b'\n')
+        .find_map(|line| {
+            let value = line.strip_prefix(b"Content-Length:")?;
+            std::str::from_utf8(value)
+                .ok()?
+                .trim()
+                .parse::<usize>()
+                .ok()
+        })
+        .is_some_and(|promised| body.len() < promised)
+}
+
 #[cfg(feature = "remote")]
 fn serve_once(response: &'static [u8]) -> (String, std::thread::JoinHandle<()>) {
     use std::{
@@ -65,15 +89,27 @@ fn serve_once(response: &'static [u8]) -> (String, std::thread::JoinHandle<()>) 
                         .unwrap();
                     drain_request(&mut stream);
                     let _ = stream.write_all(response);
-                    // Do not close first: an immediate close can drop the
-                    // buffered body before the child reads it. Wait for the
-                    // child to finish reading and close instead, bounded.
-                    let until = Instant::now() + Duration::from_secs(30);
-                    let mut sink = [0u8; 2048];
-                    while Instant::now() < until {
-                        match stream.read(&mut sink) {
-                            Ok(0) | Err(_) => break,
-                            Ok(_) => {}
+                    if is_truncated(response) {
+                        // The body is short of the promised Content-Length:
+                        // the child keeps waiting for the missing bytes, and
+                        // the drain wait below waits for the child — a
+                        // deadlock until the bound. Half-close the write side
+                        // to hand the child a clean EOF so it fails fast; the
+                        // request was drained, so this is a clean FIN, and
+                        // the child has nothing more to send us (B10).
+                        let _ = stream.shutdown(std::net::Shutdown::Write);
+                    } else {
+                        // Do not close first: an immediate close can drop the
+                        // buffered body before the child reads it. Wait for
+                        // the child to finish reading and close instead,
+                        // bounded.
+                        let until = Instant::now() + Duration::from_secs(30);
+                        let mut sink = [0u8; 2048];
+                        while Instant::now() < until {
+                            match stream.read(&mut sink) {
+                                Ok(0) | Err(_) => break,
+                                Ok(_) => {}
+                            }
                         }
                     }
                     break;
@@ -177,6 +213,9 @@ fn drain_request(stream: &mut std::net::TcpStream) {
 #[cfg(feature = "remote")]
 #[test]
 fn remote_rejects_partial_or_interrupted_responses_without_leaking_url() {
+    // The second response promises 10 body bytes but sends 4; serve_once
+    // half-closes the write side for known-truncated responses so the child
+    // fails fast instead of the suite waiting out the 30 s drain bound (B10).
     for response in [
         b"HTTP/1.1 206 Partial Content\r\nContent-Length: 4\r\nConnection: close\r\n\r\n\xfebin"
             .as_slice(),
