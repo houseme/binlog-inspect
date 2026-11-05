@@ -22,7 +22,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: utf8-forge-release
+  group: binlog-inspect-release
   cancel-in-progress: false
 
 env:
@@ -98,9 +98,11 @@ jobs:
         run: cargo build --locked
       - name: Test (default)
         run: cargo test --locked
-      - name: Build (no reqwest)
+      - name: Test (all features, incl. remote)
+        run: cargo test --locked --all-features
+      - name: Build (no default features)
         run: cargo build --locked --no-default-features
-      - name: Smoke (release binary rollout loop)
+      - name: Build (release)
         run: cargo build --locked --release
 
   # ── Lint gate ───────────────────────────────────────────────────────────────
@@ -163,19 +165,18 @@ jobs:
 
       - name: Strip binary
         if: matrix.strip == 'true'
-        run: strip target/${{ matrix.target }}/release/utf8-forge
+        run: strip target/${{ matrix.target }}/release/binlog-inspect
 
       - name: Prepare archive directory
         shell: bash
         run: |
           set -euo pipefail
           VERSION="${{ needs.prepare.outputs.version }}"
-          STAGE="utf8-forge-${VERSION}-${{ matrix.target }}"
+          STAGE="binlog-inspect-${VERSION}-${{ matrix.target }}"
           mkdir -p "$STAGE"
-          BIN="utf8-forge"
           EXT=""
           [ "${{ matrix.os }}" = "windows-latest" ] && EXT=".exe" || true
-          cp "target/${{ matrix.target }}/release/utf8-forge$EXT" "$STAGE/utf8-forge$EXT"
+          cp "target/${{ matrix.target }}/release/binlog-inspect$EXT" "$STAGE/binlog-inspect$EXT"
           cp README.md LICENSE "$STAGE/"
           echo "stage=$STAGE" >> "$GITHUB_ENV"
 
@@ -185,22 +186,22 @@ jobs:
           set -euo pipefail
           VERSION="${{ needs.prepare.outputs.version }}"
           # bsdtar on all runners infers the format from the extension (-a).
-          tar -a -cf "utf8-forge-${VERSION}-${{ matrix.target }}.${{ matrix.archive }}" "$stage"
+          tar -a -cf "binlog-inspect-${VERSION}-${{ matrix.target }}.${{ matrix.archive }}" "$stage"
 
       - name: Checksum
         shell: bash
         run: |
           set -euo pipefail
           VERSION="${{ needs.prepare.outputs.version }}"
-          ARCHIVE="utf8-forge-${VERSION}-${{ matrix.target }}.${{ matrix.archive }}"
+          ARCHIVE="binlog-inspect-${VERSION}-${{ matrix.target }}.${{ matrix.archive }}"
           sha256sum "$ARCHIVE" > "$ARCHIVE.sha256"
 
       - uses: actions/upload-artifact@v7
         with:
-          name: utf8-forge-${{ needs.prepare.outputs.version }}-${{ matrix.target }}
+          name: binlog-inspect-${{ needs.prepare.outputs.version }}-${{ matrix.target }}
           path: |
-            utf8-forge-${{ needs.prepare.outputs.version }}-${{ matrix.target }}.${{ matrix.archive }}
-            utf8-forge-${{ needs.prepare.outputs.version }}-${{ matrix.target }}.${{ matrix.archive }}.sha256
+            binlog-inspect-${{ needs.prepare.outputs.version }}-${{ matrix.target }}.${{ matrix.archive }}
+            binlog-inspect-${{ needs.prepare.outputs.version }}-${{ matrix.target }}.${{ matrix.archive }}.sha256
           retention-days: 14
 
   # ── Publish to crates.io ────────────────────────────────────────────────────
@@ -245,9 +246,9 @@ jobs:
         run: |
           set -euo pipefail
           cat > /tmp/release-notes.md <<'HEADER'
-          ## utf8-forge v${RELEASE_VERSION}
+          ## binlog-inspect v${RELEASE_VERSION}
 
-          Idempotent, bidirectional charset transcoder for source trees — default output: **UTF-8 without BOM**.
+          Offline inspector for plaintext MySQL binary logs with JSON Lines, text and CSV output.
 
           ### Downloads
           HEADER
@@ -259,15 +260,14 @@ jobs:
 
           ### Verify
           ```bash
-          sha256sum -c utf8-forge-${RELEASE_VERSION}-<target>.tar.gz.sha256
+          sha256sum -c binlog-inspect-${RELEASE_VERSION}-<target>.tar.gz.sha256
           ```
 
           ### Quick start
           ```bash
-          ./utf8-forge scan    --root <dir> --report scan.json
-          ./utf8-forge convert --root <dir> --dry-run --report dry.json
-          ./utf8-forge convert --root <dir> --backup-dir <backup>
-          ./utf8-forge verify  --root <dir>
+          ./binlog-inspect mysql-bin.000001 --events query,xid --format text
+          ./binlog-inspect mysql-bin.000001 --table app.orders --format csv --output rows.csv
+          ./binlog-inspect mysql-bin.000001 --stats
           ```
           FOOTER
           # Expand the two variables inside the heredocs.

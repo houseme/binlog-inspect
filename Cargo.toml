@@ -6,6 +6,8 @@ description = "Offline inspector for plaintext MySQL binary logs with JSON Lines
 readme = "README.md"
 keywords = ["mysql", "binlog", "database", "cli", "replication"]
 categories = ["database", "command-line-utilities"]
+license = "Apache-2.0"
+repository = "https://github.com/houseme/binlog-inspect"
 
 [features]
 default = []
