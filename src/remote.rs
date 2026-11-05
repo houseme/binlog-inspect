@@ -60,7 +60,10 @@ pub fn download(url: &str, max_bytes: u64) -> Result<tempfile::TempPath> {
     // Bounded copy in fixed chunks: never trust Content-Length, and stop as
     // soon as one more chunk would exceed the limit.
     let mut copied: u64 = 0;
-    let mut chunk = [0u8; COPY_CHUNK_SIZE];
+    // Heap-allocate the chunk: a 1 MiB stack array overflows the default
+    // 1 MiB main-thread stack on Windows (MSVC PE header) as soon as the
+    // download path runs.
+    let mut chunk = vec![0u8; COPY_CHUNK_SIZE];
     loop {
         let read = body.read(&mut chunk).map_err(|_| {
             anyhow!("HTTP download failed while reading body or writing temporary file")
