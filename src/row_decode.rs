@@ -1,3 +1,6 @@
+// Copyright (c) 2026 houseme
+// SPDX-License-Identifier: Apache-2.0
+
 //! Convert mysql_common row values without exposing its types in the public event model.
 //!
 //! This module also pre-validates hostile table map optional metadata before it

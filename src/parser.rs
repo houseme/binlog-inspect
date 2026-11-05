@@ -1,3 +1,6 @@
+// Copyright (c) 2026 houseme
+// SPDX-License-Identifier: Apache-2.0
+
 //! Stateful, streaming MySQL binlog reader.
 use crate::event::{EventPayload, EventType, ParsedEvent, RowChange};
 use mysql_common::binlog::{

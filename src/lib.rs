@@ -1,3 +1,6 @@
+// Copyright (c) 2026 houseme
+// SPDX-License-Identifier: Apache-2.0
+
 //! Streaming inspection of plaintext MySQL binary logs.
 //!
 //! The crate parses a binlog one event at a time into a stable event model

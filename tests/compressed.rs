@@ -1,3 +1,6 @@
+// Copyright (c) 2026 houseme
+// SPDX-License-Identifier: Apache-2.0
+
 //! Compressed transaction payloads (code 40, WL#3549) decode safely: the
 //! compression algorithm byte is validated before the underlying library can
 //! panic on it, decompression is streamed and bounded by the declared size,

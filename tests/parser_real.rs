@@ -1,3 +1,6 @@
+// Copyright (c) 2026 houseme
+// SPDX-License-Identifier: Apache-2.0
+
 //! Synthetic-binlog parser tests: framing, hostile input, and typed events.
 //!
 //! All fixtures are crafted bytes; no real binlog data is used.

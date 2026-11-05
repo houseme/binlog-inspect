@@ -1,3 +1,6 @@
+// Copyright (c) 2026 houseme
+// SPDX-License-Identifier: Apache-2.0
+
 //! Event, table, range and GTID filters applied after parsing.
 use crate::event::{EventPayload, EventType, ParsedEvent};
 use std::collections::HashSet;

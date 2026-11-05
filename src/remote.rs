@@ -1,3 +1,6 @@
+// Copyright (c) 2026 houseme
+// SPDX-License-Identifier: Apache-2.0
+
 use anyhow::{Context, Result, anyhow, bail};
 use std::{
     io::{Read, Write},

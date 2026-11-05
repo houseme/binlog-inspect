@@ -1,3 +1,6 @@
+// Copyright (c) 2026 houseme
+// SPDX-License-Identifier: Apache-2.0
+
 //! Stable output model, independent of the underlying binlog library.
 use serde::{Deserialize, Serialize};
 

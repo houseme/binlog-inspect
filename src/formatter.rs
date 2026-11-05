@@ -1,3 +1,6 @@
+// Copyright (c) 2026 houseme
+// SPDX-License-Identifier: Apache-2.0
+
 //! Output formatters that operate on the independent event model.
 use crate::event::{EventPayload, ParsedEvent};
 use std::io::Write;
