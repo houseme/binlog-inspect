@@ -535,6 +535,13 @@ fn is_broken_pipe(error: &anyhow::Error) -> bool {
     })
 }
 fn main() -> Result<()> {
+    match run() {
+        Err(error) if is_broken_pipe(&error) => Ok(()),
+        result => result,
+    }
+}
+
+fn run() -> Result<()> {
     let cli = Cli::parse();
     // --completions ignores every other option and never opens any input.
     if let Some(shell) = cli.completions {
@@ -584,14 +591,10 @@ fn main() -> Result<()> {
         None => None,
     };
     let result = run_inputs(&cli, &filter, &mut sink, written.as_deref());
-    if let Err(error) = &result {
+    if result.is_err() {
         // Any failure mid-run leaves no output behind.
         if let Some(written) = &written {
             let _ = std::fs::remove_file(written);
-        }
-        // A closed stdout (for example piped into head) is not an error.
-        if is_broken_pipe(error) {
-            std::process::exit(0);
         }
     }
     let outcomes = result?;

@@ -1212,6 +1212,36 @@ fn cli_completions_print_and_exit_before_reading_input() {
     assert_eq!(out.status.code(), Some(2));
 }
 
+#[cfg(unix)]
+#[test]
+fn cli_completions_to_a_closed_pipe_exit_successfully() {
+    use std::os::{fd::OwnedFd, unix::net::UnixStream};
+
+    for shell in ["bash", "elvish", "fish", "powershell", "zsh"] {
+        let (reader, writer) = UnixStream::pair().unwrap();
+        // Close the reader before spawning, so even small scripts reliably
+        // encounter BrokenPipe without relying on child scheduling.
+        drop(reader);
+        let stdout: OwnedFd = writer.into();
+        let output = Command::new(env!("CARGO_BIN_EXE_binlog-inspect"))
+            .args(["--completions", shell])
+            .stdout(Stdio::from(stdout))
+            .stderr(Stdio::piped())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{shell}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.stderr.is_empty(),
+            "{shell}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
 #[test]
 fn cli_max_event_size_caps_and_validates() {
     let mut bytes = b"\xfebin".to_vec();
