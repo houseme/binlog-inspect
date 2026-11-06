@@ -263,7 +263,7 @@ timestamp,event_type,database,table,before,after
 
 ## 错误、输入和安全
 
-事件逐个读取，单个事件上限为 64 MiB（可用 `--max-event-size` 调整，硬上限 1 GiB），内存占用与文件大小无关。明文文件头为 `FE 62 69 6E`；加密文件（`FD 62 69 6E`）被明确拒绝，提示通过 MySQL 服务器使用 `mysqlbinlog --read-from-remote-server` 获取明文，但应保护传输及副本。HTTP(S) 下载会先写入自动清理的临时文件，需要足够磁盘空间；下载超过 `--max-download-size`（默认 4 GiB）即中止。HTTPS URL 的重定向不能降级到 HTTP。下载并不会解密数据。
+原始事件逐个读取，大小上限为 64 MiB（可用 `--max-event-size` 调整，硬上限 1 GiB）。解码后的行镜像、共享表映射及聚合的事务内层事件会占用额外内存。明文文件头为 `FE 62 69 6E`；加密文件（`FD 62 69 6E`）被明确拒绝，提示通过 MySQL 服务器使用 `mysqlbinlog --read-from-remote-server` 获取明文，但应保护传输及副本。HTTP(S) 下载会先写入自动清理的临时文件，需要足够磁盘空间；下载超过 `--max-download-size`（默认 4 GiB）即中止。HTTPS URL 的重定向不能降级到 HTTP。下载并不会解密数据。
 
 压缩事务 payload（code 40）安全解码：压缩头在底层库解析前完成校验（未知算法是干净的错误）；解压流式进行且有界（声明超过 1 GiB 直接拒绝，解压输出超出声明大小加少量余量即拒绝）；内层事件与外层事件一样做预校验。会改写解析器状态的内层事件（内层 format description、rotate 或嵌套压缩 payload）被拒绝。
 
@@ -294,7 +294,7 @@ binlog-inspect = "0.4"        # or { path = "../binlog-inspect" } for a checkout
 serde_json = "1"
 ```
 
-解析器泛型化于任意 `Read` 输入（文件、标准输入、内存缓冲），逐事件读取并以 [`parser::MAX_EVENT_SIZE`](../src/parser.rs)（64 MiB）限制单个事件的内存分配：
+解析器接受任意 `Read` 输入，包括文件、标准输入和内存缓冲。原始事件的大小上限默认为 64 MiB。以下示例使用聚合迭代器，压缩事务逐个内层事件的交付方式见后面的增量检查章节。
 
 ```rust,no_run
 use binlog_inspect::{event::{EventPayload, EventType}, parser::BinlogParser};
@@ -340,3 +340,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 - `formatter` 模块：`Formatter` trait 直写 `&mut dyn Write` 并返回 `Result<bool, FormatterError>`（表示本事件是否产生输出）；提供 `JsonLinesFormatter`、`TextFormatter`、`CsvFormatter`（`header()` 返回 CSV 表头）。
 
 网络下载仅在 CLI 内实现，不是公开库 API。开发验证命令及真实样本验证范围见[执行与验证](../EXECUTION.md)，设计细节见[设计文档](../DESIGN.md)。
+
+表映射中的原始 `VAR_STRING` 和 `TYPED_ARRAY` 列会返回明确的不支持错误，当前依赖对这些类型的元数据处理存在不一致。其他列在解码行之前会检查其类型所需的元数据字节是否完整。
+
+### 压缩事务的增量检查
+
+当前尚待发布的源码版本提供 `BinlogParser::visit_events`，供库调用者逐个消费内层事件。`VisitEvent::TransactionPayloadStart` 提供外层位置与压缩信息，`VisitEvent::Event` 提供借用的事件及可选 `parent_offset`，`VisitEvent::TransactionPayloadEnd` 表示整个 payload 已成功解码。内层偏移相对于解压流起点。
+
+回调返回 `io::Result<ControlFlow<()>>`。`Continue(())` 处理下一个事件，`Break(())` 结束检查。回调错误、解析错误和回调 panic 也会使解析器进入终止状态。后续解码失败时，先前回调已产生的效果仍然存在，需要事务原子性的调用者应将变更暂存到对应的结束通知。
+
+内存包含外层原始 payload、当前解码的内层事件和共享表映射。`events()` 迭代器及 CLI 会将事务内层事件聚合到现有的嵌套事件模型中。

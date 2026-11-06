@@ -2,7 +2,7 @@
 
 Based on the conclusions of three independent expert reviews dated 2026-11-05 (binlog protocol correctness / Rust engineering quality / documentation & UX). Every item includes acceptance criteria; the "Contract" section is the unified API specification for the parallel implementations, and implementations must conform to it.
 
-Status markers: `[done W1]` implemented in the first batch, `[done W2]` implemented in the second batch, `[done W3]` implemented in the third batch, `[W4]` fourth batch (2026-11-06 expert re-review), `[pending user decision]` waiting on the user, `[backlog]` not scheduled.
+Status markers use `done` for implemented and verified work, `partial` for a delivered subset, and `backlog` for deferred work. W1–W3 are the original batches, W4 is the 2026-11-06 re-review, and W5 is the 2026-11-07 source and roadmap review. Historical findings below describe the code at the time of review. The current status and the W5 section record subsequent fixes.
 
 ## R. Correctness Fixes (P0/P1)
 
@@ -82,29 +82,29 @@ Status markers: `[done W1]` implemented in the first batch, `[done W2]` implemen
 - **R34 [backlog] MariaDB-specific event types** (GTID 163 etc.). Requires MariaDB reference implementation and samples; not implementable from this repository alone.
 - **R35 [done W3] Advisory `log_pos` continuity checking**: non-fatal stderr warnings (offset + size mismatch, zero log_pos ignored, buffer capped) and `BinlogParser::take_warnings` for library callers.
 - **R36 [done W3] Tolerance policy**: a row event may declare fewer columns than the table map (missing tail columns render as `absent`); declaring more is still an error.
-- **R37 [partially done W3] The CLI layer moved behind a default-on `cli` feature** (clap, clap_complete, jiff, anyhow; binary declares `required-features = ["cli"]`). MSRV verification / rust-toolchain pinning remains [backlog].
+- **R37 [done W4] The CLI layer moved behind a default-on `cli` feature** (clap, clap_complete, jiff, anyhow; binary declares `required-features = ["cli"]`). The manifest declares Rust 1.88 and CI runs its check/test gate (R43). Local verification uses the installed stable toolchain as required by AGENT.md.
 - **R38 [partially done W3] `deny.toml` added, and `cargo deny check` (advisories, licenses, bans, sources) runs in the audit workflow** on a daily schedule and on manual dispatch, alongside the RustSec advisory scan; the virtual workspace lib/bin split remains [backlog].
-- **R39 [W4] JSON value hardening.**
+- **R39 [done W4/W5] JSON value hardening.**
   Findings A1/A2/A4/A6/A7 of the 2026-11-06 protocol re-review.
   - Opaque jsonb members (`NEWDECIMAL`, DATE/TIME/DATETIME opaques — what MySQL writes for decimal literals or DECIMAL column values inside JSON) currently fail the whole file via `serde_json::Value::try_from(jsonb)`; decode through the library's `JsonDom` path instead (or per-cell loss marking), never failing the event on legitimate data.
   - Cap jsonb nesting depth (MySQL's own limit is 100) during conversion and return `InvalidData` on deeper hostile input — a depth-60k fixture currently aborts the process (stack overflow), violating fail-closed.
   - Pin the stripped-table-map checksum path with a test: flipping a byte inside a PARTIAL_JSON TLV of a checksummed table map must yield "event checksum mismatch" even though the library never sees those bytes.
-  - Document and pin the JSON-diff edge-case semantics (object REPLACE as upsert, array INSERT at index ≤ len) with a comment referencing `sql/json_diff.cc` behavior.
+  - Document and pin the JSON-diff edge-case semantics (object REPLACE as upsert, array INSERT at index ≤ len) with a comment referencing `sql-common/json_diff.cc` behavior.
   Acceptance: a fixture with an opaque-NEWDECIMAL JSON member decodes and the file's event count is intact; a depth-60k jsonb fixture yields `InvalidData` with an offset, not an abort; the corrupted-TLV checksum test fails with the documented message.
-- **R40 [W4] CLI correctness and packaging hygiene.**
+- **R40 [done W4/W5] CLI correctness and packaging hygiene.**
   Findings B1/B6/B7/B10 of the 2026-11-06 engineering re-review.
   - Broken-pipe exit 0 must hold for every write path: `FormatterError::Json(serde_json::Error)` wraps the io error one level down, so `is_broken_pipe` misses it (`serde_json::Error::io_error_kind()`); `binlog-inspect big.binlog | head -c 100` currently exits 1.
   - Drop the unused `clap` dev-dependency; the `required-features = ["cli"]` on the test targets is the correct mechanism.
   - `remote` is a CLI-layer feature: declare `remote = ["cli", …]` so the combination `--no-default-features --features remote` still builds the binary.
   - tests/remote.rs: a response with `Content-Length` larger than the body deadlocks until the 30 s drain bound; close the write side (or skip the wait) for known-truncated responses so the suite runs fast deterministically.
   Acceptance: a large-output piped-into-`head` test exits 0; `cargo test --locked --no-default-features --features remote` builds the binary; the remote suite has no 30 s stall.
-- **R41 [W4] V1 row-event labeling consistency.**
+- **R41 [done W4/W5] V1 row-event labeling consistency.**
   Finding A3. Codes 23–25 (`WRITE/UPDATE/DELETE_ROWS_EVENT_V1`, MySQL 5.5 era) are decoded as full row payloads by the library but labeled `EventType::Unknown` — `event_type=unknown` with `payload.kind=rows`. The pre-GA codes are 20–22 (which stay `Unknown{raw_len}`); correct the "pre-GA" naming wherever it appears. Map 23–25 onto `WriteRows`/`UpdateRows`/`DeleteRows`.
   Acceptance: a code-23 fixture emits `event_type=write_rows` with a decoded row payload; `--events write_rows` selects it; DESIGN/USAGE no longer call 23–25 pre-GA.
-- **R42 [W4] Hot-path performance pass.**
+- **R42 [implemented W4; performance acceptance pending] Hot-path performance pass.**
   Findings B12/B13/B14. `signedness()` re-serializes the whole table map for every row event — cache it per table id (invalidate on re-registration; correctness first, benchmarks optional). `apply_pair` matches pending JSON cells against before columns with `Vec::find` (O(columns²) on hostile input) — both images are in table-column order, so a linear merge suffices. `Stats::record` allocates `format!("{db}.{t}")` per row event — reuse a scratch String.
   Acceptance: all existing tests pass unchanged; a micro-benchmark or before/after timing shows no regression; behavior (JSON output) is byte-identical.
-- **R43 [W4] CI and packaging hardening.**
+- **R43 [done W4/W5] CI and packaging hardening.**
   Findings B5/B8/B9/B11/B15.
   - True MSRV is **1.88** (let-chains; edition 2024 alone would allow 1.85): verify by building with a 1.88 toolchain, then set `rust-version = "1.88"` and add a CI job pinned to 1.88 (closes the R37 remainder). If the toolchain cannot be installed in the implementing environment, do not claim the version — leave `rust-version` unset and report.
   - The lint job gains `cargo clippy --locked --all-targets --no-default-features -- -D warnings` and the matrix gains `--no-default-features --features remote`.
@@ -112,12 +112,25 @@ Status markers: `[done W1]` implemented in the first batch, `[done W2]` implemen
   - `.crate` content: exclude internal-only files (AGENT.md, EXECUTION.md, ROADMAP.md, `.github/`) via `package.exclude`; CHANGELOG.md and DESIGN.md stay.
   - Regression tests: the 100-entry advisory-warning cap; `ParserError` messages carry the file offset.
   Acceptance: CI matrix covers the three feature combinations with clippy and test; the two regression tests are in place.
-- **R44 [W4] Documentation truth pass.**
+- **R44 [done W4/W5] Documentation truth pass.**
   Findings C1–C12. The USAGE `--events` tables and the `EventType::PartialUpdateRows` rustdoc still claim the after image is "not decoded" (false since R33); stale "(Chinese)" markers in README.en/USAGE; DESIGN's verification-strategy clippy wording; the Contract section predates R26/R33 and must be annotated as the historical batch-1 spec; USAGE library section needs the crates.io dependency form; CHANGELOG `[0.3.0]`/`[0.2.0]`/`[0.1.0]` headings lack link definitions (drop the brackets — no tags exist for them); R23's version marker; explicit toolchain anchor in README.md; `--events` table ordering.
   Acceptance: every documented statement matches behavior; the docs build clean; bilingual parity holds.
 - **R45 [W5 candidate] Error-semver pass for 0.5.0**: structured `ParserError` variants (at least `Checksum`) and `#[non_exhaustive]` on the public error/payload enums — decided once while the API is young; a breaking change by design.
-- **R46 [W5 candidate] Streaming TransactionPayload decoding**: iterator/callback API instead of buffering all inner events (~55M minimal events from one 64 MiB payload today).
-- **R47 [W5 candidate] Fuzz/property harness** over the hand-written wire-format mirrors (previous-GTIDs walk, table-map TLV prevalidation, payload-header prevalidation, jsonb conversion).
+- **R46 [partial W5] Streaming TransactionPayload decoding**. R46a adds the library `visit_events` callback API, sharing framing, checksums and inner-event decoding with `events()`. It emits start/event/end notifications and terminates the parser on callback error, cancellation or panic. R46b remains in the backlog for CLI streaming output and its partial-output contract. The existing iterator and CLI collect the inner events of each payload.
+- **R47 [partial W5] Fuzz/property harness**. R47a adds stable, deterministic properties through the public parser over synthetic previous-GTIDs, table-map/row, NONE payload and JSON fixtures. It covers chunked reads, truncation, bounded mutations, JSON round-trips and termination after errors. R47b retains continuous coverage-guided fuzzing and resource-isolated allocation stress tests in the backlog.
+
+## W5. Source Review and Delivery Scope (2026-11-07)
+
+- **R39 follow-up** covers JSON quoted-path decoding, consistent container-depth counting at the 100-level boundary, validation of every column list in ENUM/SET metadata, and complete required column metadata before row decoding. Regression fixtures retain malformed input as an error or an explicit loss marker.
+- **R40 follow-up** centralizes broken-pipe handling across CLI output paths. A closed-reader regression covers every completion shell on Unix, alongside the existing event-output pipe tests.
+- **R43 follow-up** adds an explicit feature matrix axis, yielding three operating systems times four feature combinations. Feature-specific cache keys isolate build-output assertions. The remaining audit action is pinned to a verified commit.
+- **R45** stays assigned to the 0.5.0 compatibility window. Its new error variants and non-exhaustive annotations require a coordinated API migration.
+- **R46a and R47a** are the independently implemented W5 library and test deliveries. Their remaining work is recorded separately above.
+- **R49 [done W5] Row iterator progress**. The deterministic mutation corpus reproduced an unbounded loop when a nonempty ordinary row body selected no columns. The parser now rejects that shape for V1/V2 writes, updates and deletes, while accepting empty row bodies, one-sided updates and the distinct partial-update value-options encoding.
+- **Column compatibility**. Raw `VAR_STRING` and `TYPED_ARRAY` table-map columns return an explicit `Unsupported` error because the current dependency exposes inconsistent metadata to its row decoder. Typed arrays are a legitimate server type whose support requires a dedicated decoder fix.
+- **R50 [backlog] Column metadata value constraints**. The W5 guards validate required byte spans. Precision/scale, fractional-second precision and other value-range constraints still require focused reproduction and compatibility checks against the dependency and server formats.
+- **R48 [backlog] Decoded JSON resource budget**. Static review identified that repeated jsonb child offsets can reference the same subtree. Reproduce the decoded-output amplification in a resource-isolated harness before choosing node/byte limits and compatibility behavior.
+- **R34 and R38** retain the MariaDB and workspace-split backlog. R42 still needs a reproducible performance acceptance record. The local CSV microbenchmarks from the source review showed baseline drift, so they establish no stable speedup percentage.
 
 ## Contract: API Specification for the First Parallel Implementation Batch
 

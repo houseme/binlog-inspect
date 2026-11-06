@@ -263,7 +263,7 @@ All filters combine with AND. Filtering happens after parsing and cannot bypass 
 
 ## Errors, input and safety
 
-Events are read one at a time, with a 64 MiB maximum per event (adjustable with `--max-event-size`, hard limit 1 GiB); memory use does not scale with file size. Plaintext files begin with `FE 62 69 6E`; encrypted files (`FD 62 69 6E`) are explicitly rejected with a hint to obtain plaintext through the MySQL server using `mysqlbinlog --read-from-remote-server`, taking care to protect the transfer and copy. HTTP(S) downloads are first written to an automatically cleaned temporary file and require sufficient disk space; a download is aborted once it exceeds `--max-download-size` (default 4 GiB). Redirects from an HTTPS URL cannot downgrade to HTTP. Downloading does not decrypt data.
+Raw events are read one at a time, with a 64 MiB size cap (adjustable with `--max-event-size`, hard limit 1 GiB). Decoded row images, shared table maps, and collected transaction children use additional memory. Plaintext files begin with `FE 62 69 6E`; encrypted files (`FD 62 69 6E`) are explicitly rejected with a hint to obtain plaintext through the MySQL server using `mysqlbinlog --read-from-remote-server`, taking care to protect the transfer and copy. HTTP(S) downloads are first written to an automatically cleaned temporary file and require sufficient disk space; a download is aborted once it exceeds `--max-download-size` (default 4 GiB). Redirects from an HTTPS URL cannot downgrade to HTTP. Downloading does not decrypt data.
 
 Compressed transaction payloads (code 40) are decoded safely: the compression header is validated before the underlying library parses it (unknown algorithms are a clean error), decompression streams and is bounded (a declaration above 1 GiB is rejected outright, and decompressed output beyond the declared size plus a small slack is rejected), and inner events are pre-validated like outer ones. Inner events that would rewrite parser state (a nested format description, a rotate or another compressed payload) are rejected.
 
@@ -294,7 +294,7 @@ binlog-inspect = "0.4"        # or { path = "../binlog-inspect" } for a checkout
 serde_json = "1"
 ```
 
-The parser is generic over any `Read` input (a file, standard input, or an in-memory buffer), reads one event at a time, and bounds a single event's allocation to [`parser::MAX_EVENT_SIZE`](../src/parser.rs) (64 MiB):
+The parser accepts any `Read` input, including a file, standard input or an in-memory buffer. Its default raw-event size cap is 64 MiB. The following example uses the collecting iterator. See the incremental visitor section for per-child delivery from compressed transactions.
 
 ```rust,no_run
 use binlog_inspect::{event::{EventPayload, EventType}, parser::BinlogParser};
@@ -340,3 +340,13 @@ Key points:
 - The `formatter` module: the `Formatter` trait writes to a `&mut dyn Write` and returns `Result<bool, FormatterError>` (whether the event produced output); `JsonLinesFormatter`, `TextFormatter` and `CsvFormatter` are provided (`header()` returns the CSV header).
 
 Network downloading is implemented in the CLI and is not a public library API. See [execution and validation](../EXECUTION.md) for development checks and the scope of real-sample validation, and [design](../DESIGN.md) for further details.
+
+Raw `VAR_STRING` and `TYPED_ARRAY` table-map columns return an explicit unsupported-type error. Their metadata representation in the current dependency cannot be decoded reliably. Other column metadata must include the complete type-specific byte span before rows are decoded.
+
+### Incremental compressed-transaction inspection
+
+The unreleased source checkout provides `BinlogParser::visit_events` for consuming inner events individually. `VisitEvent::TransactionPayloadStart` provides outer coordinates and compression metadata, `VisitEvent::Event` provides a borrowed event with an optional `parent_offset`, and `VisitEvent::TransactionPayloadEnd` confirms successful decoding of the complete payload. Inner offsets are relative to the decompressed stream.
+
+The callback returns `io::Result<ControlFlow<()>>`. `Continue(())` processes the next event and `Break(())` ends inspection. Callback errors, parsing errors and callback panics also terminate the parser. Previously delivered callbacks remain observable if decoding fails later, so transaction-atomic consumers should stage their changes until the matching end notification.
+
+Memory includes the outer raw payload, the current decoded inner event, and shared table maps. The `events()` iterator and CLI aggregate transaction children into the existing nested event model.

@@ -17,7 +17,7 @@
 - 行镜像保留列位置、缺失列与 SQL NULL 的区分，数值附带 MySQL 列类型与 signedness。
 - 多维过滤：按事件类型、`database.table`、字节偏移区间（`--start-position`/`--stop-position`）、时间区间（`--start-datetime`/`--stop-datetime`）与精确 GTID（`--include-gtid`）筛选，行事件保留前后镜像。
 - `--stats` 输出单个 JSON 统计对象（文件数、事件数、字节数、事务数、按类型与按表计数、错误数）；`--completions` 生成 shell 补全脚本。
-- 逐事件 64 MiB 上限保证内存有界；敌意构造的事件头与表映射元数据在解码前预校验；验证支持的事件 CRC32 校验和。
+- 原始事件缓冲区默认上限为 64 MiB；敌意构造的事件头与表映射元数据在解码前预校验；验证支持的事件 CRC32 校验和。当前源码提供 `visit_events`，供库调用者逐个消费压缩事务内层事件。
 - `--output` 原子写入：unix 权限 0600，绝不覆盖已存在的文件。
 - 退出码分层：0 成功、1 硬错误、2 用法错误、3 部分解析失败。
 
@@ -69,6 +69,7 @@ cargo run --locked --features remote -- --url https://example.com/mysql-bin.0000
 - Rotate 事件只报告不跟随，需自行列出下一个文件。
 - MariaDB 专有事件类型（160+）保持 `unknown`；`rand`、`user_var` 等命名类型只保留类型与 `raw_len`。
 - 单个事件默认上限 64 MiB；CLI 可用 `--max-event-size` 调整（不超过 1 GiB 检查上限），库调用者可用 `with_max_event_size`。
+- 当前依赖解码器对表映射中的原始 `VAR_STRING` 和 `TYPED_ARRAY` 列返回明确的不支持错误。
 - 列名和数值符号信息取决于 binlog 元数据；字节以十六进制输出，不推断字符集。
 - 兼容性尚未覆盖所有服务端版本、事件和列类型，成功退出不意味着所有事件都已理解。
 

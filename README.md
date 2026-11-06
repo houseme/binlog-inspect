@@ -17,7 +17,7 @@ English | [简体中文](README.zh-CN.md)
 - Row images preserve column positions and distinguish absent columns from SQL NULL, with MySQL column type and signedness for numerics.
 - Filter by event type, `database.table`, byte-offset ranges (`--start-position`/`--stop-position`), timestamp ranges (`--start-datetime`/`--stop-datetime`) and exact GTIDs (`--include-gtid`), with before/after row images.
 - `--stats` prints one JSON summary (files, events, bytes, transactions, per-type and per-table counts, errors); `--completions` generates shell completion scripts.
-- A 64 MiB per-event cap keeps memory bounded; hostile event headers and table-map metadata are pre-validated before decoding; supported CRC32 checksums are verified.
+- Raw event buffers have a default 64 MiB cap. Hostile event headers and table-map metadata are pre-validated, and supported CRC32 checksums are verified. This source checkout provides `visit_events` for consuming compressed-transaction children individually.
 - `--output` is written atomically: mode 0600 on unix, and existing files are never overwritten.
 - Layered exit codes: 0 success, 1 hard error, 2 usage error, 3 partial parse failure.
 
@@ -69,6 +69,7 @@ Requires Rust 1.88 or newer (the MSRV is verified and enforced by a dedicated CI
 - Rotate events are reported but not followed; list the next file yourself.
 - MariaDB-specific event types (160+) remain `unknown`; named types such as `rand` and `user_var` keep only the type and `raw_len`.
 - A single event may not exceed 64 MiB by default; the CLI can raise this with `--max-event-size` (up to the 1 GiB inspection limit), and library callers with `with_max_event_size`.
+- Raw `VAR_STRING` and `TYPED_ARRAY` table-map columns produce an explicit unsupported-type error with the current dependency decoder.
 - Column names and numeric signedness depend on binlog metadata; bytes are encoded as hexadecimal without guessing a character set.
 - Compatibility with every server version, event and column type has not been verified, and a successful exit does not mean every event was understood.
 

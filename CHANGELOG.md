@@ -4,25 +4,39 @@ This project follows the [Keep a Changelog](https://keepachangelog.com/en/1.1.0/
 
 ## [Unreleased]
 
-Fourth batch, from the 2026-11-06 multi-expert re-review (ROADMAP R39–R44).
+Fourth and fifth batches, from the 2026-11-06 re-review and 2026-11-07 source review (ROADMAP R39–R47).
 
 ### Added
+
+- Library `BinlogParser::visit_events` with payload start/end notifications, one-at-a-time inner-event delivery, shared table-map state, and explicit cancellation semantics.
+- Deterministic public-parser property tests for bounded wire-format mutation, truncation, chunked readers, event round-trips, and error termination.
 
 - JSON columns containing opaque jsonb values (decimals and date/time values stored in JSON — type byte `NEWDECIMAL` and friends) decode through the library's `JsonDom` rendering instead of failing the whole file; opaque diff members render as their canonical string form.
 - Row events with type codes 23–25 (the MySQL 5.5-era V1 write/update/delete rows events) are labeled `write_rows`/`update_rows`/`delete_rows` instead of `unknown` — the payload was always decoded; only the label was wrong (the truly pre-GA codes are 20–22, which remain `unknown`).
 
 ### Fixed
 
+- Nonempty ordinary row events with no selected columns return a parsing error. The underlying row iterator previously made no byte progress and could grow memory indefinitely.
+- Table maps validate the complete required column metadata span before row decoding. Raw `VAR_STRING` and `TYPED_ARRAY` columns return an explicit unsupported-type error for the current dependency decoder.
+
+- JSON diff depth checks count containers consistently with jsonb conversion, accepting scalar changes at the 100-container boundary while rejecting deeper composed documents.
+- ENUM/SET optional metadata validation checks every column variant list in the TLV.
+- Completion-script write errors reach the central broken-pipe handler. Closed stdout now exits successfully for every supported shell.
+- CI explicitly expands three operating systems across four feature configurations and isolates their caches.
+
+- Double-quoted JSON-diff path members now use JSON string decoding, including form-feed escapes and UTF-16 surrogate pairs. Invalid escapes retain a `partial_json` loss marker. Previously `\f` could update a member named `f` and malformed Unicode escapes could be accepted.
+- Event-boundary reads retry transient `Interrupted` errors, including the final EOF probe. Other I/O errors retain their offset and terminate the stream.
 - Applying a partial-JSON diff at a deep path with a deep inserted value composes a document past the 100-level nesting limit; the composition is now rejected before the document is built and the cell renders as `partial_json` with the reason — a hostile sequence previously built a document whose recursive drop/serialization aborted the process.
 - `--completions` output goes through the graceful broken-pipe path as well: it is generated into a buffer first, because clap_complete's shell generators panic on write errors (R40).
 - JSON columns whose jsonb tree nests deeper than MySQL's limit of 100 containers return a parse error carrying the offset; a hostile ~60,000-deep value previously overflowed the stack and aborted the process (fail-closed violation).
 - The broken-pipe exit-0 contract now holds on every write path: `FormatterError::Json(serde_json::Error)` write failures are recognized as `BrokenPipe` via `serde_json::Error::io_error_kind()`, so piping into `head` exits 0 again.
 - `rust-version = "1.88"` is claimed and enforced by a dedicated MSRV CI job (the crate's let-chains set the floor; the locked `uuid` was pinned to 1.26.1 because 1.27+ requires 1.89).
-- All third-party GitHub Actions are pinned by full commit SHA (one exception recorded in the workflow: `rustsec/audit-check@v2`, whose SHA could not be resolved at the time).
+- All third-party GitHub Actions are pinned by full commit SHA, including the verified `rustsec/audit-check` v2 commit.
 - Documentation: the USAGE `--events` tables, the `EventType::PartialUpdateRows` rustdoc, and the library/limitation sections now describe the applied JSON-diff after image instead of the pre-R33 "not decoded" wording; the library section documents the full `EventFilter` (ranges, GTID allowlist) and the crates.io dependency form; stale language markers removed; the ROADMAP Contract section is annotated as the historical batch-1 spec.
 
 ### Changed
 
+- CSV formatting reuses escaped strings for their enclosing quotes and escapes database/table names once per event, reducing temporary allocations for row output.
 - **Packaging**: the `remote` feature now implies `cli` (so `--no-default-features --features remote` builds the binary); the unused `clap` dev-dependency is gone; the published `.crate` excludes internal engineering documents (`AGENT.md`, `EXECUTION.md`, `ROADMAP.md`, `docs/`, `tests/`, `.github/`).
 - Performance: per-table signedness metadata no longer re-serializes the table map for every row event; JSON-diff cell matching is linear in the column count; `--stats` reuses a scratch string for `by_table` keys. JSON output is byte-identical.
 - CI: the lint job runs clippy for no-default-features as well; the test matrix covers `--no-default-features --features remote`; the loopback download tests no longer spend a 30 s drain bound on truncated responses.

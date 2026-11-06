@@ -9,9 +9,10 @@
 //!
 //! # Guarantees
 //!
-//! * Events are read strictly one at a time; a single event may not exceed
-//!   [`parser::MAX_EVENT_SIZE`] by default, so memory use stays bounded even
-//!   on untrusted input.
+//! * Raw event buffers are limited by [`parser::MAX_EVENT_SIZE`] by default.
+//!   [`parser::BinlogParser::visit_events`] delivers compressed-transaction
+//!   children individually. The collecting iterator retains all children of
+//!   a payload, and decoded row images and shared table maps also use memory.
 //! * Encrypted binlogs are detected and rejected, not misread.
 //! * Framing, checksum, and decoding failures are reported as errors carrying
 //!   the file offset; nothing is silently skipped.

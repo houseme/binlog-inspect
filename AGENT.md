@@ -1,6 +1,6 @@
 # Project Collaboration Conventions
 
-This project provides a Rust 2024 CLI and a reusable library, with top priority on the correctness of binlog event boundaries, table maps, and numeric semantics. Follow the actual capabilities and limitations documented in `DESIGN.md`, and run verification as described in `EXECUTION.md`. Use the current stable toolchain and the repository's `Cargo.lock`; Rust 1.85 has not passed build verification and is not claimed as an MSRV.
+This project provides a Rust 2024 CLI and a reusable library, with top priority on the correctness of binlog event boundaries, table maps, and numeric semantics. Follow the actual capabilities and limitations documented in `DESIGN.md`, and run verification as described in `EXECUTION.md`. Use the current stable toolchain and the repository's `Cargo.lock`; The manifest declares an MSRV of Rust 1.88, which has a dedicated CI check/test job.
 
 - Core does not depend on CLI or network types; parsing uses `EventStreamReader` to maintain the FDE and table maps, and formatters receive only the project's event model.
 - Read strictly one event at a time so untrusted events cannot trigger unbounded allocations; never load a whole binlog file into memory.
