@@ -454,3 +454,78 @@ fn from_reader_accepts_stream_without_seek() {
         Err(binlog_inspect::parser::ParserError::InvalidHeader)
     ));
 }
+
+#[test]
+fn interrupted_reads_are_retried_at_every_stream_boundary() {
+    use std::io::{self, Cursor, Read};
+
+    struct InterruptedReader {
+        input: Cursor<Vec<u8>>,
+        interrupt_at: u64,
+        interrupted: bool,
+    }
+
+    impl Read for InterruptedReader {
+        fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+            if out.is_empty() {
+                return Ok(0);
+            }
+            if self.input.position() == self.interrupt_at && !self.interrupted {
+                self.interrupted = true;
+                return Err(io::ErrorKind::Interrupted.into());
+            }
+            // Short reads force the BufReader to refill at every byte,
+            // including event boundaries and the final EOF probe.
+            self.input.read(&mut out[..1])
+        }
+    }
+
+    let mut bytes = b"\xfebin".to_vec();
+    bytes.extend(raw_event(16, &5u64.to_le_bytes(), false));
+    bytes.extend(raw_event(16, &6u64.to_le_bytes(), false));
+    for interrupt_at in 0..=bytes.len() as u64 {
+        let reader = InterruptedReader {
+            input: Cursor::new(bytes.clone()),
+            interrupt_at,
+            interrupted: false,
+        };
+        let mut parser = BinlogParser::from_reader(reader).unwrap();
+        let events = parser
+            .events()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap_or_else(|error| panic!("interrupted at {interrupt_at}: {error}"));
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].offset, 4);
+        assert_eq!(events[1].offset, 31);
+        assert_eq!(events[0].payload, EventPayload::Xid { xid: 5 });
+        assert_eq!(events[1].payload, EventPayload::Xid { xid: 6 });
+        assert!(parser.events().next().is_none());
+    }
+}
+
+#[test]
+fn reader_errors_at_event_boundaries_are_reported_and_stop_the_stream() {
+    use std::io::{self, Cursor, Read};
+
+    struct FailingReader(io::ErrorKind);
+    impl Read for FailingReader {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            Err(self.0.into())
+        }
+    }
+
+    for kind in [
+        io::ErrorKind::UnexpectedEof,
+        io::ErrorKind::PermissionDenied,
+    ] {
+        let reader = Cursor::new(b"\xfebin").chain(FailingReader(kind));
+        let mut parser = BinlogParser::from_reader(reader).unwrap();
+        let error = parser.events().next().unwrap().unwrap_err();
+        let binlog_inspect::parser::ParserError::Io { offset, source } = error else {
+            panic!("expected an I/O error");
+        };
+        assert_eq!(offset, 4);
+        assert_eq!(source.kind(), kind);
+        assert!(parser.events().next().is_none());
+    }
+}

@@ -134,7 +134,8 @@ impl<R: Read> BinlogParser<R> {
         std::mem::take(&mut self.warnings)
     }
 
-    /// Iterate over events; a framing or decoding error terminates the stream.
+    /// Iterate over events, retrying transient [`io::ErrorKind::Interrupted`]
+    /// reads. Other I/O errors and framing or decoding errors terminate the stream.
     pub fn events(&mut self) -> impl Iterator<Item = Result<ParsedEvent, ParserError>> + '_ {
         std::iter::from_fn(move || self.next_event())
     }
@@ -167,7 +168,14 @@ impl<R: Read> BinlogParser<R> {
         let result = (|| -> io::Result<Option<ParsedEvent>> {
             // Validate framing before allowing the library to allocate the event buffer.
             let mut head = [0u8; 19];
-            let first = self.input.read(&mut head[..1])?;
+            // Retry transient interruptions without treating a reader's
+            // UnexpectedEof error as a clean event boundary.
+            let first = loop {
+                match self.input.read(&mut head[..1]) {
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    result => break result?,
+                }
+            };
             if first == 0 {
                 return Ok(None);
             }
@@ -826,9 +834,11 @@ impl BufRead for PayloadStream<'_> {
 fn fill_from(reader: &mut TransactionPayloadReader<'_>, buf: &mut [u8]) -> io::Result<usize> {
     let mut filled = 0;
     while filled < buf.len() {
-        match reader.read(&mut buf[filled..])? {
-            0 => break,
-            n => filled += n,
+        match reader.read(&mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
         }
     }
     Ok(filled)
