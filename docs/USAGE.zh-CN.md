@@ -273,6 +273,8 @@ timestamp,event_type,database,table,before,after
 
 服务器开启 `binlog_row_value_options=PARTIAL_JSON` 时，表映射会携带 optional metadata 类型（14/15），`partial_update_rows` 的 after 镜像携带 JSON 差异序列；两者均已支持——元数据被接受（并经校验和验证后为底层库剥离），差异应用到 before 镜像上，无法应用的以 `partial_json` 值保留。
 
+差异路径中的双引号成员名按 JSON 字符串规则解码，支持 `\f` 和 `\uD83D\uDE00` 等 UTF-16 代理项对。非法转义会生成 `partial_json` 值，保留原始差异及错误原因。
+
 `--output` 不覆盖文件，但 shell 的 `>` 重定向由 shell 控制，可能覆盖目标。
 
 ## 与 mysqlbinlog 的差异

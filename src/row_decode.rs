@@ -992,11 +992,27 @@ mod json_diff {
     /// Reads a quoted member name starting at the opening quote byte, which
     /// may be `"` or `'`, advancing `pos` past the closing quote.
     ///
-    /// Backslash escapes mirror the common JSON forms (`\"`, `\'`, `\\`,
-    /// `\n`, `\r`, `\t`, `\b`, `\0`, and `\uXXXX`); unknown escapes keep the
-    /// escaped byte verbatim. Non-ASCII bytes are collected raw and validated
-    /// as UTF-8 at the end.
+    /// Double-quoted members use JSON string decoding, including UTF-16
+    /// surrogate pairs and validation of escape sequences, as in MySQL's
+    /// `sql-common/json_path.cc`. The single-quoted extension retains its
+    /// historical escape handling.
     fn read_quoted_member(rest: &str, pos: &mut usize, quote: u8) -> Result<String, ApplyError> {
+        if quote == b'"' {
+            // Decode just the string token so subsequent path segments stay
+            // available to parse_path. Reuse serde's escape validation.
+            let mut strings =
+                serde_json::Deserializer::from_str(&rest[*pos..]).into_iter::<String>();
+            let key = strings
+                .next()
+                .ok_or_else(|| {
+                    ApplyError(format!(
+                        "invalid JSON path `${rest}`: missing quoted member"
+                    ))
+                })?
+                .map_err(|error| ApplyError(format!("invalid JSON path `${rest}`: {error}")))?;
+            *pos += strings.byte_offset();
+            return Ok(key);
+        }
         let bytes = rest.as_bytes();
         *pos += 1; // opening quote
         let mut key = Vec::new();
@@ -1172,6 +1188,46 @@ mod json_diff {
                 apply_json_diffs(doc, &diffs).unwrap(),
                 serde_json::json!({"q\"k": 2})
             );
+        }
+
+        #[test]
+        fn json_quoted_paths_preserve_member_identity() {
+            for (path, key) in [
+                (r#"$."\f""#, "\u{000c}"),
+                (r#"$["\uD83D\uDE00"]"#, "😀"),
+                (r#"$."\u0000""#, "\0"),
+                (r#"$."\"\\\/\b\n\r\t""#, "\"\\/\u{0008}\n\r\t"),
+                (r#"$."中文""#, "中文"),
+                (r"$.'legacy\'key'", "legacy'key"),
+            ] {
+                let mut doc = serde_json::json!({"f": 10});
+                doc[key] = serde_json::json!({"child": 1});
+                let diffs = [rec(
+                    &format!("{path}.child"),
+                    "replace",
+                    Some(serde_json::json!(2)),
+                )];
+                let applied = apply_json_diffs(doc.clone(), &diffs).unwrap();
+                doc[key]["child"] = serde_json::json!(2);
+                assert_eq!(applied, doc, "{path}");
+            }
+        }
+
+        #[test]
+        fn invalid_json_quoted_paths_are_rejected() {
+            for path in [
+                r#"$."\uD800""#,
+                r#"$."\uDC00""#,
+                r#"$."\uD800\u0041""#,
+                r#"$."\u12""#,
+                r#"$."\u+123""#,
+                r#"$."\x41""#,
+                "$.\"line\nfeed\"",
+            ] {
+                let diffs = [rec(path, "replace", Some(serde_json::json!(2)))];
+                let error = apply_json_diffs(serde_json::json!({}), &diffs).unwrap_err();
+                assert!(error.0.contains("invalid JSON path"), "{path}: {}", error.0);
+            }
         }
 
         #[test]

@@ -273,6 +273,8 @@ Unknown events retain their type code and `raw_len`; the `previous_gtids` event 
 
 When the server sets `binlog_row_value_options=PARTIAL_JSON`, table maps carry optional metadata types (14/15) and `partial_update_rows` after images carry JSON diff sequences; both are supported — the metadata is accepted (and stripped for the underlying library after checksum verification), and the diffs are applied against the before image, with unappliable ones preserved as `partial_json` values.
 
+Double-quoted member names in diff paths use JSON string decoding, including `\f` and UTF-16 surrogate pairs such as `\uD83D\uDE00`. Invalid escapes produce a `partial_json` value with the original diffs and an error reason.
+
 `--output` does not overwrite files, but shell `>` redirection is controlled by the shell and can overwrite its target.
 
 ## Differences from mysqlbinlog

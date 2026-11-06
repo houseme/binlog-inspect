@@ -145,6 +145,45 @@ const JSONB_AFTER: &[u8] = &[
     b'a', b'b', // key bytes at offsets 18, 19
 ];
 
+#[test]
+fn partial_json_quoted_paths_decode_without_targeting_another_member() {
+    // Two keys with distinct values ensure that decoding \\f as the letter
+    // f would silently change the wrong member.
+    let mut before = JSONB_AFTER.to_vec();
+    let key_start = before.len() - 2;
+    before[key_start..].copy_from_slice(&[0x0c, b'f']);
+    for path in [r#"$."\f""#, r#"$."\x66""#] {
+        let mut diffs = vec![0x00]; // REPLACE
+        put_lenenc(&mut diffs, path.len() as u64);
+        diffs.extend_from_slice(path.as_bytes());
+        put_lenenc(&mut diffs, 3);
+        diffs.extend_from_slice(&[0x05, 9, 0]); // int16 9
+        let file = binlog(&[
+            format_description(),
+            table_map(1, true, true),
+            partial_update_rows(1, &before, &diffs),
+        ]);
+        let mut parser = BinlogParser::open(file.path()).unwrap();
+        let events = parser.events().collect::<Result<Vec<_>, _>>().unwrap();
+        let EventPayload::PartialUpdateRows { after, .. } = &events[2].payload else {
+            panic!("expected partial update rows");
+        };
+        let cell = &after[0].as_ref().unwrap().columns[1].value;
+        if path.contains("\\f") {
+            assert_eq!(
+                cell,
+                &CellValue::Json(serde_json::json!({"\u{000c}": 9, "f": 44}))
+            );
+        } else {
+            let CellValue::PartialJson { diffs, reason } = cell else {
+                panic!("expected a loss-marked invalid path");
+            };
+            assert_eq!(diffs[0].path, path);
+            assert!(reason.contains("invalid JSON path"), "{reason}");
+        }
+    }
+}
+
 /// A full JSON column value: u32 length prefix plus the jsonb bytes.
 fn json_column_value(jsonb: &[u8]) -> Vec<u8> {
     let mut out = (jsonb.len() as u32).to_le_bytes().to_vec();
