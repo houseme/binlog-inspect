@@ -10,8 +10,10 @@ use mysql_common::binlog::{
 };
 use std::{
     collections::HashMap,
+    convert::Infallible,
     fs::File,
     io::{self, BufRead, BufReader, Cursor, Read},
+    ops::ControlFlow,
     path::Path,
 };
 
@@ -53,12 +55,99 @@ pub enum ParserError {
     },
 }
 
+/// One notification from [`BinlogParser::visit_events`].
+///
+/// Compressed transactions produce a start notification, their inner events
+/// in stream order, and an end notification after successful decoding. An
+/// error or an early stop can leave a start without a matching end.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum VisitEvent<'a> {
+    /// A decoded ordinary event or one inner event of a compressed transaction.
+    Event {
+        /// The current event, borrowed only for this callback invocation.
+        event: &'a ParsedEvent,
+        /// File offset of the enclosing transaction payload, or `None` for
+        /// an ordinary outer event. Inner event offsets are relative to the
+        /// decompressed stream.
+        parent_offset: Option<u64>,
+    },
+    /// A validated transaction payload about to be decoded.
+    TransactionPayloadStart {
+        /// Byte offset of the outer event in the binlog file.
+        offset: u64,
+        /// Outer timestamp, inherited by every inner event.
+        timestamp: u32,
+        /// Outer server identifier, inherited by every inner event.
+        server_id: u32,
+        /// Original outer event size, including its header and checksum.
+        event_size: u32,
+        /// Position recorded in the outer event header.
+        log_pos: u32,
+        /// Canonical compression name, `"NONE"` or `"ZSTD"`.
+        compression: &'a str,
+        /// Uncompressed size declared by the payload header.
+        uncompressed_size: u64,
+    },
+    /// All inner events and the end of the decompression stream were read
+    /// successfully.
+    TransactionPayloadEnd {
+        /// File offset of the corresponding outer transaction payload.
+        offset: u64,
+    },
+}
+
+/// A checked outer event together with its original on-disk coordinates.
+struct FramedEvent {
+    event: Event,
+    offset: u64,
+    size: u32,
+}
+
+impl FramedEvent {
+    fn into_parsed(self, payload: EventPayload) -> ParsedEvent {
+        let header = self.event.header();
+        ParsedEvent {
+            offset: self.offset,
+            timestamp: header.timestamp(),
+            event_type: EventType::from_raw(header.event_type_raw()),
+            event_type_code: header.event_type_raw(),
+            server_id: header.server_id(),
+            event_size: self.size,
+            log_pos: header.log_pos(),
+            payload,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PayloadInfo {
+    compression: &'static str,
+    uncompressed_size: u64,
+}
+
+enum PayloadItem {
+    Start(PayloadInfo),
+    Event(ParsedEvent),
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("transaction payload at inner offset {offset}: {source}")]
+struct InnerEventError {
+    offset: u64,
+    #[source]
+    source: io::Error,
+}
+
 /// Maintains the format description and table maps while reading one event at a time.
 ///
 /// The reader works on any [`Read`] input (a file, standard input, or an
-/// in-memory buffer) and bounds its own memory use per event: no allocation
-/// may exceed [`MAX_EVENT_SIZE`] unless a larger cap is requested explicitly
-/// through [`BinlogParser::with_max_event_size`].
+/// in-memory buffer). Raw event sizes are capped at [`MAX_EVENT_SIZE`] by
+/// default, configurable through [`BinlogParser::with_max_event_size`].
+/// Decoded row images and the inner-event collection returned by
+/// [`BinlogParser::events`] can consume more memory than their wire data.
+/// [`BinlogParser::visit_events`] delivers and releases each inner event in
+/// turn while retaining the outer raw payload and shared table-map state.
 pub struct BinlogParser<R: Read = File> {
     reader: EventStreamReader,
     input: BufReader<R>,
@@ -140,6 +229,107 @@ impl<R: Read> BinlogParser<R> {
         std::iter::from_fn(move || self.next_event())
     }
 
+    /// Visit the remaining events, consuming compressed transactions one
+    /// inner event at a time.
+    ///
+    /// Unlike [`Self::events`], this method does not collect the decoded inner
+    /// events of a transaction into a vector. The parser retains the outer
+    /// compressed event, the current inner event, and its shared table maps.
+    /// A single decoded event can still contain multiple row images.
+    ///
+    /// The callback receives [`VisitEvent::TransactionPayloadStart`] only
+    /// after outer framing, checksum, and payload-header validation and
+    /// decompressor creation succeed. [`VisitEvent::TransactionPayloadEnd`]
+    /// confirms that all inner events and the decompression stream completed.
+    /// Previously delivered callbacks cannot be rolled back on a later error.
+    ///
+    /// Return [`ControlFlow::Break`] from the callback to stop immediately.
+    /// EOF returns [`ControlFlow::Continue`]. Both outcomes leave this parser
+    /// terminated. Callback errors carry the current outer
+    /// file offset through [`ParserError::Io`]. A callback error or panic
+    /// also terminates the parser, so subsequent calls cannot resume with
+    /// partially updated table-map state.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use binlog_inspect::parser::{BinlogParser, VisitEvent};
+    /// use std::ops::ControlFlow;
+    ///
+    /// let mut parser = BinlogParser::open("mysql-bin.000001")?;
+    /// let mut inner_events = 0u64;
+    /// let outcome = parser.visit_events(|notification| {
+    ///     if let VisitEvent::Event { parent_offset: Some(_), .. } = notification {
+    ///         inner_events += 1;
+    ///     }
+    ///     Ok(ControlFlow::Continue(()))
+    /// })?;
+    /// assert_eq!(outcome, ControlFlow::Continue(()));
+    /// println!("Decoded {inner_events} inner events");
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn visit_events(
+        &mut self,
+        mut visitor: impl FnMut(VisitEvent<'_>) -> io::Result<ControlFlow<()>>,
+    ) -> Result<ControlFlow<()>, ParserError> {
+        if self.stopped {
+            return Ok(ControlFlow::Continue(()));
+        }
+        // The raw framing helper does not consult this flag. Setting it
+        // before invoking user code also makes a caught callback panic fuse
+        // the public parser without a guard or unsafe code.
+        self.stopped = true;
+        loop {
+            let offset = self.offset;
+            let Some(framed) = self
+                .read_framed_event()
+                .map_err(|source| ParserError::Io { offset, source })?
+            else {
+                return Ok(ControlFlow::Continue(()));
+            };
+            let result = (|| -> io::Result<ControlFlow<()>> {
+                if framed.event.header().event_type_raw() == 40 {
+                    let header = framed.event.header();
+                    let flow =
+                        self.walk_transaction_payload(&framed.event, &mut |item| match item {
+                            PayloadItem::Start(info) => {
+                                visitor(VisitEvent::TransactionPayloadStart {
+                                    offset,
+                                    timestamp: header.timestamp(),
+                                    server_id: header.server_id(),
+                                    event_size: framed.size,
+                                    log_pos: header.log_pos(),
+                                    compression: info.compression,
+                                    uncompressed_size: info.uncompressed_size,
+                                })
+                            }
+                            PayloadItem::Event(event) => visitor(VisitEvent::Event {
+                                event: &event,
+                                parent_offset: Some(offset),
+                            }),
+                        })?;
+                    if flow.is_break() {
+                        return Ok(ControlFlow::Break(()));
+                    }
+                    visitor(VisitEvent::TransactionPayloadEnd { offset })
+                } else {
+                    let payload = self.payload_for(&framed.event)?;
+                    let event = framed.into_parsed(payload);
+                    visitor(VisitEvent::Event {
+                        event: &event,
+                        parent_offset: None,
+                    })
+                }
+            })();
+            if result
+                .map_err(|source| ParserError::Io { offset, source })?
+                .is_break()
+            {
+                return Ok(ControlFlow::Break(()));
+            }
+        }
+    }
+
     /// Length of the trailing checksum the underlying library will strip from
     /// an event of the given raw type, according to the active format
     /// description.
@@ -166,141 +356,15 @@ impl<R: Read> BinlogParser<R> {
         }
         let offset = self.offset;
         let result = (|| -> io::Result<Option<ParsedEvent>> {
-            // Validate framing before allowing the library to allocate the event buffer.
-            let mut head = [0u8; 19];
-            // Retry transient interruptions without treating a reader's
-            // UnexpectedEof error as a clean event boundary.
-            let first = loop {
-                match self.input.read(&mut head[..1]) {
-                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                    result => break result?,
-                }
-            };
-            if first == 0 {
-                return Ok(None);
-            }
-            self.input.read_exact(&mut head[1..])?;
-            let size = u32::from_le_bytes(head[9..13].try_into().unwrap());
-            if !(19..=self.max_event_size).contains(&size) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "invalid or oversized event",
-                ));
-            }
-            // mysql_common assumes the complete event body is available.
-            if head[4] == 15 && size < 19 + 57 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "short format description",
-                ));
-            }
-            if head[4] != 15 && self.checksum_len(head[4]) > 0 && size < 23 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "short checksummed event",
-                ));
-            }
-            // Resizing without clearing only zero-fills the newly observed
-            // tail; every byte is overwritten by the head and body anyway.
-            self.buffer.resize(size as usize, 0);
-            self.buffer[..19].copy_from_slice(&head);
-            self.input.read_exact(&mut self.buffer[19..])?;
-            // Hostile-input prevalidation before the library decodes anything:
-            // its previous-GTIDs and table-map metadata parsers allocate from
-            // untrusted declared counts, and its transaction-payload header
-            // parser unwraps the compression type, so crafted input would
-            // abort the process.
-            let data_len = self.buffer.len() - 19 - self.checksum_len(head[4]);
-            let body = &self.buffer[19..19 + data_len];
-            if head[4] == 35 {
-                validate_previous_gtids(body)?;
-            }
-            if head[4] == 19 {
-                let header_len = self.reader.get_fde().get_event_type_header_length(
-                    mysql_common::binlog::consts::EventType::TABLE_MAP_EVENT,
-                );
-                crate::row_decode::validate_table_map_metadata(body, header_len)?;
-            }
-            if head[4] == 40 {
-                validate_transaction_payload_header(body)?;
-            }
-            // Table maps of partial-JSON binlogs (WL#2955) carry optional
-            // metadata types the library's lazily iterated metadata rejects;
-            // those entries are stripped from the bytes the library parses,
-            // so the stored table map stays acceptable for every later row
-            // event. The strip runs after the prevalidation of the original
-            // bytes, and only for table maps.
-            let mut stripped_tlv_bytes = 0usize;
-            if head[4] == 19 {
-                let header_len = self.reader.get_fde().get_event_type_header_length(
-                    mysql_common::binlog::consts::EventType::TABLE_MAP_EVENT,
-                );
-                let ranges = crate::row_decode::unsupported_tlv_ranges(body, header_len)?
-                    .unwrap_or_default();
-                if !ranges.is_empty() {
-                    // The checksum must be verified on the original bytes:
-                    // stripping changes everything the library would hash.
-                    if self.checksum_len(head[4]) > 0 {
-                        verify_event_checksum(&self.buffer)?;
-                    }
-                    stripped_tlv_bytes = remove_ranges(&mut self.buffer, 19, &ranges);
-                    let new_size = u32::try_from(self.buffer.len()).map_err(|_| {
-                        io::Error::new(io::ErrorKind::InvalidData, "invalid event size")
-                    })?;
-                    self.buffer[9..13].copy_from_slice(&new_size.to_le_bytes());
-                }
-            }
-            let Some(event) = self.reader.read(&mut Cursor::new(self.buffer.as_slice()))? else {
+            let Some(framed) = self.read_framed_event()? else {
                 return Ok(None);
             };
-            let checksum_algorithm = event
-                .footer()
-                .get_checksum_alg()
-                .map_err(|err| io::Error::new(io::ErrorKind::Unsupported, err))?;
-            if stripped_tlv_bytes == 0
-                && let (Some(checksum), Some(alg)) = (event.checksum(), checksum_algorithm)
-                && u32::from_le_bytes(checksum) != event.calc_checksum(alg)
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "event checksum mismatch",
-                ));
-            }
-            let h = event.header();
-            // The header `event_size` reflects the stripped bytes; the
-            // original size is what positions the stream and the output.
-            self.offset += u64::from(size);
-            // Advisory only (R35): on a master-written file each header's
-            // log_pos lands right after its event. A mismatch suggests
-            // tampering or a spliced file but does not stop parsing; a zero
-            // log_pos is how artificial events mark "no position".
-            const WARNING_CAP: usize = 100;
-            let log_pos = u64::from(h.log_pos());
-            let expected = offset + u64::from(size);
-            if log_pos != 0 && log_pos != expected && self.warnings.len() < WARNING_CAP {
-                self.warnings.push(format!(
-                    "log_pos {log_pos} does not match offset {offset} + event size {size}"
-                ));
-            }
-            let raw = h.event_type_raw();
-            let event_type = EventType::from_raw(raw);
-            // The mapping is shared with the events decompressed out of a
-            // transaction payload; code 40 itself takes its own path below.
-            let payload = if raw == 40 {
-                self.transaction_payload(&event)?
+            let payload = if framed.event.header().event_type_raw() == 40 {
+                self.transaction_payload(&framed.event)?
             } else {
-                self.payload_for(&event)?
+                self.payload_for(&framed.event)?
             };
-            Ok(Some(ParsedEvent {
-                offset,
-                timestamp: h.timestamp(),
-                event_type,
-                event_type_code: raw,
-                server_id: h.server_id(),
-                event_size: size,
-                log_pos: h.log_pos(),
-                payload,
-            }))
+            Ok(Some(framed.into_parsed(payload)))
         })();
         match result {
             Ok(Some(e)) => Some(Ok(e)),
@@ -313,6 +377,133 @@ impl<R: Read> BinlogParser<R> {
                 Some(Err(ParserError::Io { offset, source }))
             }
         }
+    }
+
+    /// Read and validate one outer event, retaining its original coordinates
+    /// when table-map metadata is stripped before library decoding.
+    fn read_framed_event(&mut self) -> io::Result<Option<FramedEvent>> {
+        let offset = self.offset;
+        // Validate framing before allowing the library to allocate the event buffer.
+        let mut head = [0u8; 19];
+        // Retry transient interruptions without treating a reader's
+        // UnexpectedEof error as a clean event boundary.
+        let first = loop {
+            match self.input.read(&mut head[..1]) {
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                result => break result?,
+            }
+        };
+        if first == 0 {
+            return Ok(None);
+        }
+        self.input.read_exact(&mut head[1..])?;
+        let size = u32::from_le_bytes(head[9..13].try_into().unwrap());
+        if !(19..=self.max_event_size).contains(&size) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid or oversized event",
+            ));
+        }
+        // mysql_common assumes the complete event body is available.
+        if head[4] == 15 && size < 19 + 57 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "short format description",
+            ));
+        }
+        if head[4] != 15 && self.checksum_len(head[4]) > 0 && size < 23 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "short checksummed event",
+            ));
+        }
+        // Resizing without clearing only zero-fills the newly observed
+        // tail; every byte is overwritten by the head and body anyway.
+        self.buffer.resize(size as usize, 0);
+        self.buffer[..19].copy_from_slice(&head);
+        self.input.read_exact(&mut self.buffer[19..])?;
+        // Hostile-input prevalidation before the library decodes anything:
+        // its previous-GTIDs and table-map metadata parsers allocate from
+        // untrusted declared counts, and its transaction-payload header
+        // parser unwraps the compression type, so crafted input would
+        // abort the process.
+        let data_len = self.buffer.len() - 19 - self.checksum_len(head[4]);
+        let body = &self.buffer[19..19 + data_len];
+        if head[4] == 35 {
+            validate_previous_gtids(body)?;
+        }
+        if head[4] == 19 {
+            let header_len = self.reader.get_fde().get_event_type_header_length(
+                mysql_common::binlog::consts::EventType::TABLE_MAP_EVENT,
+            );
+            crate::row_decode::validate_table_map_metadata(body, header_len)?;
+        }
+        if head[4] == 40 {
+            validate_transaction_payload_header(body)?;
+        }
+        // Table maps of partial-JSON binlogs (WL#2955) carry optional
+        // metadata types the library's lazily iterated metadata rejects;
+        // those entries are stripped from the bytes the library parses,
+        // so the stored table map stays acceptable for every later row
+        // event. The strip runs after the prevalidation of the original
+        // bytes, and only for table maps.
+        let mut stripped_tlv_bytes = 0usize;
+        if head[4] == 19 {
+            let header_len = self.reader.get_fde().get_event_type_header_length(
+                mysql_common::binlog::consts::EventType::TABLE_MAP_EVENT,
+            );
+            let ranges =
+                crate::row_decode::unsupported_tlv_ranges(body, header_len)?.unwrap_or_default();
+            if !ranges.is_empty() {
+                // The checksum must be verified on the original bytes:
+                // stripping changes everything the library would hash.
+                if self.checksum_len(head[4]) > 0 {
+                    verify_event_checksum(&self.buffer)?;
+                }
+                stripped_tlv_bytes = remove_ranges(&mut self.buffer, 19, &ranges);
+                let new_size = u32::try_from(self.buffer.len()).map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid event size")
+                })?;
+                self.buffer[9..13].copy_from_slice(&new_size.to_le_bytes());
+            }
+        }
+        let Some(event) = self.reader.read(&mut Cursor::new(self.buffer.as_slice()))? else {
+            return Ok(None);
+        };
+        let checksum_algorithm = event
+            .footer()
+            .get_checksum_alg()
+            .map_err(|err| io::Error::new(io::ErrorKind::Unsupported, err))?;
+        if stripped_tlv_bytes == 0
+            && let (Some(checksum), Some(alg)) = (event.checksum(), checksum_algorithm)
+            && u32::from_le_bytes(checksum) != event.calc_checksum(alg)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "event checksum mismatch",
+            ));
+        }
+        let h = event.header();
+        // The header `event_size` reflects the stripped bytes; the
+        // original size is what positions the stream and the output.
+        self.offset += u64::from(size);
+        // Advisory only (R35): on a master-written file each header's
+        // log_pos lands right after its event. A mismatch suggests
+        // tampering or a spliced file but does not stop parsing; a zero
+        // log_pos is how artificial events mark "no position".
+        const WARNING_CAP: usize = 100;
+        let log_pos = u64::from(h.log_pos());
+        let expected = offset + u64::from(size);
+        if log_pos != 0 && log_pos != expected && self.warnings.len() < WARNING_CAP {
+            self.warnings.push(format!(
+                "log_pos {log_pos} does not match offset {offset} + event size {size}"
+            ));
+        }
+        Ok(Some(FramedEvent {
+            event,
+            offset,
+            size,
+        }))
     }
 
     /// Maps a decoded event onto the stable payload model.
@@ -469,6 +660,19 @@ impl<R: Read> BinlogParser<R> {
             Some(EventData::RowsEvent(e)) => {
                 let id = e.table_id();
                 if let Some(map) = self.reader.get_tme(id) {
+                    // With no selected columns, an ordinary row consumes
+                    // neither a NULL bitmap nor values. The dependency's
+                    // iterator would repeatedly yield an empty row while
+                    // retaining the same nonempty data buffer.
+                    if !e.rows_data().is_empty()
+                        && !e.columns_before_image().is_some_and(|bits| bits.any())
+                        && !e.columns_after_image().is_some_and(|bits| bits.any())
+                    {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "row data with no selected columns cannot make progress",
+                        ));
+                    }
                     // See the PartialUpdateRows arm: a row event may
                     // declare fewer columns than the table map, never
                     // more; missing tail columns render as absent.
@@ -563,6 +767,31 @@ impl<R: Read> BinlogParser<R> {
     /// checksums (WL#3549), and the library registers their table maps in the
     /// shared reader state so later outer row events resolve.
     fn transaction_payload(&mut self, event: &Event) -> io::Result<EventPayload> {
+        let mut events = Vec::new();
+        let flow = self.walk_transaction_payload(event, &mut |item| {
+            if let PayloadItem::Event(event) = item {
+                events.push(event);
+            }
+            Ok(ControlFlow::<Infallible>::Continue(()))
+        })?;
+        let info = match flow {
+            ControlFlow::Continue(info) => info,
+            ControlFlow::Break(never) => match never {},
+        };
+        Ok(EventPayload::TransactionPayload {
+            compression: info.compression.to_owned(),
+            uncompressed_size: info.uncompressed_size,
+            events,
+        })
+    }
+
+    /// Shared payload decoder. The collecting API owns each emitted event;
+    /// the visiting API borrows it for one callback and then drops it.
+    fn walk_transaction_payload<B>(
+        &mut self,
+        event: &Event,
+        emit: &mut impl FnMut(PayloadItem) -> io::Result<ControlFlow<B>>,
+    ) -> io::Result<ControlFlow<B, PayloadInfo>> {
         let Some(EventData::TransactionPayloadEvent(payload)) = event.read_data()? else {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -606,29 +835,43 @@ impl<R: Read> BinlogParser<R> {
             u64::from(self.max_event_size),
             tme_header_len,
         );
+        let info = PayloadInfo {
+            compression,
+            uncompressed_size,
+        };
+        if let ControlFlow::Break(value) = emit(PayloadItem::Start(info))? {
+            return Ok(ControlFlow::Break(value));
+        }
         let timestamp = event.header().timestamp();
         let server_id = event.header().server_id();
-        let mut events = Vec::new();
-        while let Some(inner) = self.reader.read_decompressed(&mut stream)? {
-            let offset = stream.last_event_offset();
-            let h = inner.header();
-            events.push(ParsedEvent {
-                offset,
-                timestamp,
-                event_type: EventType::from_raw(h.event_type_raw()),
-                event_type_code: h.event_type_raw(),
-                server_id,
-                // The declared size, not the stripped one the library saw.
-                event_size: stream.last_event_size(),
-                log_pos: h.log_pos(),
-                payload: self.payload_for(&inner)?,
-            });
+        loop {
+            let offset = stream.position;
+            let decoded = (|| -> io::Result<Option<ParsedEvent>> {
+                let Some(inner) = self.reader.read_decompressed(&mut stream)? else {
+                    return Ok(None);
+                };
+                let h = inner.header();
+                Ok(Some(ParsedEvent {
+                    offset: stream.last_event_offset(),
+                    timestamp,
+                    event_type: EventType::from_raw(h.event_type_raw()),
+                    event_type_code: h.event_type_raw(),
+                    server_id,
+                    // The declared size, not the stripped one the library saw.
+                    event_size: stream.last_event_size(),
+                    log_pos: h.log_pos(),
+                    payload: self.payload_for(&inner)?,
+                }))
+            })()
+            .map_err(|source| io::Error::new(source.kind(), InnerEventError { offset, source }))?;
+            let Some(decoded) = decoded else {
+                break;
+            };
+            if let ControlFlow::Break(value) = emit(PayloadItem::Event(decoded))? {
+                return Ok(ControlFlow::Break(value));
+            }
         }
-        Ok(EventPayload::TransactionPayload {
-            compression: compression.to_owned(),
-            uncompressed_size,
-            events,
-        })
+        Ok(ControlFlow::Continue(info))
     }
 }
 
