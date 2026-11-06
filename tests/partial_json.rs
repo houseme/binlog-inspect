@@ -106,7 +106,7 @@ fn table_map_body(table_id: u64, partial: bool, signedness: bool) -> Vec<u8> {
     body.push(0);
     body.push(2); // two columns
     body.extend_from_slice(&[0x03, 0xf5]); // LONG (0x03), JSON (0xf5)
-    body.push(0); // no column metadata
+    body.extend_from_slice(&[1, 4]); // JSON uses a four-byte length prefix
     body.push(1); // null bitmap
     let mut meta = Vec::new();
     if signedness {

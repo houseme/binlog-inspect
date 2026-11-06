@@ -379,6 +379,7 @@ pub(crate) fn column_type_name(column_type: ColumnType) -> &'static str {
 /// iterator hard-errors on the partial-JSON metadata types (14, 15) that
 /// partial-JSON binlogs carry, which would defeat their handling.
 pub(crate) fn signedness(map: &TableMapEvent<'_>) -> io::Result<Vec<Option<bool>>> {
+    validate_column_metadata(map)?;
     let bits = signedness_bits(map)?;
     let mut numeric = 0usize;
     let mut result = Vec::new();
@@ -396,6 +397,45 @@ pub(crate) fn signedness(map: &TableMapEvent<'_>) -> io::Result<Vec<Option<bool>
         });
     }
     Ok(result)
+}
+
+/// Validate metadata before the dependency substitutes an empty slice for
+/// missing metadata and indexes it during row decoding.
+fn validate_column_metadata(map: &TableMapEvent<'_>) -> io::Result<()> {
+    let count = usize::try_from(map.columns_count())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "column count overflow"))?;
+    for index in 0..count {
+        let column_type = map
+            .get_raw_column_type(index)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing column type"))?;
+        // mysql_common gives VAR_STRING zero metadata bytes but its value
+        // decoder requires two. TYPED_ARRAY strips the element type before
+        // its value decoder tries to read it again. Reject both explicitly.
+        if matches!(
+            column_type,
+            ColumnType::MYSQL_TYPE_VAR_STRING | ColumnType::MYSQL_TYPE_TYPED_ARRAY
+        ) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!(
+                    "unsupported binlog column type {}",
+                    column_type_name(column_type)
+                ),
+            ));
+        }
+    }
+    // The getter walks every preceding column, so checking the last column
+    // once validates the complete metadata span in linear time.
+    if let Some(last) = count.checked_sub(1)
+        && map.get_column_metadata(last).is_none()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "table map column metadata is truncated",
+        ));
+    }
+    Ok(())
 }
 
 /// Reads the SIGNEDNESS (type 1) TLV value of a table map event, if any.
@@ -573,7 +613,7 @@ fn walk_table_map_header(body: &[u8], tme_header_length: u8) -> Option<usize> {
     Some(null_end)
 }
 
-/// Validates the variant list of a SET/ENUM optional metadata TLV.
+/// Validates every column variant list in a SET/ENUM optional metadata TLV.
 ///
 /// The library allocates a vector with the declared variant count before
 /// reading anything, so an inflated count must be rejected here. The count is
@@ -581,38 +621,43 @@ fn walk_table_map_header(body: &[u8], tme_header_length: u8) -> Option<usize> {
 /// mean zero), mirroring `RawInt<LenEnc>`.
 fn validate_enum_set_variants(value: &[u8]) -> io::Result<()> {
     let mut pos = 0;
-    let num_variants = read_lenenc_lenient(value, &mut pos)? as usize;
-    // Every variant needs at least one length byte, so a count larger than the
-    // remaining bytes can never be satisfied.
-    if num_variants > value.len() - pos {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "enum/set variant count exceeds TLV bounds",
-        ));
-    }
-    for _ in 0..num_variants {
-        let len = match read_lenenc(value, &mut pos)? {
-            Some(len) => len as usize,
-            None => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "invalid variant length",
-                ));
-            }
-        };
-        let Some(end) = pos.checked_add(len) else {
+    loop {
+        let num_variants = read_lenenc_lenient(value, &mut pos)? as usize;
+        // Every variant needs at least one length byte, so a count larger than the
+        // remaining bytes can never be satisfied.
+        if num_variants > value.len() - pos {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "variant length exceeds TLV bounds",
-            ));
-        };
-        if end > value.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "variant name exceeds TLV bounds",
+                "enum/set variant count exceeds TLV bounds",
             ));
         }
-        pos = end;
+        for _ in 0..num_variants {
+            let len = match read_lenenc(value, &mut pos)? {
+                Some(len) => len as usize,
+                None => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "invalid variant length",
+                    ));
+                }
+            };
+            let Some(end) = pos.checked_add(len) else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "variant length exceeds TLV bounds",
+                ));
+            };
+            if end > value.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "variant name exceeds TLV bounds",
+                ));
+            }
+            pos = end;
+        }
+        if pos == value.len() {
+            break;
+        }
     }
     Ok(())
 }
@@ -788,19 +833,20 @@ mod json_diff {
         Ok(value)
     }
 
-    /// Maximum depth of a JSON value, computed iteratively with an explicit
-    /// stack: the serializer recurses, so measuring a potentially hostile
-    /// composite must not.
+    /// Maximum container depth of a JSON value, matching jsonb_to_serde.
+    /// Scalars add no container level. The explicit stack bounds recursion
+    /// while inspecting a potentially hostile composed document.
     fn json_depth(value: &serde_json::Value) -> usize {
-        let mut max = 1;
+        let mut max = 0;
         let mut stack = vec![(value, 1usize)];
         while let Some((current, depth)) = stack.pop() {
-            max = max.max(depth);
             match current {
                 serde_json::Value::Array(items) => {
+                    max = max.max(depth);
                     stack.extend(items.iter().map(|item| (item, depth + 1)));
                 }
                 serde_json::Value::Object(members) => {
+                    max = max.max(depth);
                     stack.extend(members.values().map(|member| (member, depth + 1)));
                 }
                 _ => {}
@@ -812,7 +858,7 @@ mod json_diff {
     /// Applies a single diff to a value in place.
     ///
     /// Edge-case semantics, pinned to the server's applier (MySQL
-    /// `sql/json_diff.cc`): an object REPLACE behaves as an upsert (it also
+    /// `sql-common/json_diff.cc`): an object REPLACE behaves as an upsert (it also
     /// adds the member when it is absent), and an array INSERT accepts
     /// index == length (append) but not beyond. Real server diffs always
     /// target existing paths, so these edges only decide how malformed or
@@ -1123,6 +1169,38 @@ mod json_diff {
             );
             let remove_root = [rec("$", "remove", None)];
             assert!(apply_json_diffs(serde_json::json!({}), &remove_root).is_err());
+        }
+
+        #[test]
+        fn diff_depth_limit_counts_containers_consistently_with_jsonb() {
+            let depth = super::super::MAX_JSONB_DEPTH;
+            let nested =
+                |leaf| (0..depth).fold(leaf, |child, _| serde_json::Value::Array(vec![child]));
+            let before = nested(serde_json::json!(1));
+            assert_eq!(apply_json_diffs(before.clone(), &[]).unwrap(), before);
+            let path = format!("${}", "[0]".repeat(depth));
+            assert_eq!(
+                apply_json_diffs(
+                    before.clone(),
+                    &[rec(&path, "replace", Some(serde_json::json!(2)))]
+                )
+                .unwrap(),
+                nested(serde_json::json!(2))
+            );
+            let error = apply_json_diffs(
+                before,
+                &[rec(&path, "replace", Some(serde_json::json!([])))],
+            )
+            .unwrap_err();
+            assert!(error.0.contains("nesting limit"), "{}", error.0);
+            assert_eq!(
+                apply_json_diffs(
+                    serde_json::json!(null),
+                    &[rec("$", "replace", Some(nested(serde_json::json!(3))))]
+                )
+                .unwrap(),
+                nested(serde_json::json!(3))
+            );
         }
 
         #[test]
@@ -1660,6 +1738,28 @@ mod tests {
         let err = validate_table_map_metadata(&body, 8).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
+
+    #[test]
+    fn enum_set_metadata_validates_every_column_list() {
+        for field_type in [TLV_SET_STR_VALUE, TLV_ENUM_STR_VALUE] {
+            // Two column lists, including empty names and a zero-variant
+            // list, follow the same length-encoded representation.
+            let valid = [1, 1, b'a', 2, 0, 1, b'b', 0];
+            let mut tlv = vec![field_type, valid.len() as u8];
+            tlv.extend(valid);
+            validate_table_map_metadata(&body_with_lenient_header(&tlv), 8).unwrap();
+
+            for suffix in [vec![0xfe], vec![2, 0], vec![1, 3, b'b']] {
+                let mut value = vec![1, 1, b'a']; // valid first column
+                value.extend(suffix);
+                let mut tlv = vec![field_type, value.len() as u8];
+                tlv.extend(value);
+                let error =
+                    validate_table_map_metadata(&body_with_lenient_header(&tlv), 8).unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            }
+        }
+    }
     #[test]
     fn well_formed_tlv_block_is_accepted() {
         // SIGNEDNESS for two numeric columns, plus ENUM_STR_VALUE with a
@@ -1765,8 +1865,8 @@ mod tests {
         body.push(1);
         body.extend_from_slice(b"t\0");
         body.push(2); // two columns
-        body.extend_from_slice(&[0x03, 0xf9]); // LONG, JSON
-        body.push(0); // no column metadata
+        body.extend_from_slice(&[0x03, 0xf5]); // LONG, JSON
+        body.extend_from_slice(&[1, 4]); // JSON uses a four-byte length prefix
         body.push(1); // one null-bitmap byte
         body.extend_from_slice(tlv);
         body
