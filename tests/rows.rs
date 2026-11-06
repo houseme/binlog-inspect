@@ -67,6 +67,78 @@ fn json_and_csv_represent_typed_rows() {
 }
 
 #[test]
+fn csv_preserves_bytes_with_short_writes_and_reports_write_errors() {
+    use std::io::{self, Write};
+
+    struct ShortWriter(Vec<u8>);
+    impl Write for ShortWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            let len = bytes.len().min(3);
+            self.0.extend_from_slice(&bytes[..len]);
+            Ok(len)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut event = sample_event();
+    let EventPayload::Rows {
+        database,
+        table,
+        changes,
+        ..
+    } = &mut event.payload
+    else {
+        unreachable!();
+    };
+    *database = "db,\"quoted\"\r\n中文".into();
+    *table = "".into();
+    changes[0].after.as_mut().unwrap().columns[0].value = CellValue::Json(
+        serde_json::json!({"\"key\"": "line\r\n\t\\😀", "large": "a\"b".repeat(4096)}),
+    );
+    changes.push(RowChange {
+        before: Some(RowImage { columns: vec![] }),
+        after: None,
+    });
+    // The previous allocating implementation defines the byte contract.
+    let quote = |text: &str| format!("\"{}\"", text.replace('"', "\"\""));
+    let mut expected = String::new();
+    for change in changes {
+        expected.push_str(&format!(
+            "{},{},{},{},{},{}\n",
+            event.timestamp,
+            quote(event.event_type.as_str()),
+            quote(database),
+            quote(table),
+            quote(&serde_json::to_string(&change.before).unwrap()),
+            quote(&serde_json::to_string(&change.after).unwrap())
+        ));
+    }
+    let mut out = ShortWriter(Vec::new());
+    assert!(CsvFormatter.format(&event, &mut out).unwrap());
+    assert_eq!(out.0, expected.as_bytes());
+
+    // A fixed-size destination returns WriteZero when its capacity runs out.
+    // Exercise failures inside quoted fields as well as between records.
+    for capacity in [0, 25, 200, expected.len() - 2] {
+        let mut bytes = vec![0u8; capacity];
+        let error = CsvFormatter
+            .format(&event, &mut bytes.as_mut_slice())
+            .unwrap_err();
+        match error {
+            binlog_inspect::formatter::FormatterError::Io(error) => {
+                assert_eq!(error.kind(), io::ErrorKind::WriteZero);
+            }
+            binlog_inspect::formatter::FormatterError::Json(error) => {
+                assert_eq!(error.io_error_kind(), Some(io::ErrorKind::WriteZero));
+            }
+        }
+        assert_eq!(bytes, expected.as_bytes()[..capacity]);
+    }
+}
+
+#[test]
 fn rows_payload_round_trips_through_json() {
     let event = sample_event();
     let text = serde_json::to_string(&event).unwrap();

@@ -293,41 +293,49 @@ fn broken_pipe_from_a_piped_reader_exits_zero() {
     // write path. The JSONL formatter surfaces writer failures as
     // FormatterError::Json(serde_json::Error), which hides the underlying io
     // error one level down, so the graceful-exit check has to see through it.
-    // 2000 events produce far more output than any OS pipe buffer, so the
+    // 2000 row events produce far more output than any OS pipe buffer, so the
     // child is guaranteed to hit the closed pipe while still writing.
     let mut bytes = b"\xfebin".to_vec();
-    for index in 0..2000u64 {
-        bytes.extend(event(16, &index.to_le_bytes()));
+    let mut map = vec![1, 0, 0, 0, 0, 0, 0, 0];
+    map.extend_from_slice(b"\x03app\0\x01t\0\x01\x03\x00\x00");
+    bytes.extend(event(19, &map));
+    let mut row = vec![1, 0, 0, 0, 0, 0, 0, 0];
+    row.extend_from_slice(&[2, 0, 1, 1, 0, 42, 0, 0, 0]);
+    for _ in 0..2000 {
+        bytes.extend(event(30, &row));
     }
     let f = file(&bytes);
-    let mut child = Command::new(env!("CARGO_BIN_EXE_binlog-inspect"))
-        .arg(f.path())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    // Read a few bytes, then close the read end while the child is still
-    // producing output.
-    {
-        let mut stdout = child.stdout.take().unwrap();
-        let mut first = [0u8; 16];
-        stdout.read_exact(&mut first).unwrap();
+    for format in ["jsonl", "text", "csv"] {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_binlog-inspect"))
+            .arg(f.path())
+            .args(["--format", format])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        // Read a few bytes, then close the read end while the child is still
+        // producing output.
+        {
+            let mut stdout = child.stdout.take().unwrap();
+            let mut first = [0u8; 16];
+            stdout.read_exact(&mut first).unwrap();
+        }
+        let output = child.wait_with_output().unwrap();
+        // std maps a closed pipe to ErrorKind::BrokenPipe on every platform
+        // (Windows ERROR_BROKEN_PIPE included), so the exit-0 contract is
+        // asserted uniformly.
+        assert!(
+            output.status.success(),
+            "{format} exit {:?}: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !String::from_utf8_lossy(&output.stderr).contains("panicked"),
+            "a broken pipe must not panic: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
-    let output = child.wait_with_output().unwrap();
-    // std maps a closed pipe to ErrorKind::BrokenPipe on every platform
-    // (Windows ERROR_BROKEN_PIPE included), so the exit-0 contract is
-    // asserted uniformly.
-    assert!(
-        output.status.success(),
-        "exit {:?}: {}",
-        output.status.code(),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(
-        !String::from_utf8_lossy(&output.stderr).contains("panicked"),
-        "a broken pipe must not panic: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
 }
 #[test]
 fn gtid_events_expose_kind_gtid_value_and_tag() {

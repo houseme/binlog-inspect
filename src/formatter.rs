@@ -55,8 +55,15 @@ impl Formatter for TextFormatter {
 }
 /// One CSV record per decoded row image.
 pub struct CsvFormatter;
-fn quote(s: &str) -> String {
-    format!("\"{}\"", s.replace('"', "\"\""))
+
+/// Reuse the escaped string for its enclosing quotes, avoiding a second
+/// formatted String allocation for each field.
+fn quote(text: &str) -> String {
+    let mut quoted = text.replace('"', "\"\"");
+    quoted.reserve(2);
+    quoted.insert(0, '"');
+    quoted.push('"');
+    quoted
 }
 impl Formatter for CsvFormatter {
     fn header(&self) -> Option<&'static str> {
@@ -70,14 +77,17 @@ impl Formatter for CsvFormatter {
             ..
         } = &e.payload
         {
+            let database = quote(database);
+            let table = quote(table);
             for change in changes {
+                // EventType's fixed names never contain CSV delimiters.
                 writeln!(
                     out,
-                    "{},{},{},{},{},{}",
+                    "{},\"{}\",{},{},{},{}",
                     e.timestamp,
-                    quote(e.event_type.as_str()),
-                    quote(database),
-                    quote(table),
+                    e.event_type.as_str(),
+                    database,
+                    table,
                     quote(&serde_json::to_string(&change.before)?),
                     quote(&serde_json::to_string(&change.after)?)
                 )?;
