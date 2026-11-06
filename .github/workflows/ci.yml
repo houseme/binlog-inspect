@@ -28,6 +28,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ ubuntu-latest, macos-latest, windows-latest ]
+        features: [ default, all, no-default-features, no-default-with-remote ]
         include:
           # Default features (`cli`) — builds the library and the binary.
           - features: "default"
@@ -52,6 +53,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
 
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          # Keep feature-specific output checks independent of cached builds.
+          key: test-${{ matrix.features }}
 
       - name: Build (lib + bin)
         run: cargo build --locked ${{ matrix.flags }}
