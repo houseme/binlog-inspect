@@ -6,12 +6,12 @@
 //! The seed, family, case and mutation are printed on failure. These cases use
 //! synthetic data and run on stable with either feature configuration. They
 //! complement coverage-guided fuzzing: they do not generate arbitrary format
-//! descriptions, compressed streams or deeply aliased JSONB containers, whose
-//! resource amplification needs a separately limited process.
+//! descriptions or compressed streams, and the resource-amplifying JSONB
+//! shapes (R48) are covered by dedicated budget-bounded fixtures below.
 
 use binlog_inspect::{
     event::{CellValue, EventPayload, EventType, ParsedEvent},
-    parser::BinlogParser,
+    parser::{BinlogParser, ParserError},
 };
 use mysql_common::{
     binlog::{consts::TransactionPayloadCompressionType, events::TransactionPayloadEvent},
@@ -459,4 +459,135 @@ fn bounded_wire_mutations_and_truncations_are_deterministic_and_fused() {
             }
         }
     }
+}
+
+/// The R48 aliased-jsonb bomb: `depth` chained small-array containers whose
+/// two entries both point at the same next container; the last container
+/// holds two inlined int16 leaves. Ten wire bytes per container plus the
+/// top-level type byte decode into `2^(depth+1) - 1` serde nodes.
+fn aliased_jsonb_bomb(depth: usize) -> Vec<u8> {
+    let mut chain = [0x02, 0x00, 0x0a, 0x00, 0x05, 0x01, 0x00, 0x05, 0x01, 0x00].to_vec();
+    for _ in 1..depth {
+        let mut container = 2u16.to_le_bytes().to_vec();
+        container.extend(((10 + chain.len()) as u16).to_le_bytes());
+        // Both entries are small-array references to the same child at
+        // offset 10 (relative to the element-count field).
+        container.extend([0x02, 10, 0x00, 0x02, 10, 0x00]);
+        container.extend_from_slice(&chain);
+        chain = container;
+    }
+    let mut out = vec![0x02];
+    out.extend_from_slice(&chain);
+    out
+}
+
+/// The event sizes of the fixed corpus framing: the format description body
+/// is 57 + 40 + 1 bytes, and every event carries a 19-byte header plus a
+/// 4-byte CRC32.
+fn format_description_size() -> u32 {
+    19 + 98 + 4
+}
+
+/// The 221-byte aliased-jsonb reproduction of the R48 amplification: 22
+/// chained small-array containers, both entries of each pointing at the same
+/// child, used to decode into 2^23 - 1 = 8,388,607 serde nodes. The decoded
+/// node budget turns the amplification into a clean error at the rows event
+/// instead of an allocation runaway.
+#[test]
+fn aliased_jsonb_bomb_is_rejected_by_the_node_budget() {
+    let bomb = aliased_jsonb_bomb(22);
+    assert_eq!(bomb.len(), 221);
+    let mut value = (bomb.len() as u32).to_le_bytes().to_vec();
+    value.extend_from_slice(&bomb);
+    let tme = table_map(245, &[4]);
+    let rows = row_event(&[value]);
+    let bytes = binlog(&[tme.clone(), rows.clone()]);
+    let rows_offset = 4 + format_description_size() + (19 + tme.body.len() + 4) as u32;
+    let context = "aliased-jsonb-bomb";
+    let outcome = parse(&bytes, bytes.len(), context);
+    assert_eq!(
+        outcome.events.len(),
+        2,
+        "{context}: the format description and table map still decode: {outcome:?}"
+    );
+    let error = outcome
+        .error
+        .clone()
+        .unwrap_or_else(|| panic!("{context}: the bomb must fail the rows event"));
+    assert!(
+        error.contains("jsonb decoding exceeds the node budget of 1000000 nodes"),
+        "{error}"
+    );
+    assert!(
+        error.contains(&format!("binlog error at offset {rows_offset}")),
+        "{error}"
+    );
+    // The error is deterministic across chunked reads too.
+    assert_eq!(parse(&bytes, 9, context), outcome, "{context}");
+}
+
+/// A hostile single-container jsonb whose declared element count is 0xffff_ffff
+/// while the container declares only its 8-byte header: no element bytes exist
+/// and no pre-allocation from the untrusted count may abort the process. The
+/// library's structural check rejects the shape cleanly.
+#[test]
+fn hostile_container_element_count_is_rejected_cleanly() {
+    // JSONB_TYPE_LARGE_ARRAY, element count 0xffff_ffff, size 8 (the header
+    // alone) — the declared entries cannot exist in 9 wire bytes.
+    let jsonb = [0x03, 0xff, 0xff, 0xff, 0xff, 0x08, 0x00, 0x00, 0x00];
+    let mut value = (jsonb.len() as u32).to_le_bytes().to_vec();
+    value.extend_from_slice(&jsonb);
+    let bytes = binlog(&[table_map(245, &[4]), row_event(&[value])]);
+    let context = "hostile-element-count";
+    let outcome = parse(&bytes, bytes.len(), context);
+    assert_eq!(
+        outcome.events.len(),
+        2,
+        "{context}: the format description and table map still decode: {outcome:?}"
+    );
+    let error = outcome
+        .error
+        .clone()
+        .unwrap_or_else(|| panic!("{context}: the hostile count must fail the rows event"));
+    assert!(error.contains("Malformed jsonb"), "{error}");
+    // The same bytes survive chunked reads with the identical outcome.
+    assert_eq!(parse(&bytes, 5, context), outcome, "{context}");
+}
+
+/// The library-level `with_max_event_size` constructor (R21): a custom cap
+/// smaller than a crafted event rejects exactly that event with the
+/// oversized-event error while the earlier events still decode.
+#[test]
+fn with_max_event_size_rejects_events_above_the_custom_cap() {
+    let tme = table_map(3, &[]);
+    // A row event of 19 + body + CRC bytes with a padded value, so its frame
+    // is larger than the format description and the table map.
+    let big_value = vec![0x11; 200];
+    let rows = row_event(&[big_value]);
+    let bytes = binlog(&[tme.clone(), rows.clone()]);
+    let rows_offset = 4 + format_description_size() + (19 + tme.body.len() + 4) as u32;
+    // 121-byte format description and 56-byte table map fit; the row event
+    // does not.
+    let mut parser = BinlogParser::from_reader(Cursor::new(&bytes[..]))
+        .unwrap()
+        .with_max_event_size(130);
+    let mut events = parser.events();
+    assert!(events.next().unwrap().is_ok(), "format description");
+    assert!(events.next().unwrap().is_ok(), "table map");
+    let error = events.next().expect("the row event is framed").unwrap_err();
+    assert!(
+        matches!(
+            error,
+            ParserError::Io { ref source, .. } if source.kind() == io::ErrorKind::InvalidData
+        ),
+        "{error}"
+    );
+    assert!(
+        error.to_string().contains(&format!(
+            "binlog error at offset {rows_offset}: invalid or oversized event"
+        )),
+        "{error}"
+    );
+    // The parser is fused after the error.
+    assert!(events.next().is_none());
 }

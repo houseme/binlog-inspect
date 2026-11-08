@@ -48,6 +48,22 @@ const HEX: [u8; 16] = *b"0123456789abcdef";
 /// error instead of overflowing the stack.
 const MAX_JSONB_DEPTH: usize = 100;
 
+/// Default budget on the serde nodes a single jsonb conversion may produce.
+///
+/// The jsonb format stores a child offset per container entry, so crafted
+/// containers can point every entry at the same child subtree and amplify a
+/// linear-size wire value into an exponentially larger decoded tree: the
+/// reproduction that motivated this budget decodes 221 wire bytes (22 aliased
+/// small-array containers) into 8,388,607 serde nodes, and a ~331-byte chain
+/// demands ~275 GB before the [`MAX_JSONB_DEPTH`] cap can fire. Every node
+/// the conversion produces — scalar or container, containers counting
+/// themselves plus, through the recursion, their children — is charged one
+/// against the counter threaded through [`jsonb_to_serde`]; the counter is
+/// monotone across the whole conversion, so aliasing cannot reset it.
+/// Exceeding the budget returns a clean `InvalidData` error instead of
+/// allocating towards an allocator abort (R48).
+const DEFAULT_JSONB_NODE_BUDGET: usize = 1_000_000;
+
 /// Converts a library jsonb value into the serde_json model.
 ///
 /// Containers are converted here so the conversion recursion is capped at
@@ -60,15 +76,30 @@ const MAX_JSONB_DEPTH: usize = 100;
 /// DATE/TIME/DATETIME opaques into their text form, and every other opaque
 /// into a `base64:type<id>:<data>` string. Legitimate data therefore never
 /// fails the event.
-fn jsonb_to_serde(value: &jsonb::Value<'_>, depth: usize) -> io::Result<serde_json::Value> {
+///
+/// `nodes` is the decoded-node counter shared by the whole conversion: every
+/// converted node charges one against it, and exceeding
+/// [`DEFAULT_JSONB_NODE_BUDGET`] returns `InvalidData`. Each value
+/// conversion entry point (the row-value path and the diff-value path) owns
+/// one counter and must never reset it mid-conversion.
+fn jsonb_to_serde(
+    value: &jsonb::Value<'_>,
+    depth: usize,
+    nodes: &mut usize,
+) -> io::Result<serde_json::Value> {
+    *nodes += 1;
+    if *nodes > DEFAULT_JSONB_NODE_BUDGET {
+        return Err(jsonb_over_node_budget());
+    }
     match value {
         jsonb::Value::SmallArray(container) => {
             if depth > MAX_JSONB_DEPTH {
                 return Err(jsonb_too_deep());
             }
-            let mut items = Vec::with_capacity(container.element_count() as usize);
+            // Untrusted count; the vector grows on demand.
+            let mut items = Vec::with_capacity(container.element_count().min(4096) as usize);
             for item in container.iter() {
-                items.push(jsonb_to_serde(&item?, depth + 1)?);
+                items.push(jsonb_to_serde(&item?, depth + 1, nodes)?);
             }
             Ok(serde_json::Value::Array(items))
         }
@@ -76,9 +107,10 @@ fn jsonb_to_serde(value: &jsonb::Value<'_>, depth: usize) -> io::Result<serde_js
             if depth > MAX_JSONB_DEPTH {
                 return Err(jsonb_too_deep());
             }
-            let mut items = Vec::with_capacity(container.element_count() as usize);
+            // Untrusted count; the vector grows on demand.
+            let mut items = Vec::with_capacity(container.element_count().min(4096) as usize);
             for item in container.iter() {
-                items.push(jsonb_to_serde(&item?, depth + 1)?);
+                items.push(jsonb_to_serde(&item?, depth + 1, nodes)?);
             }
             Ok(serde_json::Value::Array(items))
         }
@@ -89,7 +121,10 @@ fn jsonb_to_serde(value: &jsonb::Value<'_>, depth: usize) -> io::Result<serde_js
             let mut members = serde_json::Map::new();
             for entry in container.iter() {
                 let (key, value) = entry?;
-                members.insert(key.value().into_owned(), jsonb_to_serde(&value, depth + 1)?);
+                members.insert(
+                    key.value().into_owned(),
+                    jsonb_to_serde(&value, depth + 1, nodes)?,
+                );
             }
             Ok(serde_json::Value::Object(members))
         }
@@ -100,7 +135,10 @@ fn jsonb_to_serde(value: &jsonb::Value<'_>, depth: usize) -> io::Result<serde_js
             let mut members = serde_json::Map::new();
             for entry in container.iter() {
                 let (key, value) = entry?;
-                members.insert(key.value().into_owned(), jsonb_to_serde(&value, depth + 1)?);
+                members.insert(
+                    key.value().into_owned(),
+                    jsonb_to_serde(&value, depth + 1, nodes)?,
+                );
             }
             Ok(serde_json::Value::Object(members))
         }
@@ -115,6 +153,15 @@ fn jsonb_too_deep() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidData,
         format!("jsonb nesting depth exceeds the MySQL limit of {MAX_JSONB_DEPTH} levels"),
+    )
+}
+
+/// The rejection error for jsonb input decoding beyond
+/// [`DEFAULT_JSONB_NODE_BUDGET`].
+fn jsonb_over_node_budget() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("jsonb decoding exceeds the node budget of {DEFAULT_JSONB_NODE_BUDGET} nodes"),
     )
 }
 
@@ -178,7 +225,12 @@ pub(crate) fn decode_row(
                     micros: *micros,
                 },
             },
-            BinlogValue::Jsonb(value) => CellValue::Json(jsonb_to_serde(value, 1)?),
+            BinlogValue::Jsonb(value) => {
+                // One node budget per value conversion entry point; a failure
+                // here aborts the row, so the counter never spans cells.
+                let mut nodes = 0usize;
+                CellValue::Json(jsonb_to_serde(value, 1, &mut nodes)?)
+            }
             BinlogValue::JsonDiff(diffs) => {
                 // Without a paired before image (see [`decode_rows_pair`])
                 // there is nothing to apply the diffs to; they are preserved
@@ -773,13 +825,18 @@ mod json_diff {
     /// Converts the library's parsed diffs of one column into model records.
     ///
     /// A diff whose binary JSON value cannot be converted at all (invalid
-    /// UTF-8 in a string member, or nesting beyond the jsonb depth cap)
-    /// yields `None` for its value and is reported in the returned problem
+    /// UTF-8 in a string member, or nesting beyond the jsonb depth cap or the
+    /// node budget) yields `None` for its value and is reported in the
+    /// returned problem
     /// note instead of failing the whole column; opaque values convert like
     /// any other scalar (see [`super::jsonb_to_serde`]).
     pub(super) fn parse_diffs(diffs: &[JsonDiff<'_>]) -> (Vec<JsonDiffRecord>, Option<String>) {
         let mut parsed = Vec::with_capacity(diffs.len());
         let mut problem = None;
+        // The whole diff sequence shares one monotone node budget (R48): an
+        // unrepresentable value does not abort the loop, so a fresh budget
+        // per diff would let hostile values each re-amplify to the limit.
+        let mut nodes = 0usize;
         for diff in diffs {
             let operation = match diff.operation() {
                 JsonDiffOperation::REPLACE => Operation::Replace,
@@ -787,7 +844,7 @@ mod json_diff {
                 JsonDiffOperation::REMOVE => Operation::Remove,
             };
             let value = match diff.value() {
-                Some(jsonb) => match super::jsonb_to_serde(jsonb, 1) {
+                Some(jsonb) => match super::jsonb_to_serde(jsonb, 1, &mut nodes) {
                     Ok(value) => Some(value),
                     Err(error) => {
                         problem.get_or_insert_with(|| {
@@ -1415,7 +1472,8 @@ mod tests {
 
     #[test]
     fn opaque_decimal_jsonb_renders_as_a_string_not_a_failure() {
-        let value = jsonb_to_serde(&jsonb(&opaque_decimal_jsonb()), 1).unwrap();
+        let mut nodes = 0usize;
+        let value = jsonb_to_serde(&jsonb(&opaque_decimal_jsonb()), 1, &mut nodes).unwrap();
         assert_eq!(value, serde_json::json!("12.5"));
     }
 
@@ -1490,13 +1548,90 @@ mod tests {
                 serde_json::json!(1),
             ]);
         }
-        assert_eq!(jsonb_to_serde(&at_cap, 1).unwrap(), expected);
+        let mut nodes = 0usize;
+        assert_eq!(jsonb_to_serde(&at_cap, 1, &mut nodes).unwrap(), expected);
         // One level deeper is hostile input: a clean InvalidData error, not
         // a stack overflow.
         let over = jsonb(&deep_jsonb(MAX_JSONB_DEPTH + 1));
-        let err = jsonb_to_serde(&over, 1).unwrap_err();
+        let mut nodes = 0usize;
+        let err = jsonb_to_serde(&over, 1, &mut nodes).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(err.to_string().contains("nesting depth"), "{}", err);
+    }
+
+    /// The R48 aliased-jsonb bomb: `depth` chained small-array containers
+    /// whose two entries both point at the same next container; the last
+    /// container holds two inlined int16 leaves. Ten wire bytes per container
+    /// plus the top-level type byte decode into `2^(depth+1) - 1` serde nodes.
+    fn aliased_jsonb_bomb(depth: usize) -> Vec<u8> {
+        let mut chain = [0x02, 0x00, 0x0a, 0x00, 0x05, 0x01, 0x00, 0x05, 0x01, 0x00].to_vec();
+        for _ in 1..depth {
+            let mut container = 2u16.to_le_bytes().to_vec();
+            container.extend(((10 + chain.len()) as u16).to_le_bytes());
+            // Both entries are small-array references to the same child at
+            // offset 10 (relative to the element-count field).
+            container.extend([0x02, 10, 0x00, 0x02, 10, 0x00]);
+            container.extend_from_slice(&chain);
+            chain = container;
+        }
+        let mut out = vec![0x02];
+        out.extend_from_slice(&chain);
+        out
+    }
+
+    #[test]
+    fn node_budget_counts_containers_and_their_children() {
+        let mut nodes = 0usize;
+        jsonb_to_serde(&jsonb(JSONB_DOC), 1, &mut nodes).unwrap();
+        // The root object, its two member values, and the array's two
+        // elements.
+        assert_eq!(nodes, 5);
+    }
+
+    #[test]
+    fn aliased_containers_amplify_until_the_node_budget_stops_them() {
+        // 221 wire bytes used to decode into 2^23 - 1 = 8,388,607 serde
+        // nodes (the R48 reproduction); the conversion now stops at the
+        // budget with a clean InvalidData error.
+        let bomb = aliased_jsonb_bomb(22);
+        assert_eq!(bomb.len(), 221);
+        let mut nodes = 0usize;
+        let err = jsonb_to_serde(&jsonb(&bomb), 1, &mut nodes).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("node budget of 1000000 nodes"),
+            "{}",
+            err
+        );
+        // An aliased document within the budget still converts, and the
+        // counter reports the decoded node count exactly.
+        let mut nodes = 0usize;
+        jsonb_to_serde(&jsonb(&aliased_jsonb_bomb(18)), 1, &mut nodes).unwrap();
+        assert_eq!(nodes, (1 << 19) - 1);
+    }
+
+    #[test]
+    fn parse_diffs_shares_one_node_budget_across_the_sequence() {
+        // The first diff's aliased value exhausts the shared budget; the
+        // later legitimate value is dropped with it, so a sequence of
+        // hostile diffs cannot each re-amplify to the limit. The losses are
+        // reported through the problem note instead of failing.
+        let mut bomb_diff = vec![0x00, 3, b'$', b'.', b'b']; // REPLACE $.b
+        let bomb = aliased_jsonb_bomb(22);
+        bomb_diff.push(bomb.len() as u8);
+        bomb_diff.extend_from_slice(&bomb);
+        let leaf_diff = [0x01, 3, b'$', b'.', b'c', 3, 0x0c, 1, b'x']; // INSERT $.c = "x"
+        let diffs = [diff(&bomb_diff), diff(&leaf_diff)];
+        let (parsed, problem) = json_diff::parse_diffs(&diffs);
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].path, "$.b");
+        assert_eq!(parsed[0].value, None);
+        assert_eq!(parsed[1].value, None);
+        let problem = problem.expect("the budget breach must be reported");
+        assert!(
+            problem.contains("node budget of 1000000 nodes"),
+            "{problem}"
+        );
     }
 
     /// REPLACE `$.b[1]` with 99, as written into a partial JSON after image.

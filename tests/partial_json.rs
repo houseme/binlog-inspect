@@ -902,3 +902,137 @@ fn v1_write_rows_are_labeled_and_decoded() {
     };
     assert!(filter.keep(&event));
 }
+
+/// The R48 aliased-jsonb bomb: `depth` chained small-array containers whose
+/// two entries both point at the same next container; the last container
+/// holds two inlined int16 leaves. Ten wire bytes per container plus the
+/// top-level type byte decode into `2^(depth+1) - 1` serde nodes.
+fn aliased_jsonb_bomb(depth: usize) -> Vec<u8> {
+    let mut chain = [0x02, 0x00, 0x0a, 0x00, 0x05, 0x01, 0x00, 0x05, 0x01, 0x00].to_vec();
+    for _ in 1..depth {
+        let mut container = 2u16.to_le_bytes().to_vec();
+        container.extend(((10 + chain.len()) as u16).to_le_bytes());
+        // Both entries are small-array references to the same child at
+        // offset 10 (relative to the element-count field).
+        container.extend([0x02, 10, 0x00, 0x02, 10, 0x00]);
+        container.extend_from_slice(&chain);
+        chain = container;
+    }
+    let mut out = vec![0x02];
+    out.extend_from_slice(&chain);
+    out
+}
+
+/// The same aliased shape as the wire-properties corpus, through a JSON
+/// column end to end: the rows event fails with the node-budget error at its
+/// offset instead of amplifying into gigabytes (R48).
+#[test]
+fn aliased_jsonb_bomb_through_a_json_column_fails_at_its_offset() {
+    let rows_offset = 4 + format_description().len() + table_map(1, false, false).len();
+    let mut parser = BinlogParser::open(
+        binlog(&[
+            format_description(),
+            table_map(1, false, false),
+            write_rows(1, 7, &aliased_jsonb_bomb(22)),
+        ])
+        .path(),
+    )
+    .unwrap();
+    let mut events = parser.events();
+    assert!(events.next().unwrap().is_ok()); // format description
+    assert!(events.next().unwrap().is_ok()); // table map
+    let err = events.next().unwrap().unwrap_err();
+    let message = err.to_string();
+    assert!(
+        message.contains("jsonb decoding exceeds the node budget of 1000000 nodes"),
+        "{message}"
+    );
+    assert!(
+        message.contains(&format!("offset {rows_offset}")),
+        "{message}"
+    );
+    // The parser is fused after the error.
+    assert!(events.next().is_none());
+}
+
+/// The aliased bomb as a partial-JSON diff value: the diff's value conversion
+/// hits the shared node budget, the diff is preserved with its value dropped,
+/// and the event still decodes as a loss record instead of amplifying or
+/// failing (R48). The budget message itself is pinned at the `parse_diffs`
+/// unit level in `row_decode`; re-application supersedes the provisional
+/// reason with its own.
+#[test]
+fn aliased_jsonb_bomb_as_a_diff_value_is_loss_marked() {
+    let bomb = aliased_jsonb_bomb(22);
+    let mut diff = vec![0x00]; // REPLACE
+    put_lenenc(&mut diff, 3); // path length
+    diff.extend_from_slice(b"$.b");
+    put_lenenc(&mut diff, bomb.len() as u64);
+    diff.extend_from_slice(&bomb);
+    let mut parser_events = BinlogParser::open(
+        binlog(&[
+            format_description(),
+            table_map(1, true, true),
+            partial_update_rows(1, JSONB_DOC, &diff),
+        ])
+        .path(),
+    )
+    .unwrap();
+    let mut events = parser_events.events();
+    assert!(events.next().unwrap().is_ok()); // format description
+    assert!(events.next().unwrap().is_ok()); // table map
+    let event = events.next().unwrap().unwrap();
+    assert_eq!(event.event_type, EventType::PartialUpdateRows);
+    let EventPayload::PartialUpdateRows { after, .. } = event.payload else {
+        panic!("expected a partial update rows payload");
+    };
+    let after = after[0].as_ref().unwrap();
+    let CellValue::PartialJson { diffs, reason } = &after.columns[1].value else {
+        panic!(
+            "expected a loss-marked JSON cell, got {:?}",
+            after.columns[1].value
+        );
+    };
+    assert_eq!(diffs.len(), 1);
+    assert_eq!(diffs[0].path, "$.b");
+    assert_eq!(diffs[0].operation, "replace");
+    assert_eq!(diffs[0].value, None);
+    assert!(reason.contains("carries no value"), "{reason}");
+    assert!(events.next().is_none());
+}
+
+/// Re-registering a table id replaces the cached signedness: rows decoded
+/// after the second table map carry the second registration's metadata, not
+/// the first one's (the R42 signedness cache must be invalidated on
+/// re-registration).
+#[test]
+fn re_registered_table_map_signedness_wins_for_subsequent_rows() {
+    let mut parser_events = BinlogParser::open(
+        binlog(&[
+            format_description(),
+            table_map(1, false, true), // SIGNEDNESS: the LONG column is unsigned
+            write_rows(1, 7, JSONB_DOC),
+            table_map(1, false, false), // re-registration without SIGNEDNESS
+            write_rows(1, 8, JSONB_DOC),
+        ])
+        .path(),
+    )
+    .unwrap();
+    let events = parser_events
+        .events()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(events.len(), 5);
+    let EventPayload::Rows { changes, .. } = &events[2].payload else {
+        panic!("expected rows payload");
+    };
+    let first = changes[0].after.as_ref().unwrap();
+    assert_eq!(first.columns[0].value, CellValue::Int(7));
+    assert_eq!(first.columns[0].signedness, Some(Signedness::Unsigned));
+    let EventPayload::Rows { changes, .. } = &events[4].payload else {
+        panic!("expected rows payload");
+    };
+    let second = changes[0].after.as_ref().unwrap();
+    assert_eq!(second.columns[0].value, CellValue::Int(8));
+    assert_eq!(second.columns[0].signedness, Some(Signedness::Unknown));
+}
