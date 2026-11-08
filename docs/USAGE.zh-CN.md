@@ -4,7 +4,7 @@
 
 ## 安装与构建
 
-从 crates.io 安装，或从源码构建、安装。需要当前 Rust stable 工具链（项目使用 Rust 2024 edition，最低支持版本尚未验证）：
+从 crates.io 安装（需要 Rust 1.88 或更新版本——MSRV 已验证并由 CI 强制执行），或从源码构建、安装。项目使用 Rust 2024 edition。
 
 ```sh
 cargo install binlog-inspect --locked   # 来自 crates.io，安装到 ~/.cargo/bin
@@ -41,6 +41,7 @@ cargo build --locked --release --features remote
 | `--stats` | 输出单个 JSON 统计对象代替事件行：仅统计被保留的事件，全部输入处理完后输出。 |
 | `--completions <SHELL>` | 输出 `bash`、`elvish`、`fish`、`powershell` 或 `zsh` 的补全脚本并退出；忽略其他参数，不打开任何输入。 |
 | `--max-event-size <BYTES>` | 超过 `BYTES` 字节的单个事件按 "invalid or oversized" 拒绝（默认 67108864；不得超过 1 GiB 检查上限）。 |
+| `--max-inner-events <COUNT>` | 压缩事务 payload 的内层事件超过 `COUNT` 个时拒绝（默认 250000；`0` 会被拒绝）。 |
 | `--strict` | 任一输入出现第一个错误即中止全部（退出码 1）；不指定时错误停止当前文件，其余文件继续处理，最终退出码为 3。 |
 | `--url <URL>` | HTTP(S) 文件地址，可重复；仅在构建时启用 `remote` 后可用。 |
 | `--max-download-size <BYTES>` | 下载超过 `BYTES` 字节时中止（默认 4294967296）；仅在构建时启用 `remote` 后可用。 |
@@ -80,7 +81,7 @@ cargo build --locked --release --features remote
 | `view_change` | 组复制视图变更（未解码）。 |
 | `xa_prepare` | XA 事务准备（未解码）。 |
 | `transaction_payload` | 压缩事务 payload（WL#3549，MySQL 8）；在安全的解压限制下解码。 |
-| `unknown` | 本版本未命名的事件类型（含 MariaDB 专有的 160+ 类型码）。 |
+| `unknown` | 本版本未命名的事件类型（含 MariaDB 专有的 160+ 类型码，含 pre-GA 行事件码 20–22）。 |
 
 未知取值同样在参数解析期报错（退出码 2），错误消息列出全部合法值：
 
@@ -238,7 +239,7 @@ timestamp,event_type,database,table,before,after
 | `float` / `double` | 字符串 | 以字符串保留非有限值。 |
 | `date` | `{year, month, day, hour, minute, second, micros}` | 日期/时间分量，含零日期。 |
 | `time` | `{negative, days, hours, minutes, seconds, micros}` | 有符号 TIME 分量，可超过 24 小时。 |
-| `json` | 任意 JSON | 解码后的完整 JSON 值。 |
+| `json` | 任意 JSON | 解码后的完整 JSON 值；MySQL 不透明 jsonb 成员（如 `NEWDECIMAL` 小数、日期/时间不透明值）按其文本形式渲染，其他不透明类型渲染为 `base64:type<id>:<data>` 字符串。 |
 | `partial_json` | `{diffs, reason}` | 无法应用 binlog 差异序列的 JSON 列：`diffs` 保留每条已传输的差异（`path`、`operation` 为 `replace`/`insert`/`remove`、`value`），`reason` 说明原因（无 before 值、路径不存在、操作非法等）。 |
 
 ## 过滤
@@ -272,6 +273,8 @@ timestamp,event_type,database,table,before,after
 未知事件保留类型码与 `raw_len`；标准 MySQL 5.7+/8.0 binlog 必含的 `previous_gtids` 事件会正常分类。这些情况不一定导致非零退出，不能将成功退出视为所有内容均已解码。旧版本、变体服务端及所有类型尚未全面验证。
 
 服务器开启 `binlog_row_value_options=PARTIAL_JSON` 时，表映射会携带 optional metadata 类型（14/15），`partial_update_rows` 的 after 镜像携带 JSON 差异序列；两者均已支持——元数据被接受（并经校验和验证后为底层库剥离），差异应用到 before 镜像上，无法应用的以 `partial_json` 值保留。
+
+JSON 列值的解码带有资源限制：嵌套超过 MySQL 100 层容器上限的值会使事件以携带文件偏移的 `jsonb nesting depth` 错误失败；敌意文档展开超过一百万个解码节点时，jsonb 解码同样会被拒绝并报 `jsonb decoding exceeds the node budget of 1000000 nodes`。
 
 差异路径中的双引号成员名按 JSON 字符串规则解码，支持 `\f` 和 `\uD83D\uDE00` 等 UTF-16 代理项对。非法转义会生成 `partial_json` 值，保留原始差异及错误原因。
 

@@ -83,10 +83,12 @@ to `crash-<sha1>`; minimize with `cargo fuzz tmin` / `cargo fuzz cmin`.
 
 ## Plain cargo build
 
-The harnesses are only ever built through `cargo fuzz` (which drives a
-nightly toolchain and passes the libFuzzer coverage flags). A plain
-`cargo build` inside `fuzz/` is expected to stop on the `libfuzzer-sys`
-dependency — its C++ runtime and coverage instrumentation are nightly-only.
-Everything else (the path dependency on `binlog-inspect`) is ordinary stable
-code; `cargo metadata --manifest-path fuzz/Cargo.toml --no-deps` validates
-the manifest without any toolchain.
+The harnesses are only ever *fuzzed* through `cargo fuzz` (which drives a
+nightly toolchain and passes the libFuzzer coverage-instrumentation flags).
+A plain `cargo build` inside `fuzz/` on a current stable toolchain compiles
+fine — `libfuzzer-sys` builds as an ordinary dependency — but the resulting
+binaries carry no coverage instrumentation, so they are useless for actual
+fuzzing; treat the stable build as a manifest/type check only.
+`cargo metadata --manifest-path fuzz/Cargo.toml --no-deps` validates the
+manifest without building anything. The root workspace never builds this
+directory, and the crate's stable quality gates are unaffected by it.

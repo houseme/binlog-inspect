@@ -66,6 +66,7 @@ Requires Rust 1.88 or newer (the MSRV is verified and enforced by a dedicated CI
 - Only plaintext files are supported. Encrypted binlogs are rejected; HTTP download neither decrypts them nor implements the MySQL replication protocol.
 - Compressed transactions (code 40) are decoded safely: the compression header is pre-validated, decompression is streamed and bounded (declared size + slack; >1 GiB declarations rejected), and inner events share the parser's table-map state.
 - `partial_update_rows` decodes the before image and applies the JSON-diff after image against it; a diff that cannot be applied is preserved as a loss-marking `partial_json` value with its diffs and the reason.
+- JSON values nested deeper than MySQL's 100-container limit return a parse error carrying the offset.
 - Rotate events are reported but not followed; list the next file yourself.
 - MariaDB-specific event types (160+) remain `unknown`; named types such as `rand` and `user_var` keep only the type and `raw_len`.
 - A single event may not exceed 64 MiB by default; the CLI can raise this with `--max-event-size` (up to the 1 GiB inspection limit), and library callers with `with_max_event_size`.
@@ -81,6 +82,7 @@ Requires Rust 1.88 or newer (the MSRV is verified and enforced by a dedicated CI
 
 ```sh
 cargo clippy --locked --all-targets -- -D warnings
+cargo clippy --locked --all-targets --no-default-features -- -D warnings
 cargo test --locked
 cargo test --locked --all-features
 cargo build --locked --no-default-features

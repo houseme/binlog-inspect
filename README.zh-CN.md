@@ -66,6 +66,7 @@ cargo run --locked --features remote -- --url https://example.com/mysql-bin.0000
 - 仅支持明文文件；加密 binlog 会被明确拒绝，HTTP 下载不会解密，也不是 MySQL 复制协议。
 - 压缩事务（code 40）已安全解码：压缩头在解码前预校验，解压流式且有界（声明大小 + 余量；超过 1 GiB 的声明直接拒绝），内层事件与解析器共享表映射状态。
 - `partial_update_rows` 解码 before 镜像，并将 after 的 JSON 差异应用到 before 值上；无法应用的差异以带保留差异与原因的 `partial_json` 丢失标记呈现。
+- 嵌套超过 MySQL 100 层容器上限的 JSON 值会返回携带偏移的解析错误。
 - Rotate 事件只报告不跟随，需自行列出下一个文件。
 - MariaDB 专有事件类型（160+）保持 `unknown`；`rand`、`user_var` 等命名类型只保留类型与 `raw_len`。
 - 单个事件默认上限 64 MiB；CLI 可用 `--max-event-size` 调整（不超过 1 GiB 检查上限），库调用者可用 `with_max_event_size`。
@@ -81,6 +82,7 @@ cargo run --locked --features remote -- --url https://example.com/mysql-bin.0000
 
 ```sh
 cargo clippy --locked --all-targets -- -D warnings
+cargo clippy --locked --all-targets --no-default-features -- -D warnings
 cargo test --locked
 cargo test --locked --all-features
 cargo build --locked --no-default-features
