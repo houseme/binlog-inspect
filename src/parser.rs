@@ -20,6 +20,20 @@ use std::{
 /// Upper bound on the accepted size of a single event, including its header.
 pub const MAX_EVENT_SIZE: u32 = 64 * 1024 * 1024;
 
+/// Upper bound on the inner events the collecting [`BinlogParser::events`]
+/// iterator buffers per transaction payload (R46b).
+///
+/// The bound targets the pathological tiny-event case: a payload of 250,000
+/// minimal events decodes to roughly 250 MB of retained event values, which
+/// is the heaviest shape one payload can produce, while sitting about two
+/// orders of magnitude above real transactions so legitimate payloads never
+/// reach it. Breaching the bound returns [`ParserError::TooManyInnerEvents`]
+/// instead of growing memory without limit. The bound can be raised through
+/// [`BinlogParser::with_inner_event_limit`], and
+/// [`BinlogParser::visit_events`] is not affected: its callback consumes
+/// each inner event immediately, so the user applies backpressure.
+pub const DEFAULT_INNER_EVENT_LIMIT: usize = 250_000;
+
 /// Capacity of the buffered reader wrapping the input.
 const READ_BUFFER_CAPACITY: usize = 1 << 20;
 
@@ -93,6 +107,22 @@ pub enum ParserError {
         size: u32,
         /// The configured per-event size cap.
         limit: u32,
+    },
+    /// A transaction payload carried more inner events than the configured
+    /// inner-event collection bound allows (R46b).
+    ///
+    /// The collecting [`BinlogParser::events`] iterator buffers every inner
+    /// event of a payload; this error stops the input before the buffer can
+    /// grow without limit. The message names the CLI flag and the uncapped
+    /// visiting alternative so the remedy is discoverable.
+    #[error(
+        "transaction payload at offset {offset} contains more than {limit} inner events; raise --max-inner-events or use visit_events"
+    )]
+    TooManyInnerEvents {
+        /// File offset of the enclosing transaction payload event.
+        offset: u64,
+        /// The configured inner-event collection bound.
+        limit: usize,
     },
 }
 
@@ -240,9 +270,11 @@ struct InnerEventError {
 ///
 /// The reader works on any [`Read`] input (a file, standard input, or an
 /// in-memory buffer). Raw event sizes are capped at [`MAX_EVENT_SIZE`] by
-/// default, configurable through [`BinlogParser::with_max_event_size`].
-/// Decoded row images and the inner-event collection returned by
-/// [`BinlogParser::events`] can consume more memory than their wire data.
+/// default, configurable through [`BinlogParser::with_max_event_size`], and
+/// the inner-event collection of the collecting [`BinlogParser::events`]
+/// iterator is bounded by [`DEFAULT_INNER_EVENT_LIMIT`], configurable
+/// through [`BinlogParser::with_inner_event_limit`] (R46b). Decoded row
+/// images can consume more memory than their wire data.
 /// [`BinlogParser::visit_events`] delivers and releases each inner event in
 /// turn while retaining the outer raw payload and shared table-map state.
 pub struct BinlogParser<R: Read = File> {
@@ -252,6 +284,8 @@ pub struct BinlogParser<R: Read = File> {
     stopped: bool,
     buffer: Vec<u8>,
     max_event_size: u32,
+    /// Inner-event collection bound of the collecting iterator (R46b).
+    inner_event_limit: usize,
     warnings: Vec<String>,
     /// Per-table signedness metadata (R42): `signedness()` walks the table
     /// map's serialized body, so it is computed once per registration instead
@@ -299,6 +333,7 @@ impl<R: Read> BinlogParser<R> {
             stopped: false,
             buffer: Vec::new(),
             max_event_size: MAX_EVENT_SIZE,
+            inner_event_limit: DEFAULT_INNER_EVENT_LIMIT,
             warnings: Vec::new(),
             signedness_cache: HashMap::new(),
         })
@@ -307,6 +342,20 @@ impl<R: Read> BinlogParser<R> {
     /// Overrides the per-event size cap (defaulting to [`MAX_EVENT_SIZE`]).
     pub fn with_max_event_size(mut self, cap: u32) -> Self {
         self.max_event_size = cap;
+        self
+    }
+
+    /// Overrides the inner-event collection bound of the collecting
+    /// [`BinlogParser::events`] iterator (defaulting to
+    /// [`DEFAULT_INNER_EVENT_LIMIT`], R46b).
+    ///
+    /// Like [`Self::with_max_event_size`], this is infallible builder-style
+    /// configuration: a limit of zero cannot be expressed because the
+    /// argument is a [`core::num::NonZeroUsize`]. Only the collecting path
+    /// is bounded; [`Self::visit_events`] stays uncapped because its
+    /// callback applies backpressure.
+    pub fn with_inner_event_limit(mut self, limit: core::num::NonZeroUsize) -> Self {
+        self.inner_event_limit = limit.get();
         self
     }
 
@@ -322,6 +371,12 @@ impl<R: Read> BinlogParser<R> {
 
     /// Iterate over events, retrying transient [`io::ErrorKind::Interrupted`]
     /// reads. Other I/O errors and framing or decoding errors terminate the stream.
+    ///
+    /// This iterator collects the inner events of each transaction payload
+    /// into `EventPayload::TransactionPayload.events`, so that collection is
+    /// bounded by [`DEFAULT_INNER_EVENT_LIMIT`] (configurable through
+    /// [`Self::with_inner_event_limit`], R46b); breaching the bound stops the
+    /// stream with [`ParserError::TooManyInnerEvents`].
     pub fn events(&mut self) -> impl Iterator<Item = Result<ParsedEvent, ParserError>> + '_ {
         std::iter::from_fn(move || self.next_event())
     }
@@ -332,7 +387,10 @@ impl<R: Read> BinlogParser<R> {
     /// Unlike [`Self::events`], this method does not collect the decoded inner
     /// events of a transaction into a vector. The parser retains the outer
     /// compressed event, the current inner event, and its shared table maps.
-    /// A single decoded event can still contain multiple row images.
+    /// A single decoded event can still contain multiple row images. The
+    /// collecting path's [`DEFAULT_INNER_EVENT_LIMIT`] does not apply here:
+    /// the callback consumes each inner event immediately, so memory stays
+    /// bounded by backpressure instead of a numeric cap (R46b).
     ///
     /// The callback receives [`VisitEvent::TransactionPayloadStart`] only
     /// after outer framing, checksum, and payload-header validation and
@@ -878,15 +936,36 @@ impl<R: Read> BinlogParser<R> {
         event: &Event,
         offset: u64,
     ) -> Result<EventPayload, ParserError> {
+        // R46b: only the collecting path buffers inner events into memory,
+        // so only this path enforces the inner-event limit. The visiting
+        // path hands each event to the callback, which applies backpressure.
+        let limit = self.inner_event_limit;
         let mut events = Vec::new();
+        let mut over_limit = false;
         let flow = self
             .walk_transaction_payload(event, &mut |item| {
                 if let PayloadItem::Event(event) = item {
+                    if events.len() >= limit {
+                        over_limit = true;
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "transaction payload inner event limit exceeded",
+                        ));
+                    }
                     events.push(event);
                 }
                 Ok(ControlFlow::<Infallible>::Continue(()))
             })
-            .map_err(|source| ParserError::Io { offset, source })?;
+            .map_err(|source| {
+                // The closure records the breach before returning: the only
+                // error that can carry the flag out of the walk is this one,
+                // because an emit error propagates immediately.
+                if over_limit {
+                    ParserError::TooManyInnerEvents { offset, limit }
+                } else {
+                    ParserError::Io { offset, source }
+                }
+            })?;
         let info = match flow {
             ControlFlow::Continue(info) => info,
             ControlFlow::Break(never) => match never {},

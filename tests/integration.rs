@@ -5,10 +5,12 @@ use binlog_inspect::{
     event::{EventPayload, EventType, ParsedEvent},
     filter::EventFilter,
     formatter::{CsvFormatter, Formatter, TextFormatter},
-    parser::{BinlogParser, MAX_EVENT_SIZE, ParserError},
+    parser::{BinlogParser, MAX_EVENT_SIZE, ParserError, VisitEvent},
 };
 use std::{
-    io::{Read, Write},
+    io::{Cursor, Read, Write},
+    num::NonZeroUsize,
+    ops::ControlFlow,
     process::{Command, Output, Stdio},
 };
 
@@ -1385,4 +1387,176 @@ fn cli_max_event_size_caps_and_validates() {
         stderr.contains("exceeds the 1 GiB inspection limit"),
         "{stderr}"
     );
+}
+
+/// Writes a MySQL serialization-library length-encoded integer (fixtures only).
+fn put_lenenc(out: &mut Vec<u8>, value: u64) {
+    if value < 251 {
+        out.push(value as u8);
+    } else if value < 65536 {
+        out.push(0xfc);
+        out.extend_from_slice(&(value as u16).to_le_bytes());
+    } else if value < 1 << 24 {
+        out.push(0xfd);
+        out.extend_from_slice(&(value as u32).to_le_bytes()[..3]);
+    } else {
+        out.push(0xfe);
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+}
+
+/// A transaction payload (code 40) body carrying the NONE compression
+/// algorithm and the given raw inner events, hand-crafted the way the
+/// framing prevalidation and the library read it: each header field is a
+/// length-encoded type, a length-encoded declared length, and a
+/// length-encoded value; field 2 is the compression algorithm (255 = NONE),
+/// field 1 the payload size, then the end mark and the payload bytes (a NONE
+/// payload declares no uncompressed size on the wire, mirroring the
+/// library's own writer).
+fn none_payload(content: &[u8]) -> Vec<u8> {
+    let mut body = Vec::new();
+    put_lenenc(&mut body, 2); // compression algorithm field
+    put_lenenc(&mut body, 1); // declared value length
+    put_lenenc(&mut body, 255); // TransactionPayloadCompressionType::NONE
+    put_lenenc(&mut body, 1); // payload size field
+    put_lenenc(&mut body, 1); // declared value length
+    put_lenenc(&mut body, content.len() as u64);
+    body.push(0); // end mark
+    body.extend_from_slice(content);
+    body
+}
+
+/// Three minimal inner XID frames (27 bytes each, no checksums in the inner
+/// stream) plus the enclosing payload event at file offset 4.
+fn three_xid_payload_file() -> tempfile::NamedTempFile {
+    let mut content = Vec::new();
+    for xid in 1..=3u64 {
+        content.extend(event(16, &xid.to_le_bytes()));
+    }
+    let mut bytes = b"\xfebin".to_vec();
+    bytes.extend(event(40, &none_payload(&content)));
+    file(&bytes)
+}
+
+#[test]
+fn cli_inner_event_limit_stops_breaching_payloads_and_raising_it_decodes() {
+    // R46b: the collecting iterator bounds transaction payload memory. Three
+    // minimal inner XIDs breach --max-inner-events 2 (exit 3 with the
+    // documented message, exit 1 under --strict); the default limit and an
+    // explicitly raised limit decode the payload.
+    let f = three_xid_payload_file();
+    let path = f.path().to_str().unwrap();
+
+    let out = run_cli(&[path, "--max-inner-events", "2"]);
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("transaction payload at offset 4 contains more than 2 inner events"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("raise --max-inner-events or use visit_events"),
+        "{stderr}"
+    );
+
+    let out = run_cli(&[path, "--max-inner-events", "2", "--strict"]);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("more than 2 inner events"), "{stderr}");
+
+    // The default limit (250000) decodes the payload untouched.
+    let out = run_cli(&[path]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let inner = value["payload"]["events"].as_array().unwrap();
+    assert_eq!(inner.len(), 3);
+    assert_eq!(value["payload"]["compression"], "NONE");
+
+    // An explicit limit exactly at the event count decodes it too.
+    let out = run_cli(&[path, "--max-inner-events", "3"]);
+    assert_eq!(out.status.code(), Some(0));
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(value["payload"]["events"].as_array().unwrap().len(), 3);
+
+    // Zero cannot disable the bound: usage error (exit 2) at parse time.
+    let out = run_cli(&[path, "--max-inner-events", "0"]);
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("the limit cannot be disabled"), "{stderr}");
+}
+
+#[test]
+fn with_inner_event_limit_bounds_only_the_collecting_iterator() {
+    // R46b: the library constructor mirrors with_max_event_size and is
+    // enforced only where events are collected; visit_events delivers each
+    // inner event to the callback and stays uncapped.
+    let f = three_xid_payload_file();
+    let mut bytes = Vec::new();
+    std::fs::File::open(f.path())
+        .unwrap()
+        .read_to_end(&mut bytes)
+        .unwrap();
+
+    let mut parser = BinlogParser::from_reader(Cursor::new(bytes.clone()))
+        .unwrap()
+        .with_inner_event_limit(NonZeroUsize::new(2).unwrap());
+    let error = parser.events().next().unwrap().unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "transaction payload at offset 4 contains more than 2 inner events; raise --max-inner-events or use visit_events"
+    );
+    assert!(matches!(
+        error,
+        ParserError::TooManyInnerEvents {
+            offset: 4,
+            limit: 2
+        }
+    ));
+    // The breach fuses the parser like every other framing/decoding error.
+    assert!(parser.events().next().is_none());
+
+    // A sufficient bound decodes the whole payload.
+    let mut parser = BinlogParser::from_reader(Cursor::new(bytes.clone()))
+        .unwrap()
+        .with_inner_event_limit(NonZeroUsize::new(3).unwrap());
+    let event = parser.events().next().unwrap().unwrap();
+    assert_eq!(event.event_type, EventType::TransactionPayload);
+    assert!(
+        matches!(event.payload, EventPayload::TransactionPayload { ref events, .. } if events.len() == 3)
+    );
+
+    // The visiting path ignores the limit: all three inner events are
+    // delivered one at a time.
+    let mut parser = BinlogParser::from_reader(Cursor::new(bytes.clone()))
+        .unwrap()
+        .with_inner_event_limit(NonZeroUsize::new(2).unwrap());
+    let mut inner = 0;
+    let outcome = parser
+        .visit_events(|notification| {
+            if let VisitEvent::Event {
+                parent_offset: Some(_),
+                ..
+            } = notification
+            {
+                inner += 1;
+            }
+            Ok(ControlFlow::Continue(()))
+        })
+        .unwrap();
+    assert_eq!(outcome, ControlFlow::Continue(()));
+    assert_eq!(inner, 3, "visit_events is not bounded by the limit");
 }

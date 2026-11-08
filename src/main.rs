@@ -6,7 +6,7 @@ use binlog_inspect::{
     event::{EventPayload, EventType, ParsedEvent},
     filter::{EventFilter, RangeFilter},
     formatter::{CsvFormatter, Formatter, JsonLinesFormatter, TextFormatter},
-    parser::{BinlogParser, MAX_EVENT_SIZE},
+    parser::{BinlogParser, DEFAULT_INNER_EVENT_LIMIT, MAX_EVENT_SIZE},
 };
 use clap::{CommandFactory, Parser, ValueEnum};
 #[cfg(unix)]
@@ -14,6 +14,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::{
     collections::BTreeMap,
     io::{self, Read, Write},
+    num::NonZeroUsize,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -91,6 +92,18 @@ struct Cli {
         value_parser = parse_max_event_size
     )]
     max_event_size: u32,
+    /// Stop an input with an error when one transaction payload contains more
+    /// than COUNT inner events (default 250000); raising the limit trades
+    /// memory use for payload depth.
+    #[arg(
+        long,
+        value_name = "COUNT",
+        default_value_t = NonZeroUsize::new(DEFAULT_INNER_EVENT_LIMIT).expect(
+            "DEFAULT_INNER_EVENT_LIMIT is nonzero",
+        ),
+        value_parser = parse_inner_event_limit
+    )]
+    max_inner_events: NonZeroUsize,
     /// Abort on the first error in any input; without it, an error stops the
     /// current file, remaining files are still processed, and the exit code is
     /// non-zero (3).
@@ -314,6 +327,20 @@ fn parse_max_event_size(value: &str) -> Result<u32, String> {
     }
     Ok(u32::try_from(bytes).expect("bounded by the 1 GiB inspection limit"))
 }
+/// Parses one `--max-inner-events` value.
+///
+/// The bound exists to cap memory, so it cannot be disabled: zero is
+/// rejected at parse time (exit code 2), mirroring `parse_max_event_size`.
+fn parse_inner_event_limit(value: &str) -> Result<NonZeroUsize, String> {
+    let count: usize = value.parse().map_err(|_| {
+        format!("invalid --max-inner-events value '{value}': expected a number of events")
+    })?;
+    NonZeroUsize::new(count).ok_or_else(|| {
+        format!(
+            "--max-inner-events {count} must be at least one event; the limit cannot be disabled"
+        )
+    })
+}
 /// Processes one input; a parse error either aborts (strict) or yields `Partial`.
 fn process<R: Read>(
     name: &str,
@@ -385,13 +412,15 @@ fn run_inputs(
     for file in &cli.files {
         let outcome = if file.as_os_str() == "-" {
             let stdin = io::stdin();
-            let mut parser =
-                BinlogParser::from_reader(stdin.lock())?.with_max_event_size(cli.max_event_size);
+            let mut parser = BinlogParser::from_reader(stdin.lock())?
+                .with_max_event_size(cli.max_event_size)
+                .with_inner_event_limit(cli.max_inner_events);
             process("<stdin>", &mut parser, filter, sink, &mut out, cli.strict)?
         } else {
             let mut parser = BinlogParser::open(file)
                 .with_context(|| format!("cannot inspect {}", file.display()))?
-                .with_max_event_size(cli.max_event_size);
+                .with_max_event_size(cli.max_event_size)
+                .with_inner_event_limit(cli.max_inner_events);
             process(
                 &file.display().to_string(),
                 &mut parser,
@@ -410,7 +439,8 @@ fn run_inputs(
         let path: &Path = download.as_ref();
         let mut parser = BinlogParser::open(path)
             .context("cannot inspect downloaded binlog")?
-            .with_max_event_size(cli.max_event_size);
+            .with_max_event_size(cli.max_event_size)
+            .with_inner_event_limit(cli.max_inner_events);
         outcomes.push(process(
             "downloaded binlog",
             &mut parser,
