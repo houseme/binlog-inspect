@@ -4,7 +4,7 @@ This project follows the [Keep a Changelog](https://keepachangelog.com/en/1.1.0/
 
 ## [Unreleased]
 
-Fourth and fifth batches, from the 2026-11-06 re-review and 2026-11-07 source review (ROADMAP R39–R47).
+Fourth and fifth batches, from the 2026-11-06 re-review and 2026-11-07 source review (ROADMAP R39–R47 plus the W5-2 batch, R48–R52).
 
 ### Added
 

@@ -4,7 +4,7 @@
 
 ## Install and build
 
-Install from crates.io, or build and install from source. The current Rust stable toolchain is required (the project uses the Rust 2024 edition; its minimum supported version has not been verified):
+Install from crates.io (requires Rust 1.88 or newer — the MSRV is verified and CI-enforced), or build and install from source. The project uses the Rust 2024 edition.
 
 ```sh
 cargo install binlog-inspect --locked   # from crates.io, into ~/.cargo/bin
@@ -41,6 +41,7 @@ The table matches `binlog-inspect --help`:
 | `--stats` | Print one JSON statistics object instead of event lines: counts over the kept events only, after all inputs. |
 | `--completions <SHELL>` | Print shell completions for `bash`, `elvish`, `fish`, `powershell` or `zsh` and exit; all other options are ignored and no input is opened. |
 | `--max-event-size <BYTES>` | Reject single events larger than `BYTES` bytes as "invalid or oversized" (default 67108864; may not exceed the 1 GiB inspection limit). |
+| `--max-inner-events <COUNT>` | Reject a compressed transaction payload carrying more than `COUNT` inner events (default 250000; `0` is rejected). |
 | `--strict` | Abort on the first error in any input (exit code 1); without it an error stops the current file, remaining files are still processed, and the exit code is 3. |
 | `--url <URL>` | HTTP(S) file URL; repeatable and available only when built with `remote`. |
 | `--max-download-size <BYTES>` | Abort a download that exceeds `BYTES` bytes (default 4294967296); available only when built with `remote`. |
@@ -80,7 +81,7 @@ The values map one-to-one to the library `EventType` enum, which is also the set
 | `view_change` | Group replication view change (undecoded). |
 | `xa_prepare` | XA transaction prepare (undecoded). |
 | `transaction_payload` | Compressed transaction payload (WL#3549, MySQL 8); decoded with safe decompression limits. |
-| `unknown` | Event type this version does not name (including MariaDB-specific 160+ codes). |
+| `unknown` | Event type this version does not name (including MariaDB-specific 160+ codes and the pre-GA row-event codes 20–22). |
 
 Unknown values also fail at argument parsing (exit code 2); the error message lists every valid value:
 
@@ -238,7 +239,7 @@ Each column (`ColumnValue`):
 | `float` / `double` | string | Rendered as strings to preserve non-finite values. |
 | `date` | `{year, month, day, hour, minute, second, micros}` | Date/time components, including zero dates. |
 | `time` | `{negative, days, hours, minutes, seconds, micros}` | Signed TIME components, possibly exceeding 24 hours. |
-| `json` | any JSON | Fully decoded JSON value. |
+| `json` | any JSON | Fully decoded JSON value; MySQL opaque jsonb members (e.g. `NEWDECIMAL` decimals, date/time opaques) render as their text form, other opaque types as `base64:type<id>:<data>` strings. |
 | `partial_json` | `{diffs, reason}` | A JSON column whose binlog diff sequence could not be applied: `diffs` preserves every transmitted diff (`path`, `operation` as `replace`/`insert`/`remove`, `value`), `reason` says why (no before value, missing path, invalid operation, …). |
 
 ## Filtering
@@ -272,6 +273,8 @@ Framing (event sizes, checksums) and decoding errors are reported with the file 
 Unknown events retain their type code and `raw_len`; the `previous_gtids` event that every standard MySQL 5.7+/8.0 binlog contains is classified normally. These cases do not necessarily cause a nonzero exit, so success does not mean all content was decoded. Older versions, server variants and all types have not been comprehensively validated.
 
 When the server sets `binlog_row_value_options=PARTIAL_JSON`, table maps carry optional metadata types (14/15) and `partial_update_rows` after images carry JSON diff sequences; both are supported — the metadata is accepted (and stripped for the underlying library after checksum verification), and the diffs are applied against the before image, with unappliable ones preserved as `partial_json` values.
+
+JSON column values are decoded under resource limits: a value nested deeper than MySQL's 100-container limit fails the event with a `jsonb nesting depth` error carrying the file offset, and jsonb decoding is likewise rejected with `jsonb decoding exceeds the node budget of 1000000 nodes` once a hostile document would expand beyond one million decoded nodes.
 
 Double-quoted member names in diff paths use JSON string decoding, including `\f` and UTF-16 surrogate pairs such as `\uD83D\uDE00`. Invalid escapes produce a `partial_json` value with the original diffs and an error reason.
 

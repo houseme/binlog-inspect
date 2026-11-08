@@ -1,0 +1,54 @@
+name: Fuzz
+
+# Scheduled, NON-GATING fuzz smoke (R47b): one short coverage-guided round per
+# target to keep the parser's fail-closed prevalidation exercised. Findings are
+# triaged from the run logs (crash inputs land in the job artifacts); the job
+# result never blocks merges — see continue-on-error below. Known open findings
+# are listed in fuzz/README.md.
+on:
+  schedule:
+    # Daily, offset from the CI (17 03) and audit schedules.
+    - cron: "43 04 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  fuzz:
+    name: Fuzz (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # A fuzz finding is information, not a merge gate.
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [ parse_binlog, jsonb_via_row ]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      # nightly is deliberately UNPINNED here (a moving ref): libFuzzer's
+      # coverage instrumentation requires a nightly rustc and the harness must
+      # track its changes, so the SHA-pinned forms used for the stable/MSRV
+      # toolchains in ci.yml do not apply to this action. checkout/rust-cache
+      # below stay SHA-pinned like everywhere else.
+      - uses: dtolnay/rust-toolchain@nightly
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          # The fuzz directory is a detached workspace with its own target
+          # dir; cache it separately from the root workspace builds.
+          workspaces: |
+            .
+            fuzz
+          key: fuzz-${{ matrix.target }}
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      - name: Fuzz ${{ matrix.target }} (60 s smoke round)
+        run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=60 -rss_limit_mb=2048
