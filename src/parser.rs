@@ -5,7 +5,10 @@
 use crate::event::{EventPayload, EventType, ParsedEvent, RowChange};
 use mysql_common::binlog::{
     EventStreamReader,
-    consts::{BinlogChecksumAlg, BinlogVersion, TransactionPayloadCompressionType},
+    consts::{
+        BinlogChecksumAlg, BinlogVersion, IncidentType, IntvarEventType,
+        TransactionPayloadCompressionType,
+    },
     events::{Event, EventData, PreviousGtidsEvent, RowsEventData, TransactionPayloadReader},
 };
 use std::{
@@ -732,13 +735,16 @@ impl<R: Read> BinlogParser<R> {
             },
             Some(EventData::IncidentEvent(e)) => EventPayload::Incident {
                 incident_type: match e.incident_type() {
-                    Ok(incident_type) => format!("{incident_type:?}"),
+                    // The canonical name is pinned below (R51), not the
+                    // library's Debug rendering, so a library rename cannot
+                    // change the output.
+                    Ok(incident_type) => incident_type_name(incident_type).to_owned(),
                     Err(unknown) => format!("UNKNOWN({})", u16::from(unknown)),
                 },
                 message: e.message().into_owned(),
             },
             Some(EventData::IntvarEvent(e)) => EventPayload::Intvar {
-                var_type: format!("{:?}", e.subtype()),
+                var_type: intvar_type_name(e.subtype()).to_owned(),
                 value: e.value(),
             },
             Some(EventData::RowsEvent(RowsEventData::PartialUpdateRowsEvent(e))) => {
@@ -1285,6 +1291,31 @@ fn server_version(raw: &[u8]) -> String {
     String::from_utf8_lossy(&raw[..end]).into_owned()
 }
 
+/// Canonical stable name for a replication incident type.
+///
+/// The library's `Debug` output must not leak into the output model, so
+/// every [`IncidentType`] variant maps to its constant name; a library
+/// rename cannot change the output (R51, mirroring the `column_type_name`
+/// pattern).
+fn incident_type_name(incident_type: IncidentType) -> &'static str {
+    match incident_type {
+        IncidentType::INCIDENT_NONE => "INCIDENT_NONE",
+        IncidentType::INCIDENT_LOST_EVENTS => "INCIDENT_LOST_EVENTS",
+    }
+}
+
+/// Canonical stable name for an intvar event subtype.
+///
+/// See [`incident_type_name`] for why the names are pinned instead of taken
+/// from the library's `Debug` rendering (R51).
+fn intvar_type_name(subtype: IntvarEventType) -> &'static str {
+    match subtype {
+        IntvarEventType::INVALID_INT_EVENT => "INVALID_INT_EVENT",
+        IntvarEventType::LAST_INSERT_ID_EVENT => "LAST_INSERT_ID_EVENT",
+        IntvarEventType::INSERT_ID_EVENT => "INSERT_ID_EVENT",
+    }
+}
+
 /// Lowercase hex digits shared with the row decoder.
 const HEX: [u8; 16] = *b"0123456789abcdef";
 
@@ -1688,6 +1719,33 @@ mod tests {
         // A non-EOF failure while filling the buffer stays a plain I/O error.
         let interrupted = io::Error::new(io::ErrorKind::Interrupted, "retry");
         assert!(matches!(truncated_or_io(interrupted), FrameError::Io(_)));
+    }
+
+    #[test]
+    fn intvar_and_incident_type_names_are_pinned() {
+        // R51: the intvar and incident type names are pinned constants, not
+        // the library's Debug rendering, so a library rename cannot change
+        // the output.
+        assert_eq!(
+            intvar_type_name(IntvarEventType::INVALID_INT_EVENT),
+            "INVALID_INT_EVENT"
+        );
+        assert_eq!(
+            intvar_type_name(IntvarEventType::LAST_INSERT_ID_EVENT),
+            "LAST_INSERT_ID_EVENT"
+        );
+        assert_eq!(
+            intvar_type_name(IntvarEventType::INSERT_ID_EVENT),
+            "INSERT_ID_EVENT"
+        );
+        assert_eq!(
+            incident_type_name(IncidentType::INCIDENT_NONE),
+            "INCIDENT_NONE"
+        );
+        assert_eq!(
+            incident_type_name(IncidentType::INCIDENT_LOST_EVENTS),
+            "INCIDENT_LOST_EVENTS"
+        );
     }
 
     #[test]

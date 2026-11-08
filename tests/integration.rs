@@ -1560,3 +1560,81 @@ fn with_inner_event_limit_bounds_only_the_collecting_iterator() {
     assert_eq!(outcome, ControlFlow::Continue(()));
     assert_eq!(inner, 3, "visit_events is not bounded by the limit");
 }
+
+#[test]
+fn intvar_output_pins_the_canonical_type_names() {
+    // R51: Intvar.var_type renders pinned canonical constant names, not the
+    // library's Debug formatting. Subtype 2 = INSERT_ID_EVENT, subtype 1 =
+    // LAST_INSERT_ID_EVENT.
+    let mut bytes = b"\xfebin".to_vec();
+    bytes.extend(event(5, &[2, 42, 0, 0, 0, 0, 0, 0, 0]));
+    bytes.extend(event(5, &[1, 7, 0, 0, 0, 0, 0, 0, 0]));
+    let f = file(&bytes);
+    let out = run_cli(&[f.path().to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        stdout.contains("\"var_type\":\"INSERT_ID_EVENT\""),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("\"var_type\":\"LAST_INSERT_ID_EVENT\""),
+        "{stdout}"
+    );
+    assert!(stdout.contains("\"value\":42"), "{stdout}");
+    assert!(stdout.contains("\"value\":7"), "{stdout}");
+}
+
+#[cfg(unix)]
+#[test]
+fn closed_stderr_does_not_change_the_exit_status() {
+    // R51: warnings and partial-failure summaries are advisory output, so a
+    // closed stderr must never change the outcome. The eprintln! macro they
+    // used before panics on write errors (exit 101); the advise() helper
+    // drops the failure instead. A pipe with no reader makes every write
+    // fail deterministically (BrokenPipe), exercising the same ignore-the-
+    // error path as a closed fd.
+    use std::os::{fd::OwnedFd, unix::net::UnixStream};
+
+    let run_with_closed_stderr = |args: &[&str]| {
+        let (reader, writer) = UnixStream::pair().unwrap();
+        drop(reader);
+        let stderr: OwnedFd = writer.into();
+        Command::new(env!("CARGO_BIN_EXE_binlog-inspect"))
+            .args(args)
+            .stderr(Stdio::from(stderr))
+            .output()
+            .unwrap()
+    };
+
+    // Advisory warnings survive: the broken log_pos emits a warning, but the
+    // run still parses everything and exits 0.
+    let mut bad = event(16, &456u64.to_le_bytes());
+    bad[13..17].copy_from_slice(&999u32.to_le_bytes());
+    let mut bytes = b"\xfebin".to_vec();
+    bytes.extend(event(16, &123u64.to_le_bytes()));
+    bytes.extend(bad);
+    let f = file(&bytes);
+    let out = run_with_closed_stderr(&[f.path().to_str().unwrap()]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a closed stderr must not change the exit status"
+    );
+
+    // The partial-failure summary survives: the corrupt tail still exits 3
+    // (not the panic exit 101) with a closed stderr.
+    let mut corrupt = b"\xfebin".to_vec();
+    corrupt.extend(corrupt_event());
+    let f = file(&corrupt);
+    let out = run_with_closed_stderr(&[f.path().to_str().unwrap()]);
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "the partial-failure summary must survive a closed stderr"
+    );
+}

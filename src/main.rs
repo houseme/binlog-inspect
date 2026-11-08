@@ -372,7 +372,7 @@ fn process<R: Read>(
         }
     }
     for warning in parser.take_warnings() {
-        eprintln!("warning: {warning}");
+        advise(&format!("warning: {warning}"));
     }
     match failure {
         Some((true, err)) => Err(err).with_context(|| format!("cannot fully parse {name}")),
@@ -644,11 +644,20 @@ fn run() -> Result<()> {
         })
         .collect();
     if !partial.is_empty() {
-        eprintln!("error: the following binlogs could not be fully parsed:");
+        advise("error: the following binlogs could not be fully parsed:");
         for (file, error) in &partial {
-            eprintln!("  {file}: {error}");
+            advise(&format!("  {file}: {error}"));
         }
         std::process::exit(3);
     }
     Ok(())
+}
+/// Writes one advisory line to standard error, ignoring write failures.
+///
+/// Warnings and partial-failure summaries are advisory output: a closed
+/// stderr (`2>&-`) or a closed pipe must never change the exit status, and
+/// the `eprintln!` macro panics on write errors (exit 101), so failures are
+/// dropped here instead (R51).
+fn advise(message: &str) {
+    let _ = writeln!(io::stderr(), "{message}");
 }

@@ -290,8 +290,9 @@ pub enum EventPayload {
     },
     /// Statement-time integer variable assignment.
     Intvar {
-        /// Variable kind, using the library's stable constant names
-        /// (`INVALID_INT_EVENT`, `LAST_INSERT_ID_EVENT`, `INSERT_ID_EVENT`).
+        /// Variable kind: the pinned canonical MySQL constant name
+        /// (`INVALID_INT_EVENT`, `LAST_INSERT_ID_EVENT`, `INSERT_ID_EVENT`),
+        /// independent of the underlying library's Debug rendering.
         var_type: String,
         /// Assigned value.
         value: u64,
