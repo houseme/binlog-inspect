@@ -1,0 +1,45 @@
+# Fuzz harnesses for binlog-inspect (ROADMAP R47b).
+#
+# This directory is a DETACHED cargo workspace: the empty `[workspace]` table
+# at the end keeps it out of the root workspace, and the root package lists
+# "fuzz" in `package.exclude`, so the published .crate never ships the
+# harnesses. libFuzzer's coverage instrumentation requires a nightly toolchain,
+# which is why the fuzz build stays outside the crate's stable MSRV gates.
+#
+# Standard cargo-fuzz layout: one [[bin]] per target under fuzz_targets/, a
+# path dependency on the crate under inspection, and seed inputs in
+# corpus/<target>/ (built from the fixture byte layouts of
+# tests/partial_json.rs).
+
+[package]
+name = "binlog-inspect-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+# Marks this as a cargo-fuzz manifest so `cargo fuzz build` / `cargo fuzz run`
+# accept it (cargo-fuzz refuses otherwise).
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+binlog-inspect = { path = ".." }
+libfuzzer-sys = "0.4"
+
+[[bin]]
+name = "parse_binlog"
+path = "fuzz_targets/parse_binlog.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "jsonb_via_row"
+path = "fuzz_targets/jsonb_via_row.rs"
+test = false
+doc = false
+bench = false
+
+# Detached on purpose — see the header comment. Do not add this directory to
+# the root workspace and do not remove this table.
+[workspace]
