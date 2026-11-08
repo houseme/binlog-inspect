@@ -144,28 +144,124 @@ fn jsonb_to_serde(
         }
         // Scalars carry no recursion, so they are converted through the
         // library's own JsonDom rendering (including its opaque string rules).
-        // One precondition is checked by hand first: the library computes a
-        // NEWDECIMAL opaque's packed size as `precision - scale` and the
-        // subtraction underflows when a hostile payload declares
-        // scale > precision (or truncates the two-byte header). Malformed
-        // decimals are clean errors, matching every other malformed-jsonb
-        // path (R47b fuzz finding).
+        // NEWDECIMAL opaques get a hand validation first: the library's
+        // packed-decimal reader trusts the header (and panics/fails open on
+        // hostile shapes), so the crate owns the contract (R47b fuzz
+        // findings + round-2 verification).
         jsonb::Value::Opaque(opaque)
             if opaque.value_type() == ColumnType::MYSQL_TYPE_NEWDECIMAL =>
         {
             let data = opaque.data_raw();
-            if data.len() < 2 || data[1] > data[0] {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "malformed jsonb opaque NEWDECIMAL: scale exceeds precision",
-                ));
-            }
+            validate_packed_decimal(data)?;
             Ok(serde_json::Value::from(
                 jsonb::Value::Opaque(opaque.clone()).parse()?,
             ))
         }
         other => Ok(serde_json::Value::from(other.clone().parse()?)),
     }
+}
+
+/// Validates a packed binlog DECIMAL (the bytes after the two precision/scale
+/// header bytes) before the library touches it.
+///
+/// The dependency's reader trusts `precision`/`scale`: `precision - scale`
+/// underflows when scale is larger, a hostile digit group overflows its
+/// `x * 10^(9 - digits)` scaling multiply, and a release build wraps that
+/// overflow into silently wrong output. The layout mirrors the library's
+/// `Decimal::read_bin`: a sign bit in the high bit of the first packed byte,
+/// then the integer groups (partial-width prefix of `precision - scale % 9`
+/// digits, then full 9-digit groups) and the fractional groups (full, then a
+/// partial-width suffix of `scale % 9` digits), every group big-endian with
+/// non-negative digit values below `10^digits` after the sign masks are
+/// reapplied.
+fn validate_packed_decimal(data: &[u8]) -> io::Result<()> {
+    const DIG_PER_DEC: usize = 9;
+    const DIG_TO_BYTES: [usize; DIG_PER_DEC + 1] = [0, 1, 1, 2, 2, 3, 3, 4, 4, 4];
+    const INVALID: &str = "malformed jsonb opaque NEWDECIMAL";
+
+    let Some(&precision) = data.first() else {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, INVALID));
+    };
+    let Some(&scale) = data.get(1) else {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, INVALID));
+    };
+    if scale > precision {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{INVALID}: scale exceeds precision"),
+        ));
+    }
+    // The writer flips the high bit of the first packed byte; undo it before
+    // deriving the sign mask (the library reads it the same way).
+    let mut packed = data[2..].to_vec();
+    if let Some(first) = packed.first_mut() {
+        *first ^= 0x80;
+    }
+    let mask = if packed.first().copied().unwrap_or(0) & 0x80 == 0 {
+        0i32
+    } else {
+        -1i32
+    };
+    let intg = precision as usize - scale as usize;
+    // (digit count per group, group count): a partial-width prefix group of
+    // `intg % 9` digits, full 9-digit groups, full fractional groups, and a
+    // partial-width suffix of `scale % 9` digits.
+    let groups: [(usize, usize); 4] = [
+        (
+            intg % DIG_PER_DEC,
+            usize::from(!intg.is_multiple_of(DIG_PER_DEC)),
+        ),
+        (DIG_PER_DEC, intg / DIG_PER_DEC),
+        (DIG_PER_DEC, scale as usize / DIG_PER_DEC),
+        (
+            scale as usize % DIG_PER_DEC,
+            usize::from(!(scale as usize).is_multiple_of(DIG_PER_DEC)),
+        ),
+    ];
+    let mut offset = 0usize;
+    for (digits, count) in groups {
+        let width = DIG_TO_BYTES[digits];
+        for _ in 0..count {
+            let raw = packed
+                .get(offset..offset + width)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, INVALID))?;
+            offset += width;
+            // Sign-extend the written group (the writer stored
+            // `digit ^ mask` in `width` bytes) and re-apply the mask: the
+            // result is the non-negative digit value for valid input.
+            let widened = match width {
+                1 => i32::from(raw[0] as i8),
+                2 => i32::from(i16::from_be_bytes([raw[0], raw[1]])),
+                3 => {
+                    let sign_extend = raw[0] & 0x80 != 0;
+                    let mut value =
+                        i32::from(raw[2]) | (i32::from(raw[1]) << 8) | (i32::from(raw[0]) << 16);
+                    if sign_extend {
+                        value |= !0 << 24;
+                    }
+                    value
+                }
+                4 => i32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]),
+                _ => 0,
+            } ^ mask;
+            let limit = 10i32
+                .checked_pow(digits as u32)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, INVALID))?;
+            if widened < 0 || widened >= limit {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("{INVALID}: digit group exceeds {digits} digits"),
+                ));
+            }
+        }
+    }
+    if offset != packed.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{INVALID}: packed length does not match precision and scale"),
+        ));
+    }
+    Ok(())
 }
 
 /// The rejection error for jsonb input nested deeper than [`MAX_JSONB_DEPTH`].
@@ -1516,9 +1612,63 @@ mod tests {
         let truncated = vec![0x0f, 0xf6, 0];
         let error = jsonb_to_serde(&jsonb(&truncated), 1, &mut nodes).unwrap_err();
         assert!(
-            error.to_string().contains("scale exceeds precision"),
+            error
+                .to_string()
+                .contains("malformed jsonb opaque NEWDECIMAL"),
             "{error}"
         );
+    }
+
+    /// With a valid header, hostile packed digit groups still panic the
+    /// dependency (a group value scaled by `10^(9 - digits)` overflows i32)
+    /// and a release build wraps the overflow into silently wrong output —
+    /// the round-2 verifier reproduced both from the fuzz target. Every
+    /// group must stay below 10^digits after the sign masks are reapplied;
+    /// legitimate positives and negatives pass byte-for-byte.
+    #[test]
+    fn hostile_packed_decimal_groups_are_rejected_legitimates_pass() {
+        let mut nodes = 0usize;
+        // Legitimate positive decimal: precision 9 scale 0, one full group
+        // 999999999 (0x3b9ac9ff with the first byte's high bit set on the
+        // wire).
+        let ok = vec![0x0f, 0xf6, 6, 9, 0, 0xbb, 0x9a, 0xc9, 0xff];
+        let value = jsonb_to_serde(&jsonb(&ok), 1, &mut nodes).unwrap();
+        assert_eq!(value, serde_json::json!("999999999"));
+        // Legitimate negative decimal: all group bytes inverted, then the
+        // first byte's high bit flipped again on the wire.
+        let neg = vec![0x0f, 0xf6, 6, 9, 0, 0x44, 0x65, 0x36, 0x00];
+        let value = jsonb_to_serde(&jsonb(&neg), 1, &mut nodes).unwrap();
+        assert_eq!(value, serde_json::json!("-999999999"));
+        // One over the limit in the same group: 10^9 with the high bit set
+        // (0xba9aca00) is rejected.
+        let over = vec![0x0f, 0xf6, 6, 9, 0, 0xc0, 0x00, 0x00, 0x00];
+        let error = jsonb_to_serde(&jsonb(&over), 1, &mut nodes).unwrap_err();
+        assert!(
+            error.to_string().contains("digit group exceeds 9 digits"),
+            "{error}"
+        );
+        // The verifier's panic shape: precision 5 scale 5 (suffix group of 5
+        // digits, 3 bytes) with a group value whose scaling multiply
+        // overflows i32 (first byte 0x83 = 0x03 with the sign bit set).
+        let overflow = vec![0x0f, 0xf6, 5, 5, 5, 0x83, 0x46, 0xdc];
+        let error = jsonb_to_serde(&jsonb(&overflow), 1, &mut nodes).unwrap_err();
+        assert!(
+            error.to_string().contains("digit group exceeds 5 digits"),
+            "{error}"
+        );
+        // Packed length disagreeing with precision/scale is rejected too.
+        let short = vec![0x0f, 0xf6, 4, 9, 0, 0xbb, 0x9a];
+        let error = jsonb_to_serde(&jsonb(&short), 1, &mut nodes).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("malformed jsonb opaque NEWDECIMAL"),
+            "{error}"
+        );
+        // Precision 0 scale 0 packs zero bytes; the validator accepts it (the
+        // library's jsonb framing rejects such opaques outright, so the
+        // validator is asserted directly).
+        validate_packed_decimal(&[0, 0]).unwrap();
     }
 
     /// A nested large jsonb array holding three elements: element 0 is the
