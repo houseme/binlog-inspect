@@ -5,7 +5,12 @@
 use crate::event::{EventPayload, ParsedEvent};
 use std::io::Write;
 /// Failures while writing formatted events.
+///
+/// This enum is `#[non_exhaustive]` (R45): downstream matches require a
+/// wildcard arm, so new variants can be added without a semver-major
+/// release.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum FormatterError {
     /// JSON encoding of an event or payload failed.
     #[error(transparent)]

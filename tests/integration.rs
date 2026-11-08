@@ -832,12 +832,128 @@ fn framing_error_message_carries_the_exact_offset() {
     bytes.extend(corrupt_event());
     let f = file(&bytes);
     let mut p = BinlogParser::open(f.path()).unwrap();
-    let error = p.events().nth(1).unwrap().unwrap_err().to_string();
+    let error = p.events().nth(1).unwrap().unwrap_err();
     assert!(
-        error.contains("binlog error at offset 31"),
+        error.to_string().contains("binlog error at offset 31"),
         "expected the offset in the message: {error}"
     );
-    assert!(error.contains("invalid or oversized"), "{error}");
+    assert!(
+        error.to_string().contains("invalid or oversized"),
+        "{error}"
+    );
+    // R45: the same failure is now the structured OversizedEvent variant
+    // carrying the declared size and the configured cap.
+    assert!(matches!(
+        error,
+        ParserError::OversizedEvent {
+            offset: 31,
+            size: 0,
+            limit: MAX_EVENT_SIZE
+        }
+    ));
+}
+
+/// CRC-32 (IEEE 802.3, reflected) for checksummed fixtures.
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut crc = !0u32;
+    for &byte in bytes {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ (0xedb88320 & (0u32.wrapping_sub(crc & 1)));
+        }
+    }
+    !crc
+}
+
+/// A checksummed event: header plus body plus the CRC32 of both.
+fn checksummed_event(code: u8, body: &[u8]) -> Vec<u8> {
+    let size = 19 + body.len() + 4;
+    let mut data = Vec::new();
+    data.extend(1u32.to_le_bytes()); // timestamp
+    data.push(code);
+    data.extend(7u32.to_le_bytes()); // server id
+    data.extend((size as u32).to_le_bytes());
+    data.extend(0u32.to_le_bytes()); // log pos
+    data.extend(0u16.to_le_bytes()); // flags
+    data.extend_from_slice(body);
+    data.extend(crc32(&data).to_le_bytes());
+    data
+}
+
+/// A checksummed format description enabling CRC32 verification for all
+/// following events (the same fixture shape the reference tests use).
+fn checksummed_format_description() -> Vec<u8> {
+    let mut body = vec![0; 57];
+    body[0..2].copy_from_slice(&4u16.to_le_bytes());
+    body[2..8].copy_from_slice(b"8.0.30");
+    body[56] = 19; // event header length
+    body.extend([0; 40]); // per-type post-header lengths
+    body.push(1); // BINLOG_CHECKSUM_ALG_CRC32
+    checksummed_event(15, &body)
+}
+
+#[test]
+fn structured_framing_errors_pin_their_display_strings() {
+    // R45: the Checksum/Truncated/OversizedEvent variants keep the exact
+    // Display strings the paths always emitted, now with structured fields.
+    // Truncated: the declared event body is not fully present.
+    let mut bytes = b"\xfebin".to_vec();
+    bytes.extend(event(16, &123u64.to_le_bytes()));
+    bytes.extend(&event(16, &456u64.to_le_bytes())[..19 + 4]);
+    let f = file(&bytes);
+    let mut p = BinlogParser::open(f.path()).unwrap();
+    let mut events = p.events();
+    assert!(events.next().unwrap().is_ok());
+    let error = events.next().unwrap().unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "binlog error at offset 31: failed to fill whole buffer"
+    );
+    assert!(matches!(error, ParserError::Truncated { offset: 31 }));
+
+    // Oversized: a declared size below the 19-byte header minimum.
+    let mut bytes = b"\xfebin".to_vec();
+    let mut header = vec![0u8; 19];
+    header[4] = 16;
+    header[9..13].copy_from_slice(&18u32.to_le_bytes());
+    bytes.extend(header);
+    let f = file(&bytes);
+    let error = BinlogParser::open(f.path())
+        .unwrap()
+        .events()
+        .next()
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "binlog error at offset 4: invalid or oversized event"
+    );
+    assert!(matches!(
+        error,
+        ParserError::OversizedEvent {
+            offset: 4,
+            size: 18,
+            limit: MAX_EVENT_SIZE
+        }
+    ));
+
+    // Checksum: a corrupted body byte after a checksummed format description
+    // (the FDE is 19 + 98 + 4 = 121 bytes, so the XID starts at offset 125).
+    let mut bytes = b"\xfebin".to_vec();
+    bytes.extend(checksummed_format_description());
+    let mut xid = checksummed_event(16, &42u64.to_le_bytes());
+    xid[19] ^= 1;
+    bytes.extend(xid);
+    let f = file(&bytes);
+    let mut p = BinlogParser::open(f.path()).unwrap();
+    let mut events = p.events();
+    assert!(events.next().unwrap().is_ok());
+    let error = events.next().unwrap().unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "binlog error at offset 125: event checksum mismatch"
+    );
+    assert!(matches!(error, ParserError::Checksum { offset: 125 }));
 }
 
 #[test]
