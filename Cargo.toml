@@ -14,7 +14,8 @@ rust-version = "1.88"
 # The .crate ships user-facing documentation and sources only; internal
 # engineering notes, planning documents, and CI/test material stay out of the
 # published tarball (R40). CHANGELOG.md, DESIGN.md, README.md, and LICENSE
-# remain included.
+# remain included. The nightly-only fuzz harnesses and the repo-engineering
+# files .gitignore and deny.toml join the exclusion list in W5-2 (R51).
 exclude = [
     "AGENT.md",
     "EXECUTION.md",
@@ -22,6 +23,9 @@ exclude = [
     "docs",
     "tests",
     ".github",
+    "fuzz",
+    ".gitignore",
+    "deny.toml",
 ]
 
 # The binary lives in the CLI layer; building it requires the cli feature,
