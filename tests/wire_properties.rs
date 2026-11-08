@@ -578,7 +578,9 @@ fn with_max_event_size_rejects_events_above_the_custom_cap() {
     assert!(
         matches!(
             error,
-            ParserError::Io { ref source, .. } if source.kind() == io::ErrorKind::InvalidData
+            ParserError::OversizedEvent { offset: rows_offset_event, size, limit: 130 }
+                if rows_offset_event == u64::from(rows_offset)
+                    && size == u32::try_from(19 + rows.body.len() + 4).unwrap()
         ),
         "{error}"
     );

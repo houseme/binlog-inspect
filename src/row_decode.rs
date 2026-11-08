@@ -144,6 +144,26 @@ fn jsonb_to_serde(
         }
         // Scalars carry no recursion, so they are converted through the
         // library's own JsonDom rendering (including its opaque string rules).
+        // One precondition is checked by hand first: the library computes a
+        // NEWDECIMAL opaque's packed size as `precision - scale` and the
+        // subtraction underflows when a hostile payload declares
+        // scale > precision (or truncates the two-byte header). Malformed
+        // decimals are clean errors, matching every other malformed-jsonb
+        // path (R47b fuzz finding).
+        jsonb::Value::Opaque(opaque)
+            if opaque.value_type() == ColumnType::MYSQL_TYPE_NEWDECIMAL =>
+        {
+            let data = opaque.data_raw();
+            if data.len() < 2 || data[1] > data[0] {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "malformed jsonb opaque NEWDECIMAL: scale exceeds precision",
+                ));
+            }
+            Ok(serde_json::Value::from(
+                jsonb::Value::Opaque(opaque.clone()).parse()?,
+            ))
+        }
         other => Ok(serde_json::Value::from(other.clone().parse()?)),
     }
 }
@@ -1475,6 +1495,30 @@ mod tests {
         let mut nodes = 0usize;
         let value = jsonb_to_serde(&jsonb(&opaque_decimal_jsonb()), 1, &mut nodes).unwrap();
         assert_eq!(value, serde_json::json!("12.5"));
+    }
+
+    /// A hostile NEWDECIMAL opaque declaring scale > precision (the library
+    /// computes the packed size as `precision - scale` and underflows) is a
+    /// clean `InvalidData`, not a panic — found by the R47b fuzz scaffold.
+    #[test]
+    fn malformed_opaque_decimal_is_a_clean_error() {
+        let dec = mysql_common::binlog::decimal::Decimal::parse_str_bytes(b"12.5").unwrap();
+        let mut out = vec![0x0f, 0xf6, 4]; // OPAQUE, NEWDECIMAL, data length
+        out.extend_from_slice(&[1, 3]); // precision 1, scale 3 (scale > precision)
+        dec.write_bin(&mut out).unwrap();
+        let mut nodes = 0usize;
+        let error = jsonb_to_serde(&jsonb(&out), 1, &mut nodes).unwrap_err();
+        assert!(
+            error.to_string().contains("scale exceeds precision"),
+            "{error}"
+        );
+        // A truncated header (no precision/scale bytes at all) is the same.
+        let truncated = vec![0x0f, 0xf6, 0];
+        let error = jsonb_to_serde(&jsonb(&truncated), 1, &mut nodes).unwrap_err();
+        assert!(
+            error.to_string().contains("scale exceeds precision"),
+            "{error}"
+        );
     }
 
     /// A nested large jsonb array holding three elements: element 0 is the

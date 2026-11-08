@@ -12,7 +12,10 @@
 //! * Raw event buffers are limited by [`parser::MAX_EVENT_SIZE`] by default.
 //!   [`parser::BinlogParser::visit_events`] delivers compressed-transaction
 //!   children individually. The collecting iterator retains all children of
-//!   a payload, and decoded row images and shared table maps also use memory.
+//!   a payload up to [`parser::DEFAULT_INNER_EVENT_LIMIT`] (raise it with
+//!   [`parser::BinlogParser::with_inner_event_limit`]), and decoded row
+//!   images and shared table maps also use memory. Decoded JSON values are
+//!   bounded by a nesting-depth cap and a node budget.
 //! * Encrypted binlogs are detected and rejected, not misread.
 //! * Framing, checksum, and decoding failures are reported as errors carrying
 //!   the file offset; nothing is silently skipped.

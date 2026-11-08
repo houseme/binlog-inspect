@@ -2,19 +2,35 @@
 
 This project follows the [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format and [Semantic Versioning](https://semver.org/). Entries are written in English; breaking changes are explicitly marked.
 
-## [Unreleased]
+## [0.5.0] - Unreleased
 
-Fourth and fifth batches, from the 2026-11-06 re-review and 2026-11-07 source review (ROADMAP R39–R47 plus the W5-2 batch, R48–R52).
+Fourth and fifth batches, from the 2026-11-06 re-review and 2026-11-07/09 source reviews (ROADMAP R39–R52). **Breaking library release** (R45).
 
 ### Added
 
 - Library `BinlogParser::visit_events` with payload start/end notifications, one-at-a-time inner-event delivery, shared table-map state, and explicit cancellation semantics.
 - Deterministic public-parser property tests for bounded wire-format mutation, truncation, chunked readers, event round-trips, and error termination.
+- **Structured `ParserError` variants** — `Checksum { offset }`, `Truncated { offset }`, `OversizedEvent { offset, size, limit }`, `TooManyInnerEvents { offset, limit }` alongside `Io`/`EncryptedBinlog`/`InvalidHeader` — with Display strings byte-compatible with the previous messages (R45).
+- `BinlogParser::with_inner_event_limit(NonZeroUsize)` and the `--max-inner-events <COUNT>` CLI flag (default 250,000, 0 rejected at parse time): the collecting `transaction_payload()` path fails with `TooManyInnerEvents` instead of buffering an unbounded number of inner events; `visit_events` stays uncapped and backpressured (R46b).
+- A coverage-guided fuzz scaffold (`fuzz/`, cargo-fuzz targets over the public parser including raw jsonb through a JSON column with an RSS limit, curated corpus) plus a scheduled non-gating CI fuzz job; the jsonb target found a real panic in the dependency on hostile opaque NEWDECIMAL input within seconds (R47b).
+
+### Changed
+
+- **Breaking**: `ParserError`, `FormatterError`, `EventType`, `EventPayload`, `CellValue` and `Signedness` are now `#[non_exhaustive]` (R45). Exhaustive downstream `match`es need a wildcard arm; the plain output structs are deliberately not annotated and remain constructible.
+- Decoded JSON values are bounded by a 100-level nesting cap **and** a 1,000,000-node budget: hostile aliased jsonb (a 221-byte fixture previously expanding to 8.4M nodes, ~331 bytes demanding ~275 GB) now returns a clean offset-carrying error, and hostile container counts cannot pre-allocate more than 4096 slots (R48).
+- Advisory stderr output (warnings, partial-failure summaries) survives a closed stderr instead of panicking with exit 101; `Intvar.var_type` and `Incident.incident_type` render canonical pinned names instead of library `Debug` formatting (R51).
+- Packaging: `.gitignore`, `deny.toml` and `fuzz/` join the `.crate` exclude list; the MSRV CI job also checks the library-only configuration (R51).
+- The jsonb depth cap, node budget and opaque jsonb rendering rules are documented in README Limitations, the USAGE value/error tables and DESIGN boundaries; the CLI option tables document `--max-inner-events` (R52).
+
+### Fixed
+
+- Applying a partial-JSON diff at a deep path with a deep inserted value composes a document past the 100-level nesting limit; the composition is now rejected before the document is built and the cell renders as `partial_json` with the reason — a hostile sequence previously built a document whose recursive drop/serialization aborted the process.
+- **Hostile opaque `NEWDECIMAL` jsonb members declaring `scale > precision` (or a truncated header) return a clean offset-carrying error** instead of panicking inside the dependency's decimal size computation — found by the new fuzz target within seconds of its first run (R47b/R52).
+- `--completions` output goes through the graceful broken-pipe path as well: it is generated into a buffer first, because clap_complete's shell generators panic on write errors (R40).
+- JSON columns whose jsonb tree nests deeper than MySQL's limit of 100 containers return a parse error carrying the offset; a hostile ~60,000-deep value previously overflowed the stack and aborted the process (fail-closed violation).
 
 - JSON columns containing opaque jsonb values (decimals and date/time values stored in JSON — type byte `NEWDECIMAL` and friends) decode through the library's `JsonDom` rendering instead of failing the whole file; opaque diff members render as their canonical string form.
 - Row events with type codes 23–25 (the MySQL 5.5-era V1 write/update/delete rows events) are labeled `write_rows`/`update_rows`/`delete_rows` instead of `unknown` — the payload was always decoded; only the label was wrong (the truly pre-GA codes are 20–22, which remain `unknown`).
-
-### Fixed
 
 - Nonempty ordinary row events with no selected columns return a parsing error. The underlying row iterator previously made no byte progress and could grow memory indefinitely.
 - Table maps validate the complete required column metadata span before row decoding. Raw `VAR_STRING` and `TYPED_ARRAY` columns return an explicit unsupported-type error for the current dependency decoder.

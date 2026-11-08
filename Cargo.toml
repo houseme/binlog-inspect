@@ -1,6 +1,6 @@
 [package]
 name = "binlog-inspect"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 description = "Offline inspector for plaintext MySQL binary logs with JSON Lines, text and CSV output"
 readme = "README.md"
