@@ -184,6 +184,9 @@ jobs:
       - name: Check (all features)
         run: cargo check --locked --all-features
 
+      - name: Check (no default features)
+        run: cargo check --locked --no-default-features
+
       - name: Test (all features)
         run: cargo test --locked --all-features
 
