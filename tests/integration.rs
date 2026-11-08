@@ -5,10 +5,12 @@ use binlog_inspect::{
     event::{EventPayload, EventType, ParsedEvent},
     filter::EventFilter,
     formatter::{CsvFormatter, Formatter, TextFormatter},
-    parser::{BinlogParser, MAX_EVENT_SIZE, ParserError},
+    parser::{BinlogParser, MAX_EVENT_SIZE, ParserError, VisitEvent},
 };
 use std::{
-    io::{Read, Write},
+    io::{Cursor, Read, Write},
+    num::NonZeroUsize,
+    ops::ControlFlow,
     process::{Command, Output, Stdio},
 };
 
@@ -832,12 +834,128 @@ fn framing_error_message_carries_the_exact_offset() {
     bytes.extend(corrupt_event());
     let f = file(&bytes);
     let mut p = BinlogParser::open(f.path()).unwrap();
-    let error = p.events().nth(1).unwrap().unwrap_err().to_string();
+    let error = p.events().nth(1).unwrap().unwrap_err();
     assert!(
-        error.contains("binlog error at offset 31"),
+        error.to_string().contains("binlog error at offset 31"),
         "expected the offset in the message: {error}"
     );
-    assert!(error.contains("invalid or oversized"), "{error}");
+    assert!(
+        error.to_string().contains("invalid or oversized"),
+        "{error}"
+    );
+    // R45: the same failure is now the structured OversizedEvent variant
+    // carrying the declared size and the configured cap.
+    assert!(matches!(
+        error,
+        ParserError::OversizedEvent {
+            offset: 31,
+            size: 0,
+            limit: MAX_EVENT_SIZE
+        }
+    ));
+}
+
+/// CRC-32 (IEEE 802.3, reflected) for checksummed fixtures.
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut crc = !0u32;
+    for &byte in bytes {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ (0xedb88320 & (0u32.wrapping_sub(crc & 1)));
+        }
+    }
+    !crc
+}
+
+/// A checksummed event: header plus body plus the CRC32 of both.
+fn checksummed_event(code: u8, body: &[u8]) -> Vec<u8> {
+    let size = 19 + body.len() + 4;
+    let mut data = Vec::new();
+    data.extend(1u32.to_le_bytes()); // timestamp
+    data.push(code);
+    data.extend(7u32.to_le_bytes()); // server id
+    data.extend((size as u32).to_le_bytes());
+    data.extend(0u32.to_le_bytes()); // log pos
+    data.extend(0u16.to_le_bytes()); // flags
+    data.extend_from_slice(body);
+    data.extend(crc32(&data).to_le_bytes());
+    data
+}
+
+/// A checksummed format description enabling CRC32 verification for all
+/// following events (the same fixture shape the reference tests use).
+fn checksummed_format_description() -> Vec<u8> {
+    let mut body = vec![0; 57];
+    body[0..2].copy_from_slice(&4u16.to_le_bytes());
+    body[2..8].copy_from_slice(b"8.0.30");
+    body[56] = 19; // event header length
+    body.extend([0; 40]); // per-type post-header lengths
+    body.push(1); // BINLOG_CHECKSUM_ALG_CRC32
+    checksummed_event(15, &body)
+}
+
+#[test]
+fn structured_framing_errors_pin_their_display_strings() {
+    // R45: the Checksum/Truncated/OversizedEvent variants keep the exact
+    // Display strings the paths always emitted, now with structured fields.
+    // Truncated: the declared event body is not fully present.
+    let mut bytes = b"\xfebin".to_vec();
+    bytes.extend(event(16, &123u64.to_le_bytes()));
+    bytes.extend(&event(16, &456u64.to_le_bytes())[..19 + 4]);
+    let f = file(&bytes);
+    let mut p = BinlogParser::open(f.path()).unwrap();
+    let mut events = p.events();
+    assert!(events.next().unwrap().is_ok());
+    let error = events.next().unwrap().unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "binlog error at offset 31: failed to fill whole buffer"
+    );
+    assert!(matches!(error, ParserError::Truncated { offset: 31 }));
+
+    // Oversized: a declared size below the 19-byte header minimum.
+    let mut bytes = b"\xfebin".to_vec();
+    let mut header = vec![0u8; 19];
+    header[4] = 16;
+    header[9..13].copy_from_slice(&18u32.to_le_bytes());
+    bytes.extend(header);
+    let f = file(&bytes);
+    let error = BinlogParser::open(f.path())
+        .unwrap()
+        .events()
+        .next()
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "binlog error at offset 4: invalid or oversized event"
+    );
+    assert!(matches!(
+        error,
+        ParserError::OversizedEvent {
+            offset: 4,
+            size: 18,
+            limit: MAX_EVENT_SIZE
+        }
+    ));
+
+    // Checksum: a corrupted body byte after a checksummed format description
+    // (the FDE is 19 + 98 + 4 = 121 bytes, so the XID starts at offset 125).
+    let mut bytes = b"\xfebin".to_vec();
+    bytes.extend(checksummed_format_description());
+    let mut xid = checksummed_event(16, &42u64.to_le_bytes());
+    xid[19] ^= 1;
+    bytes.extend(xid);
+    let f = file(&bytes);
+    let mut p = BinlogParser::open(f.path()).unwrap();
+    let mut events = p.events();
+    assert!(events.next().unwrap().is_ok());
+    let error = events.next().unwrap().unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "binlog error at offset 125: event checksum mismatch"
+    );
+    assert!(matches!(error, ParserError::Checksum { offset: 125 }));
 }
 
 #[test]
@@ -1268,5 +1386,255 @@ fn cli_max_event_size_caps_and_validates() {
     assert!(
         stderr.contains("exceeds the 1 GiB inspection limit"),
         "{stderr}"
+    );
+}
+
+/// Writes a MySQL serialization-library length-encoded integer (fixtures only).
+fn put_lenenc(out: &mut Vec<u8>, value: u64) {
+    if value < 251 {
+        out.push(value as u8);
+    } else if value < 65536 {
+        out.push(0xfc);
+        out.extend_from_slice(&(value as u16).to_le_bytes());
+    } else if value < 1 << 24 {
+        out.push(0xfd);
+        out.extend_from_slice(&(value as u32).to_le_bytes()[..3]);
+    } else {
+        out.push(0xfe);
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+}
+
+/// A transaction payload (code 40) body carrying the NONE compression
+/// algorithm and the given raw inner events, hand-crafted the way the
+/// framing prevalidation and the library read it: each header field is a
+/// length-encoded type, a length-encoded declared length, and a
+/// length-encoded value; field 2 is the compression algorithm (255 = NONE),
+/// field 1 the payload size, then the end mark and the payload bytes (a NONE
+/// payload declares no uncompressed size on the wire, mirroring the
+/// library's own writer).
+fn none_payload(content: &[u8]) -> Vec<u8> {
+    let mut body = Vec::new();
+    put_lenenc(&mut body, 2); // compression algorithm field
+    put_lenenc(&mut body, 1); // declared value length
+    put_lenenc(&mut body, 255); // TransactionPayloadCompressionType::NONE
+    put_lenenc(&mut body, 1); // payload size field
+    put_lenenc(&mut body, 1); // declared value length
+    put_lenenc(&mut body, content.len() as u64);
+    body.push(0); // end mark
+    body.extend_from_slice(content);
+    body
+}
+
+/// Three minimal inner XID frames (27 bytes each, no checksums in the inner
+/// stream) plus the enclosing payload event at file offset 4.
+fn three_xid_payload_file() -> tempfile::NamedTempFile {
+    let mut content = Vec::new();
+    for xid in 1..=3u64 {
+        content.extend(event(16, &xid.to_le_bytes()));
+    }
+    let mut bytes = b"\xfebin".to_vec();
+    bytes.extend(event(40, &none_payload(&content)));
+    file(&bytes)
+}
+
+#[test]
+fn cli_inner_event_limit_stops_breaching_payloads_and_raising_it_decodes() {
+    // R46b: the collecting iterator bounds transaction payload memory. Three
+    // minimal inner XIDs breach --max-inner-events 2 (exit 3 with the
+    // documented message, exit 1 under --strict); the default limit and an
+    // explicitly raised limit decode the payload.
+    let f = three_xid_payload_file();
+    let path = f.path().to_str().unwrap();
+
+    let out = run_cli(&[path, "--max-inner-events", "2"]);
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("transaction payload at offset 4 contains more than 2 inner events"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("raise --max-inner-events or use visit_events"),
+        "{stderr}"
+    );
+
+    let out = run_cli(&[path, "--max-inner-events", "2", "--strict"]);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("more than 2 inner events"), "{stderr}");
+
+    // The default limit (250000) decodes the payload untouched.
+    let out = run_cli(&[path]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let inner = value["payload"]["events"].as_array().unwrap();
+    assert_eq!(inner.len(), 3);
+    assert_eq!(value["payload"]["compression"], "NONE");
+
+    // An explicit limit exactly at the event count decodes it too.
+    let out = run_cli(&[path, "--max-inner-events", "3"]);
+    assert_eq!(out.status.code(), Some(0));
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(value["payload"]["events"].as_array().unwrap().len(), 3);
+
+    // Zero cannot disable the bound: usage error (exit 2) at parse time.
+    let out = run_cli(&[path, "--max-inner-events", "0"]);
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("the limit cannot be disabled"), "{stderr}");
+}
+
+#[test]
+fn with_inner_event_limit_bounds_only_the_collecting_iterator() {
+    // R46b: the library constructor mirrors with_max_event_size and is
+    // enforced only where events are collected; visit_events delivers each
+    // inner event to the callback and stays uncapped.
+    let f = three_xid_payload_file();
+    let mut bytes = Vec::new();
+    std::fs::File::open(f.path())
+        .unwrap()
+        .read_to_end(&mut bytes)
+        .unwrap();
+
+    let mut parser = BinlogParser::from_reader(Cursor::new(bytes.clone()))
+        .unwrap()
+        .with_inner_event_limit(NonZeroUsize::new(2).unwrap());
+    let error = parser.events().next().unwrap().unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "transaction payload at offset 4 contains more than 2 inner events; raise --max-inner-events or use visit_events"
+    );
+    assert!(matches!(
+        error,
+        ParserError::TooManyInnerEvents {
+            offset: 4,
+            limit: 2
+        }
+    ));
+    // The breach fuses the parser like every other framing/decoding error.
+    assert!(parser.events().next().is_none());
+
+    // A sufficient bound decodes the whole payload.
+    let mut parser = BinlogParser::from_reader(Cursor::new(bytes.clone()))
+        .unwrap()
+        .with_inner_event_limit(NonZeroUsize::new(3).unwrap());
+    let event = parser.events().next().unwrap().unwrap();
+    assert_eq!(event.event_type, EventType::TransactionPayload);
+    assert!(
+        matches!(event.payload, EventPayload::TransactionPayload { ref events, .. } if events.len() == 3)
+    );
+
+    // The visiting path ignores the limit: all three inner events are
+    // delivered one at a time.
+    let mut parser = BinlogParser::from_reader(Cursor::new(bytes.clone()))
+        .unwrap()
+        .with_inner_event_limit(NonZeroUsize::new(2).unwrap());
+    let mut inner = 0;
+    let outcome = parser
+        .visit_events(|notification| {
+            if let VisitEvent::Event {
+                parent_offset: Some(_),
+                ..
+            } = notification
+            {
+                inner += 1;
+            }
+            Ok(ControlFlow::Continue(()))
+        })
+        .unwrap();
+    assert_eq!(outcome, ControlFlow::Continue(()));
+    assert_eq!(inner, 3, "visit_events is not bounded by the limit");
+}
+
+#[test]
+fn intvar_output_pins_the_canonical_type_names() {
+    // R51: Intvar.var_type renders pinned canonical constant names, not the
+    // library's Debug formatting. Subtype 2 = INSERT_ID_EVENT, subtype 1 =
+    // LAST_INSERT_ID_EVENT.
+    let mut bytes = b"\xfebin".to_vec();
+    bytes.extend(event(5, &[2, 42, 0, 0, 0, 0, 0, 0, 0]));
+    bytes.extend(event(5, &[1, 7, 0, 0, 0, 0, 0, 0, 0]));
+    let f = file(&bytes);
+    let out = run_cli(&[f.path().to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        stdout.contains("\"var_type\":\"INSERT_ID_EVENT\""),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("\"var_type\":\"LAST_INSERT_ID_EVENT\""),
+        "{stdout}"
+    );
+    assert!(stdout.contains("\"value\":42"), "{stdout}");
+    assert!(stdout.contains("\"value\":7"), "{stdout}");
+}
+
+#[cfg(unix)]
+#[test]
+fn closed_stderr_does_not_change_the_exit_status() {
+    // R51: warnings and partial-failure summaries are advisory output, so a
+    // closed stderr must never change the outcome. The eprintln! macro they
+    // used before panics on write errors (exit 101); the advise() helper
+    // drops the failure instead. A pipe with no reader makes every write
+    // fail deterministically (BrokenPipe), exercising the same ignore-the-
+    // error path as a closed fd.
+    use std::os::{fd::OwnedFd, unix::net::UnixStream};
+
+    let run_with_closed_stderr = |args: &[&str]| {
+        let (reader, writer) = UnixStream::pair().unwrap();
+        drop(reader);
+        let stderr: OwnedFd = writer.into();
+        Command::new(env!("CARGO_BIN_EXE_binlog-inspect"))
+            .args(args)
+            .stderr(Stdio::from(stderr))
+            .output()
+            .unwrap()
+    };
+
+    // Advisory warnings survive: the broken log_pos emits a warning, but the
+    // run still parses everything and exits 0.
+    let mut bad = event(16, &456u64.to_le_bytes());
+    bad[13..17].copy_from_slice(&999u32.to_le_bytes());
+    let mut bytes = b"\xfebin".to_vec();
+    bytes.extend(event(16, &123u64.to_le_bytes()));
+    bytes.extend(bad);
+    let f = file(&bytes);
+    let out = run_with_closed_stderr(&[f.path().to_str().unwrap()]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a closed stderr must not change the exit status"
+    );
+
+    // The partial-failure summary survives: the corrupt tail still exits 3
+    // (not the panic exit 101) with a closed stderr.
+    let mut corrupt = b"\xfebin".to_vec();
+    corrupt.extend(corrupt_event());
+    let f = file(&corrupt);
+    let out = run_with_closed_stderr(&[f.path().to_str().unwrap()]);
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "the partial-failure summary must survive a closed stderr"
     );
 }

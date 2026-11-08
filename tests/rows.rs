@@ -133,6 +133,9 @@ fn csv_preserves_bytes_with_short_writes_and_reports_write_errors() {
             binlog_inspect::formatter::FormatterError::Json(error) => {
                 assert_eq!(error.io_error_kind(), Some(io::ErrorKind::WriteZero));
             }
+            // The error enums are #[non_exhaustive] (R45): downstream matches
+            // need a wildcard arm even where every current variant is handled.
+            _ => unreachable!("only the io wrapping variants exist"),
         }
         assert_eq!(bytes, expected.as_bytes()[..capacity]);
     }

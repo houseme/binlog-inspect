@@ -5,7 +5,10 @@
 use crate::event::{EventPayload, EventType, ParsedEvent, RowChange};
 use mysql_common::binlog::{
     EventStreamReader,
-    consts::{BinlogChecksumAlg, BinlogVersion, TransactionPayloadCompressionType},
+    consts::{
+        BinlogChecksumAlg, BinlogVersion, IncidentType, IntvarEventType,
+        TransactionPayloadCompressionType,
+    },
     events::{Event, EventData, PreviousGtidsEvent, RowsEventData, TransactionPayloadReader},
 };
 use std::{
@@ -19,6 +22,20 @@ use std::{
 
 /// Upper bound on the accepted size of a single event, including its header.
 pub const MAX_EVENT_SIZE: u32 = 64 * 1024 * 1024;
+
+/// Upper bound on the inner events the collecting [`BinlogParser::events`]
+/// iterator buffers per transaction payload (R46b).
+///
+/// The bound targets the pathological tiny-event case: a payload of 250,000
+/// minimal events decodes to roughly 250 MB of retained event values, which
+/// is the heaviest shape one payload can produce, while sitting about two
+/// orders of magnitude above real transactions so legitimate payloads never
+/// reach it. Breaching the bound returns [`ParserError::TooManyInnerEvents`]
+/// instead of growing memory without limit. The bound can be raised through
+/// [`BinlogParser::with_inner_event_limit`], and
+/// [`BinlogParser::visit_events`] is not affected: its callback consumes
+/// each inner event immediately, so the user applies backpressure.
+pub const DEFAULT_INNER_EVENT_LIMIT: usize = 250_000;
 
 /// Capacity of the buffered reader wrapping the input.
 const READ_BUFFER_CAPACITY: usize = 1 << 20;
@@ -34,7 +51,13 @@ const MAX_UNCOMPRESSED_PAYLOAD_SIZE: u64 = 1 << 30;
 const PAYLOAD_SIZE_SLACK: u64 = 1 << 20;
 
 /// Failure opening or reading a binlog.
+///
+/// This enum is `#[non_exhaustive]` (R45): downstream matches require a
+/// wildcard arm, so structured variants can be added without a semver-major
+/// release. [`ParserError::Io`] stays the documented catch-all for failures
+/// without a dedicated variant.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ParserError {
     /// Encrypted MySQL binlogs must be read through the server.
     #[error(
@@ -44,7 +67,7 @@ pub enum ParserError {
     /// The input does not have the plaintext MySQL binlog magic.
     #[error("invalid or truncated binlog file header")]
     InvalidHeader,
-    /// An input or event decoding failure.
+    /// Any other input or event decoding failure.
     #[error("binlog error at offset {offset}: {source}")]
     Io {
         /// File offset at which the failure was detected.
@@ -52,6 +75,57 @@ pub enum ParserError {
         /// The underlying failure.
         #[source]
         source: io::Error,
+    },
+    /// The event's CRC32 checksum does not match its bytes.
+    ///
+    /// The Display string is identical to the message this path emitted
+    /// before the variant existed (R45); the offset is structured so callers
+    /// can locate the corruption programmatically.
+    #[error("binlog error at offset {offset}: event checksum mismatch")]
+    Checksum {
+        /// File offset at which the failed event begins.
+        offset: u64,
+    },
+    /// The event body ended before its declared size was read.
+    ///
+    /// The Display string is identical to the underlying `read_exact` EOF
+    /// failure the truncated/EOF path surfaced before the variant existed
+    /// (R45).
+    #[error("binlog error at offset {offset}: failed to fill whole buffer")]
+    Truncated {
+        /// File offset at which the truncated event begins.
+        offset: u64,
+    },
+    /// The declared event size is outside the valid range: below the
+    /// 19-byte event header or above the configured per-event cap.
+    ///
+    /// The Display string is identical to the message this path emitted
+    /// before the variant existed (R45); `size` and `limit` are structured
+    /// fields, not part of the message.
+    #[error("binlog error at offset {offset}: invalid or oversized event")]
+    OversizedEvent {
+        /// File offset at which the rejected event begins.
+        offset: u64,
+        /// Declared size carried in the event header.
+        size: u32,
+        /// The configured per-event size cap.
+        limit: u32,
+    },
+    /// A transaction payload carried more inner events than the configured
+    /// inner-event collection bound allows (R46b).
+    ///
+    /// The collecting [`BinlogParser::events`] iterator buffers every inner
+    /// event of a payload; this error stops the input before the buffer can
+    /// grow without limit. The message names the CLI flag and the uncapped
+    /// visiting alternative so the remedy is discoverable.
+    #[error(
+        "transaction payload at offset {offset} contains more than {limit} inner events; raise --max-inner-events or use visit_events"
+    )]
+    TooManyInnerEvents {
+        /// File offset of the enclosing transaction payload event.
+        offset: u64,
+        /// The configured inner-event collection bound.
+        limit: usize,
     },
 }
 
@@ -131,6 +205,62 @@ enum PayloadItem {
     Event(ParsedEvent),
 }
 
+/// Framing-layer failure raised by [`BinlogParser::read_framed_event`].
+///
+/// The helper runs where the failed event's file offset is known to its
+/// callers but not to itself, so it reports the framing problem without one;
+/// the callers map it onto the public [`ParserError`] structured variants
+/// with the starting offset (R45).
+#[derive(Debug, thiserror::Error)]
+enum FrameError {
+    /// The event's CRC32 checksum does not match its bytes.
+    #[error("event checksum mismatch")]
+    Checksum,
+    /// The event body ended before its declared size was read.
+    #[error("failed to fill whole buffer")]
+    Truncated,
+    /// The declared event size is outside the valid range.
+    #[error("invalid or oversized event")]
+    OversizedEvent {
+        /// Declared size carried in the event header.
+        size: u32,
+        /// The configured per-event size cap.
+        limit: u32,
+    },
+    /// Any other I/O failure while framing the event.
+    #[error(transparent)]
+    Io(#[from] io::Error),
+}
+
+impl FrameError {
+    /// Attaches the file offset where the failed event begins, keeping every
+    /// public Display string identical to the one the path emitted before
+    /// the structured variants existed (R45).
+    fn into_parser_error(self, offset: u64) -> ParserError {
+        match self {
+            Self::Checksum => ParserError::Checksum { offset },
+            Self::Truncated => ParserError::Truncated { offset },
+            Self::OversizedEvent { size, limit } => ParserError::OversizedEvent {
+                offset,
+                size,
+                limit,
+            },
+            Self::Io(source) => ParserError::Io { offset, source },
+        }
+    }
+}
+
+/// Classifies an I/O failure while filling the raw event buffer: a short
+/// read is the truncated/EOF path (R45), everything else stays a plain I/O
+/// error with its original source.
+fn truncated_or_io(error: io::Error) -> FrameError {
+    if error.kind() == io::ErrorKind::UnexpectedEof {
+        FrameError::Truncated
+    } else {
+        FrameError::Io(error)
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 #[error("transaction payload at inner offset {offset}: {source}")]
 struct InnerEventError {
@@ -143,9 +273,11 @@ struct InnerEventError {
 ///
 /// The reader works on any [`Read`] input (a file, standard input, or an
 /// in-memory buffer). Raw event sizes are capped at [`MAX_EVENT_SIZE`] by
-/// default, configurable through [`BinlogParser::with_max_event_size`].
-/// Decoded row images and the inner-event collection returned by
-/// [`BinlogParser::events`] can consume more memory than their wire data.
+/// default, configurable through [`BinlogParser::with_max_event_size`], and
+/// the inner-event collection of the collecting [`BinlogParser::events`]
+/// iterator is bounded by [`DEFAULT_INNER_EVENT_LIMIT`], configurable
+/// through [`BinlogParser::with_inner_event_limit`] (R46b). Decoded row
+/// images can consume more memory than their wire data.
 /// [`BinlogParser::visit_events`] delivers and releases each inner event in
 /// turn while retaining the outer raw payload and shared table-map state.
 pub struct BinlogParser<R: Read = File> {
@@ -155,6 +287,8 @@ pub struct BinlogParser<R: Read = File> {
     stopped: bool,
     buffer: Vec<u8>,
     max_event_size: u32,
+    /// Inner-event collection bound of the collecting iterator (R46b).
+    inner_event_limit: usize,
     warnings: Vec<String>,
     /// Per-table signedness metadata (R42): `signedness()` walks the table
     /// map's serialized body, so it is computed once per registration instead
@@ -202,6 +336,7 @@ impl<R: Read> BinlogParser<R> {
             stopped: false,
             buffer: Vec::new(),
             max_event_size: MAX_EVENT_SIZE,
+            inner_event_limit: DEFAULT_INNER_EVENT_LIMIT,
             warnings: Vec::new(),
             signedness_cache: HashMap::new(),
         })
@@ -210,6 +345,20 @@ impl<R: Read> BinlogParser<R> {
     /// Overrides the per-event size cap (defaulting to [`MAX_EVENT_SIZE`]).
     pub fn with_max_event_size(mut self, cap: u32) -> Self {
         self.max_event_size = cap;
+        self
+    }
+
+    /// Overrides the inner-event collection bound of the collecting
+    /// [`BinlogParser::events`] iterator (defaulting to
+    /// [`DEFAULT_INNER_EVENT_LIMIT`], R46b).
+    ///
+    /// Like [`Self::with_max_event_size`], this is infallible builder-style
+    /// configuration: a limit of zero cannot be expressed because the
+    /// argument is a [`core::num::NonZeroUsize`]. Only the collecting path
+    /// is bounded; [`Self::visit_events`] stays uncapped because its
+    /// callback applies backpressure.
+    pub fn with_inner_event_limit(mut self, limit: core::num::NonZeroUsize) -> Self {
+        self.inner_event_limit = limit.get();
         self
     }
 
@@ -225,6 +374,12 @@ impl<R: Read> BinlogParser<R> {
 
     /// Iterate over events, retrying transient [`io::ErrorKind::Interrupted`]
     /// reads. Other I/O errors and framing or decoding errors terminate the stream.
+    ///
+    /// This iterator collects the inner events of each transaction payload
+    /// into `EventPayload::TransactionPayload.events`, so that collection is
+    /// bounded by [`DEFAULT_INNER_EVENT_LIMIT`] (configurable through
+    /// [`Self::with_inner_event_limit`], R46b); breaching the bound stops the
+    /// stream with [`ParserError::TooManyInnerEvents`].
     pub fn events(&mut self) -> impl Iterator<Item = Result<ParsedEvent, ParserError>> + '_ {
         std::iter::from_fn(move || self.next_event())
     }
@@ -235,7 +390,10 @@ impl<R: Read> BinlogParser<R> {
     /// Unlike [`Self::events`], this method does not collect the decoded inner
     /// events of a transaction into a vector. The parser retains the outer
     /// compressed event, the current inner event, and its shared table maps.
-    /// A single decoded event can still contain multiple row images.
+    /// A single decoded event can still contain multiple row images. The
+    /// collecting path's [`DEFAULT_INNER_EVENT_LIMIT`] does not apply here:
+    /// the callback consumes each inner event immediately, so memory stays
+    /// bounded by backpressure instead of a numeric cap (R46b).
     ///
     /// The callback receives [`VisitEvent::TransactionPayloadStart`] only
     /// after outer framing, checksum, and payload-header validation and
@@ -283,7 +441,7 @@ impl<R: Read> BinlogParser<R> {
             let offset = self.offset;
             let Some(framed) = self
                 .read_framed_event()
-                .map_err(|source| ParserError::Io { offset, source })?
+                .map_err(|error| error.into_parser_error(offset))?
             else {
                 return Ok(ControlFlow::Continue(()));
             };
@@ -355,14 +513,18 @@ impl<R: Read> BinlogParser<R> {
             return None;
         }
         let offset = self.offset;
-        let result = (|| -> io::Result<Option<ParsedEvent>> {
-            let Some(framed) = self.read_framed_event()? else {
+        let result = (|| -> Result<Option<ParsedEvent>, ParserError> {
+            let Some(framed) = self
+                .read_framed_event()
+                .map_err(|error| error.into_parser_error(offset))?
+            else {
                 return Ok(None);
             };
             let payload = if framed.event.header().event_type_raw() == 40 {
-                self.transaction_payload(&framed.event)?
+                self.transaction_payload(&framed.event, offset)?
             } else {
-                self.payload_for(&framed.event)?
+                self.payload_for(&framed.event)
+                    .map_err(|source| ParserError::Io { offset, source })?
             };
             Ok(Some(framed.into_parsed(payload)))
         })();
@@ -372,16 +534,20 @@ impl<R: Read> BinlogParser<R> {
                 self.stopped = true;
                 None
             }
-            Err(source) => {
+            Err(error) => {
                 self.stopped = true;
-                Some(Err(ParserError::Io { offset, source }))
+                Some(Err(error))
             }
         }
     }
 
     /// Read and validate one outer event, retaining its original coordinates
     /// when table-map metadata is stripped before library decoding.
-    fn read_framed_event(&mut self) -> io::Result<Option<FramedEvent>> {
+    ///
+    /// Failures are reported as [`FrameError`] without the file offset; the
+    /// callers attach the offset where the event begins and map them onto
+    /// the public [`ParserError`] variants (R45).
+    fn read_framed_event(&mut self) -> Result<Option<FramedEvent>, FrameError> {
         let offset = self.offset;
         // Validate framing before allowing the library to allocate the event buffer.
         let mut head = [0u8; 19];
@@ -396,32 +562,36 @@ impl<R: Read> BinlogParser<R> {
         if first == 0 {
             return Ok(None);
         }
-        self.input.read_exact(&mut head[1..])?;
+        self.input
+            .read_exact(&mut head[1..])
+            .map_err(truncated_or_io)?;
         let size = u32::from_le_bytes(head[9..13].try_into().unwrap());
         if !(19..=self.max_event_size).contains(&size) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "invalid or oversized event",
-            ));
+            return Err(FrameError::OversizedEvent {
+                size,
+                limit: self.max_event_size,
+            });
         }
         // mysql_common assumes the complete event body is available.
         if head[4] == 15 && size < 19 + 57 {
-            return Err(io::Error::new(
+            return Err(FrameError::Io(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "short format description",
-            ));
+            )));
         }
         if head[4] != 15 && self.checksum_len(head[4]) > 0 && size < 23 {
-            return Err(io::Error::new(
+            return Err(FrameError::Io(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "short checksummed event",
-            ));
+            )));
         }
         // Resizing without clearing only zero-fills the newly observed
         // tail; every byte is overwritten by the head and body anyway.
         self.buffer.resize(size as usize, 0);
         self.buffer[..19].copy_from_slice(&head);
-        self.input.read_exact(&mut self.buffer[19..])?;
+        self.input
+            .read_exact(&mut self.buffer[19..])
+            .map_err(truncated_or_io)?;
         // Hostile-input prevalidation before the library decodes anything:
         // its previous-GTIDs and table-map metadata parsers allocate from
         // untrusted declared counts, and its transaction-payload header
@@ -478,10 +648,7 @@ impl<R: Read> BinlogParser<R> {
             && let (Some(checksum), Some(alg)) = (event.checksum(), checksum_algorithm)
             && u32::from_le_bytes(checksum) != event.calc_checksum(alg)
         {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "event checksum mismatch",
-            ));
+            return Err(FrameError::Checksum);
         }
         let h = event.header();
         // The header `event_size` reflects the stripped bytes; the
@@ -568,13 +735,16 @@ impl<R: Read> BinlogParser<R> {
             },
             Some(EventData::IncidentEvent(e)) => EventPayload::Incident {
                 incident_type: match e.incident_type() {
-                    Ok(incident_type) => format!("{incident_type:?}"),
+                    // The canonical name is pinned below (R51), not the
+                    // library's Debug rendering, so a library rename cannot
+                    // change the output.
+                    Ok(incident_type) => incident_type_name(incident_type).to_owned(),
                     Err(unknown) => format!("UNKNOWN({})", u16::from(unknown)),
                 },
                 message: e.message().into_owned(),
             },
             Some(EventData::IntvarEvent(e)) => EventPayload::Intvar {
-                var_type: format!("{:?}", e.subtype()),
+                var_type: intvar_type_name(e.subtype()).to_owned(),
                 value: e.value(),
             },
             Some(EventData::RowsEvent(RowsEventData::PartialUpdateRowsEvent(e))) => {
@@ -765,15 +935,43 @@ impl<R: Read> BinlogParser<R> {
     /// every decompressed byte against the declaration and prevalidates each
     /// inner event before the library parses it. Inner events carry no
     /// checksums (WL#3549), and the library registers their table maps in the
-    /// shared reader state so later outer row events resolve.
-    fn transaction_payload(&mut self, event: &Event) -> io::Result<EventPayload> {
+    /// shared reader state so later outer row events resolve. `offset` is the
+    /// outer event's file position, attached to failures (R45).
+    fn transaction_payload(
+        &mut self,
+        event: &Event,
+        offset: u64,
+    ) -> Result<EventPayload, ParserError> {
+        // R46b: only the collecting path buffers inner events into memory,
+        // so only this path enforces the inner-event limit. The visiting
+        // path hands each event to the callback, which applies backpressure.
+        let limit = self.inner_event_limit;
         let mut events = Vec::new();
-        let flow = self.walk_transaction_payload(event, &mut |item| {
-            if let PayloadItem::Event(event) = item {
-                events.push(event);
-            }
-            Ok(ControlFlow::<Infallible>::Continue(()))
-        })?;
+        let mut over_limit = false;
+        let flow = self
+            .walk_transaction_payload(event, &mut |item| {
+                if let PayloadItem::Event(event) = item {
+                    if events.len() >= limit {
+                        over_limit = true;
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "transaction payload inner event limit exceeded",
+                        ));
+                    }
+                    events.push(event);
+                }
+                Ok(ControlFlow::<Infallible>::Continue(()))
+            })
+            .map_err(|source| {
+                // The closure records the breach before returning: the only
+                // error that can carry the flag out of the walk is this one,
+                // because an emit error propagates immediately.
+                if over_limit {
+                    ParserError::TooManyInnerEvents { offset, limit }
+                } else {
+                    ParserError::Io { offset, source }
+                }
+            })?;
         let info = match flow {
             ControlFlow::Continue(info) => info,
             ControlFlow::Break(never) => match never {},
@@ -1093,6 +1291,31 @@ fn server_version(raw: &[u8]) -> String {
     String::from_utf8_lossy(&raw[..end]).into_owned()
 }
 
+/// Canonical stable name for a replication incident type.
+///
+/// The library's `Debug` output must not leak into the output model, so
+/// every [`IncidentType`] variant maps to its constant name; a library
+/// rename cannot change the output (R51, mirroring the `column_type_name`
+/// pattern).
+fn incident_type_name(incident_type: IncidentType) -> &'static str {
+    match incident_type {
+        IncidentType::INCIDENT_NONE => "INCIDENT_NONE",
+        IncidentType::INCIDENT_LOST_EVENTS => "INCIDENT_LOST_EVENTS",
+    }
+}
+
+/// Canonical stable name for an intvar event subtype.
+///
+/// See [`incident_type_name`] for why the names are pinned instead of taken
+/// from the library's `Debug` rendering (R51).
+fn intvar_type_name(subtype: IntvarEventType) -> &'static str {
+    match subtype {
+        IntvarEventType::INVALID_INT_EVENT => "INVALID_INT_EVENT",
+        IntvarEventType::LAST_INSERT_ID_EVENT => "LAST_INSERT_ID_EVENT",
+        IntvarEventType::INSERT_ID_EVENT => "INSERT_ID_EVENT",
+    }
+}
+
 /// Lowercase hex digits shared with the row decoder.
 const HEX: [u8; 16] = *b"0123456789abcdef";
 
@@ -1407,17 +1630,18 @@ const CRC32_TABLE: [u32; 256] = {
 /// "binlog in use" flag cleared, then the body). It is needed when a table
 /// map event body is modified by stripping before the library parses it: the
 /// library's own verification would then hash the modified bytes against the
-/// original checksum.
-fn verify_event_checksum(buffer: &[u8]) -> io::Result<()> {
+/// original checksum. A mismatch is framed as [`FrameError::Checksum`] so it
+/// surfaces as the structured [`ParserError::Checksum`] variant (R45).
+fn verify_event_checksum(buffer: &[u8]) -> Result<(), FrameError> {
     // `EventFlags::LOG_EVENT_BINLOG_IN_USE_F` (0x0001) is cleared before the
     // checksum is computed, both by the server when writing and by the
     // library when verifying.
     const BINLOG_IN_USE_FLAG: u16 = 0x0001;
     let Some(body_len) = buffer.len().checked_sub(4) else {
-        return Err(io::Error::new(
+        return Err(FrameError::Io(io::Error::new(
             io::ErrorKind::InvalidData,
             "short checksummed event",
-        ));
+        )));
     };
     let mut header = [0u8; 19];
     header.copy_from_slice(&buffer[..19]);
@@ -1431,10 +1655,7 @@ fn verify_event_checksum(buffer: &[u8]) -> io::Result<()> {
     crc.update(&buffer[19..body_len]);
     let recorded = u32::from_le_bytes(buffer[body_len..].try_into().unwrap());
     if crc.finalize() != recorded {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "event checksum mismatch",
-        ));
+        return Err(FrameError::Checksum);
     }
     Ok(())
 }
@@ -1462,6 +1683,70 @@ fn remove_ranges(buffer: &mut Vec<u8>, base: usize, ranges: &[std::ops::Range<us
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn structured_parser_errors_keep_their_display_strings() {
+        // R45: the structured variants carry the offset (and size/limit) as
+        // fields while their Display strings stay identical to the messages
+        // the paths emitted before the variants existed.
+        assert_eq!(
+            ParserError::Checksum { offset: 125 }.to_string(),
+            "binlog error at offset 125: event checksum mismatch"
+        );
+        assert_eq!(
+            ParserError::Truncated { offset: 4 }.to_string(),
+            "binlog error at offset 4: failed to fill whole buffer"
+        );
+        assert_eq!(
+            ParserError::OversizedEvent {
+                offset: 31,
+                size: 0,
+                limit: MAX_EVENT_SIZE
+            }
+            .to_string(),
+            "binlog error at offset 31: invalid or oversized event"
+        );
+        assert_eq!(
+            FrameError::Checksum.into_parser_error(125).to_string(),
+            ParserError::Checksum { offset: 125 }.to_string()
+        );
+        assert_eq!(
+            truncated_or_io(io::Error::new(io::ErrorKind::UnexpectedEof, "ignored"))
+                .into_parser_error(4)
+                .to_string(),
+            ParserError::Truncated { offset: 4 }.to_string()
+        );
+        // A non-EOF failure while filling the buffer stays a plain I/O error.
+        let interrupted = io::Error::new(io::ErrorKind::Interrupted, "retry");
+        assert!(matches!(truncated_or_io(interrupted), FrameError::Io(_)));
+    }
+
+    #[test]
+    fn intvar_and_incident_type_names_are_pinned() {
+        // R51: the intvar and incident type names are pinned constants, not
+        // the library's Debug rendering, so a library rename cannot change
+        // the output.
+        assert_eq!(
+            intvar_type_name(IntvarEventType::INVALID_INT_EVENT),
+            "INVALID_INT_EVENT"
+        );
+        assert_eq!(
+            intvar_type_name(IntvarEventType::LAST_INSERT_ID_EVENT),
+            "LAST_INSERT_ID_EVENT"
+        );
+        assert_eq!(
+            intvar_type_name(IntvarEventType::INSERT_ID_EVENT),
+            "INSERT_ID_EVENT"
+        );
+        assert_eq!(
+            incident_type_name(IncidentType::INCIDENT_NONE),
+            "INCIDENT_NONE"
+        );
+        assert_eq!(
+            incident_type_name(IncidentType::INCIDENT_LOST_EVENTS),
+            "INCIDENT_LOST_EVENTS"
+        );
+    }
 
     #[test]
     fn server_version_stops_at_first_nul() {

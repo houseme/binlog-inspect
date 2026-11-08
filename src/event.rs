@@ -7,11 +7,14 @@ use serde::{Deserialize, Serialize};
 /// Canonical event type; the single source of truth for event naming.
 ///
 /// The JSON output renders the snake_case variant name, which matches the
-/// historical string values byte for byte.
+/// historical string values byte for byte. This enum is `#[non_exhaustive]`
+/// (R45): downstream matches require a wildcard arm, so new event types can
+/// be added without a semver-major release.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "cli", derive(clap::ValueEnum))]
 #[serde(rename_all = "snake_case")]
 #[cfg_attr(feature = "cli", value(rename_all = "snake_case"))]
+#[non_exhaustive]
 pub enum EventType {
     /// Layout description for the rest of the binlog file.
     FormatDescription,
@@ -177,8 +180,13 @@ pub struct ParsedEvent {
 }
 
 /// Event-specific content.
+///
+/// This enum is `#[non_exhaustive]` (R45): downstream matches require a
+/// wildcard arm, so new payload kinds can be added without a semver-major
+/// release.
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum EventPayload {
     /// Format description.
     FormatDescription {
@@ -282,8 +290,9 @@ pub enum EventPayload {
     },
     /// Statement-time integer variable assignment.
     Intvar {
-        /// Variable kind, using the library's stable constant names
-        /// (`INVALID_INT_EVENT`, `LAST_INSERT_ID_EVENT`, `INSERT_ID_EVENT`).
+        /// Variable kind: the pinned canonical MySQL constant name
+        /// (`INVALID_INT_EVENT`, `LAST_INSERT_ID_EVENT`, `INSERT_ID_EVENT`),
+        /// independent of the underlying library's Debug rendering.
         var_type: String,
         /// Assigned value.
         value: u64,
@@ -347,8 +356,12 @@ pub struct ColumnValue {
 ///
 /// When deserializing, [`CellValue::Bytes`] expects the lowercase hexadecimal
 /// encoding produced by serialization; no character decoding is performed.
+/// This enum is `#[non_exhaustive]` (R45): downstream matches require a
+/// wildcard arm, so new value kinds can be added without a semver-major
+/// release.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "value", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum CellValue {
     /// Column omitted from this image.
     Absent,
@@ -427,8 +440,12 @@ pub struct JsonDiffRecord {
 }
 
 /// Signedness carried by the table map, or unknown when metadata was omitted.
+///
+/// This enum is `#[non_exhaustive]` (R45): downstream matches require a
+/// wildcard arm, so new states can be added without a semver-major release.
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum Signedness {
     /// A signed numeric column.
     Signed,
