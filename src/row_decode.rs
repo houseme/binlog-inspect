@@ -297,14 +297,12 @@ fn validate_packed_decimal_groups(precision: u8, scale: u8, packed: &[u8]) -> Re
     }
     // The writer flips the high bit of the first packed byte; undo it before
     // deriving the sign mask (the library reads it the same way).
-    let mut bytes = packed.to_vec();
-    if let Some(first) = bytes.first_mut() {
-        *first ^= 0x80;
-    }
-    let mask = if bytes.first().copied().unwrap_or(0) & 0x80 == 0 {
-        0i32
-    } else {
-        -1i32
+    // The writer flips the high bit of the first packed byte; treat it as
+    // flipped without copying the value (the library reads it the same way).
+    let first_flipped = packed.first().map(|byte| byte ^ 0x80);
+    let mask = match first_flipped {
+        Some(byte) if byte & 0x80 != 0 => -1i32,
+        _ => 0i32,
     };
     let intg = usize::from(precision) - usize::from(scale);
     // (digit count per group, group count): a partial-width prefix group of
@@ -326,28 +324,40 @@ fn validate_packed_decimal_groups(precision: u8, scale: u8, packed: &[u8]) -> Re
     for (digits, count) in groups {
         let width = DIG_TO_BYTES[digits];
         for _ in 0..count {
-            let raw = bytes
-                .get(offset..offset + width)
-                .ok_or_else(|| LENGTH.to_owned())?;
-            offset += width;
+            if offset + width > packed.len() {
+                return Err(LENGTH.to_owned());
+            }
+            // Byte accessor applying the first byte's sign flip in place, so
+            // the walk never copies the packed value. The group is read at
+            // `base` before the cursor advances past it.
+            let base = offset;
+            let at = |index: usize| -> u8 {
+                if index == 0 {
+                    first_flipped.unwrap_or(0)
+                } else {
+                    packed[index]
+                }
+            };
             // Sign-extend the written group (the writer stored
             // `digit ^ mask` in `width` bytes) and re-apply the mask: the
             // result is the non-negative digit value for valid input.
             let widened = match width {
-                1 => i32::from(raw[0] as i8),
-                2 => i32::from(i16::from_be_bytes([raw[0], raw[1]])),
+                1 => i32::from(at(base) as i8),
+                2 => i32::from(i16::from_be_bytes([at(base), at(base + 1)])),
                 3 => {
-                    let sign_extend = raw[0] & 0x80 != 0;
-                    let mut value =
-                        i32::from(raw[2]) | (i32::from(raw[1]) << 8) | (i32::from(raw[0]) << 16);
+                    let sign_extend = at(base) & 0x80 != 0;
+                    let mut value = i32::from(at(base + 2))
+                        | (i32::from(at(base + 1)) << 8)
+                        | (i32::from(at(base)) << 16);
                     if sign_extend {
                         value |= !0 << 24;
                     }
                     value
                 }
-                4 => i32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]),
+                4 => i32::from_be_bytes([at(base), at(base + 1), at(base + 2), at(base + 3)]),
                 _ => 0,
             } ^ mask;
+            offset += width;
             // `digits` is at most 9, so 10^digits always fits an i32.
             let limit = 10i32.pow(digits as u32);
             if widened < 0 || widened >= limit {
@@ -355,7 +365,7 @@ fn validate_packed_decimal_groups(precision: u8, scale: u8, packed: &[u8]) -> Re
             }
         }
     }
-    if offset != bytes.len() {
+    if offset != packed.len() {
         return Err(LENGTH.to_owned());
     }
     Ok(())

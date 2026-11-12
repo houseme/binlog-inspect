@@ -101,7 +101,7 @@ Status markers use `done` for implemented and verified work, `partial` for a del
 - **R41 [done W4/W5] V1 row-event labeling consistency.**
   Finding A3. Codes 23–25 (`WRITE/UPDATE/DELETE_ROWS_EVENT_V1`, MySQL 5.5 era) are decoded as full row payloads by the library but labeled `EventType::Unknown` — `event_type=unknown` with `payload.kind=rows`. The pre-GA codes are 20–22 (which stay `Unknown{raw_len}`); correct the "pre-GA" naming wherever it appears. Map 23–25 onto `WriteRows`/`UpdateRows`/`DeleteRows`.
   Acceptance: a code-23 fixture emits `event_type=write_rows` with a decoded row payload; `--events write_rows` selects it; DESIGN/USAGE no longer call 23–25 pre-GA.
-- **R42 [implemented W4; performance acceptance pending] Hot-path performance pass.**
+- **R42 [done W4/W6] Hot-path performance pass** (the acceptance record landed in W6).
   Findings B12/B13/B14. `signedness()` re-serializes the whole table map for every row event — cache it per table id (invalidate on re-registration; correctness first, benchmarks optional). `apply_pair` matches pending JSON cells against before columns with `Vec::find` (O(columns²) on hostile input) — both images are in table-column order, so a linear merge suffices. `Stats::record` allocates `format!("{db}.{t}")` per row event — reuse a scratch String.
   Acceptance: all existing tests pass unchanged; a micro-benchmark or before/after timing shows no regression; behavior (JSON output) is byte-identical.
 - **R43 [done W4/W5] CI and packaging hardening.**
@@ -145,9 +145,9 @@ From the 2026-11-09 two-expert re-review (engineering + documentation; the engin
 - **R46a and R47a** are the independently implemented W5 library and test deliveries. Their remaining work is recorded separately above.
 - **R49 [done W5] Row iterator progress**. The deterministic mutation corpus reproduced an unbounded loop when a nonempty ordinary row body selected no columns. The parser now rejects that shape for V1/V2 writes, updates and deletes, while accepting empty row bodies, one-sided updates and the distinct partial-update value-options encoding.
 - **Column compatibility**. Raw `VAR_STRING` and `TYPED_ARRAY` table-map columns return an explicit `Unsupported` error because the current dependency exposes inconsistent metadata to its row decoder. Typed arrays are a legitimate server type whose support requires a dedicated decoder fix.
-- **R50 [backlog] Column metadata value constraints**. The W5 guards validate required byte spans. Precision/scale, fractional-second precision and other value-range constraints still require focused reproduction and compatibility checks against the dependency and server formats.
-- **R48** delivered in the W5-2 batch above: the round-2 reviewer reproduced the amplification (221 bytes → 8,388,607 nodes; ~331 wire bytes demanding ~275 GB) and the node budget now enforces the bound. A wire-proportional per-event budget remains a possible future refinement — the shipped budget is per decoded value, so one rows event with thousands of hostile JSON columns still allocates linearly with its wire size.
-- **R34 and R38** retain the MariaDB and workspace-split backlog. R42 still needs a reproducible performance acceptance record. The local CSV microbenchmarks from the source review showed baseline drift, so they establish no stable speedup percentage.
+- **R50** delivered in the W6 batch above (both dependency-abort paths reproduced, guarded, and pinned with the reviewer's fixtures).
+- **R48** delivered in the W5-2 batch above: the round-2 reviewer reproduced the amplification (221 bytes → 8,388,607 nodes; ~331 wire bytes demanding ~275 GB) and the node budget now enforces the bound. The W6 batch added the wire-proportional per-event shared budget (`min(16 × event size, 4,000,000)` nodes), closing the linear-allocation residual.
+- **R34 and R38** retain the MariaDB and workspace-split backlog. The R42 acceptance record landed in the W6 batch (EXECUTION.md), replacing the baseline-drifting CSV microbenchmarks.
 
 ## Contract: API Specification for the First Parallel Implementation Batch
 
