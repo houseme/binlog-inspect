@@ -924,18 +924,21 @@ fn aliased_jsonb_bomb(depth: usize) -> Vec<u8> {
 }
 
 /// The same aliased shape as the wire-properties corpus, through a JSON
-/// column end to end: the rows event fails with the node-budget error at its
-/// offset instead of amplifying into gigabytes (R48).
+/// column end to end: the rows event fails with a node-budget error at its
+/// offset instead of amplifying into gigabytes (R48). The 8.4M-node bomb
+/// exceeds both budgets; with this event's wire size the shared per-event
+/// budget (R48-refinement) is the tighter one and stops the conversion
+/// first, so the message names the per-event limit.
 #[test]
 fn aliased_jsonb_bomb_through_a_json_column_fails_at_its_offset() {
+    let rows = write_rows(1, 7, &aliased_jsonb_bomb(22));
     let rows_offset = 4 + format_description().len() + table_map(1, false, false).len();
+    // write_rows body: table id, flags, extra-data length, column count,
+    // bitmap, null bitmap, LONG value, and the length-prefixed JSON value.
+    let event_size = 19 + (rows.len() - 19 - 4) + 4;
+    let expected_budget = (16 * event_size).min(4_000_000);
     let mut parser = BinlogParser::open(
-        binlog(&[
-            format_description(),
-            table_map(1, false, false),
-            write_rows(1, 7, &aliased_jsonb_bomb(22)),
-        ])
-        .path(),
+        binlog(&[format_description(), table_map(1, false, false), rows]).path(),
     )
     .unwrap();
     let mut events = parser.events();
@@ -944,7 +947,9 @@ fn aliased_jsonb_bomb_through_a_json_column_fails_at_its_offset() {
     let err = events.next().unwrap().unwrap_err();
     let message = err.to_string();
     assert!(
-        message.contains("jsonb decoding exceeds the node budget of 1000000 nodes"),
+        message.contains(&format!(
+            "jsonb decoding in this event exceeds the per-event node budget of {expected_budget} nodes"
+        )),
         "{message}"
     );
     assert!(

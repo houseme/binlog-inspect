@@ -21,6 +21,9 @@ use std::io::{self, Cursor, Read};
 
 const SEED: u64 = 0x5247_3437_6269_6e6c;
 const EVENT_CAP: u32 = 4096;
+/// Event cap for the large legitimate and bomb fixtures of the R50/R48
+/// refinement acceptance, which exceed the mutation-corpus cap above.
+const LARGE_EVENT_CAP: u32 = 1 << 16;
 const CASES_PER_FAMILY: usize = 24;
 const FAMILIES: [&str; 4] = [
     "previous_gtids",
@@ -67,8 +70,13 @@ fn crc32(bytes: &[u8]) -> u32 {
 }
 
 fn encode_event(event: &WireEvent, checksum: bool) -> Vec<u8> {
+    encode_event_within(event, checksum, EVENT_CAP)
+}
+
+/// The same framing with a larger cap, for the large acceptance fixtures.
+fn encode_event_within(event: &WireEvent, checksum: bool, cap: u32) -> Vec<u8> {
     let size = 19 + event.body.len() + usize::from(checksum) * 4;
-    assert!(size <= EVENT_CAP as usize);
+    assert!(size <= cap as usize);
     let mut bytes = Vec::with_capacity(size);
     bytes.extend(123u32.to_le_bytes());
     bytes.push(event.code);
@@ -100,6 +108,29 @@ fn binlog(events: &[WireEvent]) -> Vec<u8> {
     ));
     for event in events {
         bytes.extend(encode_event(event, true));
+    }
+    bytes
+}
+
+/// The same framing with the large per-event cap of the acceptance fixtures.
+fn binlog_large(events: &[WireEvent]) -> Vec<u8> {
+    let mut bytes = b"\xfebin".to_vec();
+    let mut description = vec![0; 57];
+    description[..2].copy_from_slice(&4u16.to_le_bytes());
+    description[2..8].copy_from_slice(b"8.0.30");
+    description[56] = 19;
+    description.extend([0; 40]);
+    description.push(1); // CRC32
+    bytes.extend(encode_event_within(
+        &WireEvent {
+            code: 15,
+            body: description,
+        },
+        true,
+        LARGE_EVENT_CAP,
+    ));
+    for event in events {
+        bytes.extend(encode_event_within(event, true, LARGE_EVENT_CAP));
     }
     bytes
 }
@@ -277,7 +308,11 @@ struct Outcome {
 }
 
 fn check_event(event: &ParsedEvent) {
-    assert!((19..=EVENT_CAP).contains(&event.event_size));
+    check_event_within(event, EVENT_CAP);
+}
+
+fn check_event_within(event: &ParsedEvent, cap: u32) {
+    assert!((19..=cap).contains(&event.event_size));
     let json = serde_json::to_vec(event).unwrap();
     let decoded: ParsedEvent = serde_json::from_slice(&json).unwrap();
     assert_eq!(&decoded, event);
@@ -292,13 +327,19 @@ fn check_event(event: &ParsedEvent) {
 }
 
 fn parse(bytes: &[u8], chunk: usize, context: &str) -> Outcome {
+    parse_with_cap(bytes, chunk, EVENT_CAP, context)
+}
+
+/// The same harness with a larger per-event cap, for the acceptance fixtures
+/// whose wire size exceeds [`EVENT_CAP`].
+fn parse_with_cap(bytes: &[u8], chunk: usize, cap: u32, context: &str) -> Outcome {
     std::panic::catch_unwind(|| {
         let reader = ShortReader {
             input: Cursor::new(bytes),
             chunk,
         };
         let mut parser = match BinlogParser::from_reader(reader) {
-            Ok(parser) => parser.with_max_event_size(EVENT_CAP),
+            Ok(parser) => parser.with_max_event_size(cap),
             Err(error) => {
                 return Outcome {
                     events: Vec::new(),
@@ -317,7 +358,7 @@ fn parse(bytes: &[u8], chunk: usize, context: &str) -> Outcome {
                     assert_eq!(event.offset, offset);
                     offset += u64::from(event.event_size);
                     assert!(offset <= bytes.len() as u64);
-                    check_event(&event);
+                    check_event_within(&event, cap);
                     outcome.events.push(event);
                     assert!(outcome.events.len() <= bytes.len() / 19);
                 }
@@ -491,8 +532,11 @@ fn format_description_size() -> u32 {
 /// The 221-byte aliased-jsonb reproduction of the R48 amplification: 22
 /// chained small-array containers, both entries of each pointing at the same
 /// child, used to decode into 2^23 - 1 = 8,388,607 serde nodes. The decoded
-/// node budget turns the amplification into a clean error at the rows event
-/// instead of an allocation runaway.
+/// node budgets turn the amplification into a clean error at the rows event
+/// instead of an allocation runaway. For this event's wire size the shared
+/// per-event budget (R48-refinement) is the tighter of the two and stops the
+/// conversion first; the per-value budget's message is pinned by the
+/// `row_decode` unit tests, which run it at the 4M per-event maximum.
 #[test]
 fn aliased_jsonb_bomb_is_rejected_by_the_node_budget() {
     let bomb = aliased_jsonb_bomb(22);
@@ -503,6 +547,8 @@ fn aliased_jsonb_bomb_is_rejected_by_the_node_budget() {
     let rows = row_event(&[value]);
     let bytes = binlog(&[tme.clone(), rows.clone()]);
     let rows_offset = 4 + format_description_size() + (19 + tme.body.len() + 4) as u32;
+    let event_size = 19 + rows.body.len() + 4;
+    let expected_budget = (16 * event_size).min(4_000_000);
     let context = "aliased-jsonb-bomb";
     let outcome = parse(&bytes, bytes.len(), context);
     assert_eq!(
@@ -515,7 +561,9 @@ fn aliased_jsonb_bomb_is_rejected_by_the_node_budget() {
         .clone()
         .unwrap_or_else(|| panic!("{context}: the bomb must fail the rows event"));
     assert!(
-        error.contains("jsonb decoding exceeds the node budget of 1000000 nodes"),
+        error.contains(&format!(
+            "jsonb decoding in this event exceeds the per-event node budget of {expected_budget} nodes"
+        )),
         "{error}"
     );
     assert!(
@@ -828,6 +876,141 @@ fn trailing_bytes_after_row_data_are_rejected() {
     assert_eq!(
         cells,
         vec![CellValue::Int(1), CellValue::Int(2)],
+        "{context}"
+    );
+}
+
+/// R48-refinement acceptance: a legitimate rows event over 1200 JSON
+/// columns of small documents still decodes — the shared per-event budget
+/// (`min(16 × event_size, 4_000_000)` nodes) leaves a wide margin over the
+/// ~0.25 nodes per wire byte that legitimate jsonb costs, so no legitimate
+/// density is rejected.
+#[test]
+fn legitimate_multi_column_json_rows_decode_within_the_budget() {
+    const COLUMNS: usize = 1200;
+    // Binary jsonb for {"a": 1}: small object, one member; offsets count
+    // from the element-count field.
+    let doc = [
+        0x00, 0x01, 0x00, 0x0c, 0x00, // small object, one member, 12 bytes
+        0x0b, 0x00, 0x01, 0x00, // key entry: "a" at offset 11, length 1
+        0x05, 0x01, 0x00, // value entry: int16 1 (inlined)
+        b'a', // key bytes at offset 11
+    ];
+    let mut map_body = vec![5, 0, 0, 0, 0, 0, 0, 0]; // Table id 5 and flags.
+    map_body.extend_from_slice(b"\x02db\0\x01t\0");
+    map_body.push(0xfc); // 1200 columns, length-encoded
+    map_body.extend((COLUMNS as u16).to_le_bytes());
+    map_body.extend([0xf5; COLUMNS]); // JSON
+    map_body.push(0xfc); // 1200 metadata bytes, length-encoded
+    map_body.extend((COLUMNS as u16).to_le_bytes());
+    map_body.extend([4; COLUMNS]); // JSON uses a four-byte length prefix
+    map_body.extend([0; COLUMNS.div_ceil(8)]); // NULL bitmap
+    let map = WireEvent {
+        code: 19,
+        body: map_body,
+    };
+
+    let mut rows_body = vec![5, 0, 0, 0, 0, 0, 0, 0]; // Table id 5 and flags.
+    rows_body.extend([2, 0]); // Extra-data length (none).
+    rows_body.push(0xfc); // 1200 columns, length-encoded
+    rows_body.extend((COLUMNS as u16).to_le_bytes());
+    rows_body.extend([0xff; COLUMNS / 8]); // All 1200 columns present
+    rows_body.extend([0; COLUMNS.div_ceil(8)]); // None of them NULL
+    for _ in 0..COLUMNS {
+        rows_body.extend((doc.len() as u32).to_le_bytes());
+        rows_body.extend_from_slice(&doc);
+    }
+    let rows = WireEvent {
+        code: 30,
+        body: rows_body,
+    };
+    let bytes = binlog_large(&[map, rows]);
+    let context = "legit-1200-json-columns";
+    let outcome = parse_with_cap(&bytes, bytes.len(), LARGE_EVENT_CAP, context);
+    assert!(
+        outcome.error.is_none(),
+        "{context}: the legitimate event must decode: {outcome:?}"
+    );
+    // Every column of the single row is a JSON cell; collect them all.
+    let mut cells = Vec::new();
+    for event in &outcome.events {
+        if let EventPayload::Rows { changes, .. } = &event.payload {
+            for change in changes {
+                let after = change.after.as_ref().unwrap();
+                for column in &after.columns {
+                    cells.push(column.value.clone());
+                }
+            }
+        }
+    }
+    assert_eq!(cells.len(), COLUMNS, "{context}: every JSON column decodes");
+    assert!(
+        cells
+            .iter()
+            .all(|cell| cell == &CellValue::Json(serde_json::json!({"a": 1}))),
+        "{context}: every column renders the same document"
+    );
+}
+
+/// R48-refinement acceptance: 100 individually budget-clean hostile JSON
+/// columns in one rows event (100 × 181 wire bytes, each bomb decoding to
+/// 2^19 - 1 = 524,287 nodes within the per-value budget of one million) trip
+/// the shared per-event budget instead of allocating linearly with the wire
+/// size.
+#[test]
+fn one_hundred_json_bombs_trip_the_per_event_budget() {
+    const BOMBS: usize = 100;
+    let bomb = aliased_jsonb_bomb(18);
+    assert_eq!(bomb.len(), 181);
+    let mut body = vec![5, 0, 0, 0, 0, 0, 0, 0]; // Table id 5 and flags.
+    body.extend([2, 0]); // Extra-data length (none).
+    body.push(BOMBS as u8); // Column count.
+    let mut bitmap = vec![0xffu8; BOMBS / 8];
+    bitmap.push(0x0f); // 100 present bits over 13 bytes
+    body.extend_from_slice(&bitmap);
+    body.extend([0; BOMBS.div_ceil(8)]); // None of them NULL
+    for _ in 0..BOMBS {
+        body.extend((bomb.len() as u32).to_le_bytes());
+        body.extend_from_slice(&bomb);
+    }
+    let rows = WireEvent { code: 30, body };
+    // The table map declares the same 100 JSON columns; 100 is below the
+    // length-encoded threshold for both counts.
+    let mut map_body = vec![5, 0, 0, 0, 0, 0, 0, 0]; // Table id 5 and flags.
+    map_body.extend_from_slice(b"\x02db\0\x01t\0");
+    map_body.push(BOMBS as u8); // Column count.
+    map_body.extend([0xf5; BOMBS]); // JSON
+    map_body.push(BOMBS as u8); // Metadata length.
+    map_body.extend([4; BOMBS]); // JSON uses a four-byte length prefix
+    map_body.extend([0; BOMBS.div_ceil(8)]); // NULL bitmap
+    let map = WireEvent {
+        code: 19,
+        body: map_body,
+    };
+    let bytes = binlog_large(&[map, rows]);
+    let event_size = (19 + 37 + BOMBS * (4 + 181) + 4) as u32;
+    let expected_budget = (16 * event_size as usize).min(4_000_000);
+    let context = "100-json-bombs";
+    let outcome = parse_with_cap(&bytes, bytes.len(), LARGE_EVENT_CAP, context);
+    assert_eq!(
+        outcome.events.len(),
+        2,
+        "{context}: the format description and table map still decode: {outcome:?}"
+    );
+    let error = outcome
+        .error
+        .clone()
+        .unwrap_or_else(|| panic!("{context}: the rows event must fail"));
+    assert!(
+        error.contains(&format!(
+            "jsonb decoding in this event exceeds the per-event node budget of {expected_budget} nodes"
+        )),
+        "{error}"
+    );
+    // The same outcome under chunked reads.
+    assert_eq!(
+        parse_with_cap(&bytes, 64, LARGE_EVENT_CAP, context),
+        outcome,
         "{context}"
     );
 }

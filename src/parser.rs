@@ -830,6 +830,11 @@ impl<R: Read> BinlogParser<R> {
                             map.json_column_count(),
                             map,
                         )?;
+                        // R48-refinement: every jsonb value decoded for this
+                        // event shares one node counter bounded by the
+                        // event's wire size.
+                        let mut event_budget =
+                            crate::row_decode::EventNodeBudget::new(event.header().event_size());
                         let mut before = Vec::new();
                         let mut after = Vec::new();
                         for row in e.rows(map) {
@@ -840,6 +845,7 @@ impl<R: Read> BinlogParser<R> {
                                 before_bitmap.as_deref(),
                                 after_bitmap.as_deref(),
                                 &signedness,
+                                &mut event_budget,
                             )?;
                             before.push(before_image);
                             after.push(after_image);
@@ -942,6 +948,11 @@ impl<R: Read> BinlogParser<R> {
                         map.json_column_count(),
                         map,
                     )?;
+                    // R48-refinement: every jsonb value decoded for this
+                    // event shares one node counter bounded by the event's
+                    // wire size.
+                    let mut event_budget =
+                        crate::row_decode::EventNodeBudget::new(event.header().event_size());
                     let mut changes = Vec::new();
                     for row in e.rows(map) {
                         let (before_row, after_row) = row?;
@@ -954,6 +965,7 @@ impl<R: Read> BinlogParser<R> {
                             before_bitmap.as_deref(),
                             after_bitmap.as_deref(),
                             &signedness,
+                            &mut event_budget,
                         )?;
                         changes.push(RowChange { before, after });
                     }

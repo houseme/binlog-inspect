@@ -62,7 +62,73 @@ const MAX_JSONB_DEPTH: usize = 100;
 /// monotone across the whole conversion, so aliasing cannot reset it.
 /// Exceeding the budget returns a clean `InvalidData` error instead of
 /// allocating towards an allocator abort (R48).
+///
+/// Two budgets apply to every conversion, and both stay in force (R48 and
+/// the R48-refinement):
+///
+/// - The per-value budget of [`DEFAULT_JSONB_NODE_BUDGET`] nodes bounds one
+///   decoded value — one JSON cell of a row image, or the whole diff
+///   sequence of one partial-JSON cell. It caps a single huge legitimate
+///   document independently of the event carrying it.
+/// - The per-event budget of [`EventNodeBudget`] is shared by every value of
+///   one rows event (all rows, both images of an updated row): legitimate
+///   jsonb is at most ~0.25 nodes per wire byte, so
+///   `min(16 × event_size, 4_000_000)` leaves a 64× density headroom while
+///   bounding a hostile event's decoded tree at ~128 MB. It closes the gap
+///   the per-value budget leaves open: thousands of individually
+///   budget-clean hostile columns in one event used to allocate linearly
+///   with the wire size.
 const DEFAULT_JSONB_NODE_BUDGET: usize = 1_000_000;
+
+/// Absolute cap on the per-event jsonb node budget (R48-refinement).
+///
+/// [`EventNodeBudget`] scales the shared budget with the event's wire size,
+/// so the absolute cap bounds the worst-case decoded tree of one event at
+/// roughly 4M nodes (~128 MB of serde values) even for the largest event the
+/// framing accepts.
+const MAX_PER_EVENT_JSONB_NODES: usize = 4_000_000;
+
+/// Wire-byte density factor of the per-event jsonb node budget
+/// (R48-refinement): legitimate jsonb decodes to at most ~0.25 nodes per
+/// wire byte, so 16 nodes per byte leaves a 64× headroom before
+/// [`EventNodeBudget`] trips.
+const PER_EVENT_NODE_DENSITY_FACTOR: u64 = 16;
+
+/// The per-event shared jsonb node counter (R48-refinement).
+///
+/// One instance is created per rows event and threaded through every value
+/// conversion of that event: all rows, and the before/after images of each
+/// updated row, charge the same monotone counter. Aliasing cannot reset it,
+/// and a hostile multi-column event trips the shared budget instead of
+/// allocating once per column within each column's per-value budget.
+pub(crate) struct EventNodeBudget {
+    /// Nodes decoded so far in this event.
+    nodes: usize,
+    /// `min(PER_EVENT_NODE_DENSITY_FACTOR × event_size,
+    /// MAX_PER_EVENT_JSONB_NODES)`.
+    limit: usize,
+}
+
+impl EventNodeBudget {
+    /// Creates the shared budget for one event of `event_size` wire bytes
+    /// (the framed event size, header and checksum included).
+    pub(crate) fn new(event_size: u32) -> Self {
+        let limit =
+            usize::try_from(u64::from(event_size).saturating_mul(PER_EVENT_NODE_DENSITY_FACTOR))
+                .unwrap_or(usize::MAX)
+                .min(MAX_PER_EVENT_JSONB_NODES);
+        Self { nodes: 0, limit }
+    }
+
+    /// Charges one decoded node against the shared budget.
+    fn charge(&mut self) -> io::Result<()> {
+        self.nodes = self.nodes.saturating_add(1);
+        if self.nodes > self.limit {
+            return Err(jsonb_over_event_node_budget(self.limit));
+        }
+        Ok(())
+    }
+}
 
 /// Converts a library jsonb value into the serde_json model.
 ///
@@ -81,16 +147,20 @@ const DEFAULT_JSONB_NODE_BUDGET: usize = 1_000_000;
 /// conversion: every converted node charges one against it, and exceeding
 /// [`DEFAULT_JSONB_NODE_BUDGET`] returns `InvalidData`. Each value
 /// conversion entry point (the row-value path and the diff-value path) owns
-/// one counter and must never reset it mid-conversion.
+/// one counter and must never reset it mid-conversion. `event` is the
+/// per-event counter every entry point of one rows event shares
+/// (R48-refinement); both budgets apply to every node.
 fn jsonb_to_serde(
     value: &jsonb::Value<'_>,
     depth: usize,
     nodes: &mut usize,
+    event: &mut EventNodeBudget,
 ) -> io::Result<serde_json::Value> {
     *nodes += 1;
     if *nodes > DEFAULT_JSONB_NODE_BUDGET {
         return Err(jsonb_over_node_budget());
     }
+    event.charge()?;
     match value {
         jsonb::Value::SmallArray(container) => {
             if depth > MAX_JSONB_DEPTH {
@@ -99,7 +169,7 @@ fn jsonb_to_serde(
             // Untrusted count; the vector grows on demand.
             let mut items = Vec::with_capacity(container.element_count().min(4096) as usize);
             for item in container.iter() {
-                items.push(jsonb_to_serde(&item?, depth + 1, nodes)?);
+                items.push(jsonb_to_serde(&item?, depth + 1, nodes, event)?);
             }
             Ok(serde_json::Value::Array(items))
         }
@@ -110,7 +180,7 @@ fn jsonb_to_serde(
             // Untrusted count; the vector grows on demand.
             let mut items = Vec::with_capacity(container.element_count().min(4096) as usize);
             for item in container.iter() {
-                items.push(jsonb_to_serde(&item?, depth + 1, nodes)?);
+                items.push(jsonb_to_serde(&item?, depth + 1, nodes, event)?);
             }
             Ok(serde_json::Value::Array(items))
         }
@@ -123,7 +193,7 @@ fn jsonb_to_serde(
                 let (key, value) = entry?;
                 members.insert(
                     key.value().into_owned(),
-                    jsonb_to_serde(&value, depth + 1, nodes)?,
+                    jsonb_to_serde(&value, depth + 1, nodes, event)?,
                 );
             }
             Ok(serde_json::Value::Object(members))
@@ -137,7 +207,7 @@ fn jsonb_to_serde(
                 let (key, value) = entry?;
                 members.insert(
                     key.value().into_owned(),
-                    jsonb_to_serde(&value, depth + 1, nodes)?,
+                    jsonb_to_serde(&value, depth + 1, nodes, event)?,
                 );
             }
             Ok(serde_json::Value::Object(members))
@@ -308,10 +378,20 @@ fn jsonb_over_node_budget() -> io::Error {
     )
 }
 
+/// The rejection error for one event's shared jsonb decoding beyond the
+/// per-event budget (R48-refinement).
+fn jsonb_over_event_node_budget(limit: usize) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("jsonb decoding in this event exceeds the per-event node budget of {limit} nodes"),
+    )
+}
+
 pub(crate) fn decode_row(
     row: &BinlogRow,
     present: &[bool],
     signedness: &[Option<bool>],
+    event_budget: &mut EventNodeBudget,
 ) -> io::Result<RowImage> {
     let mut offset = 0;
     let mut columns = Vec::with_capacity(present.len());
@@ -369,16 +449,17 @@ pub(crate) fn decode_row(
                 },
             },
             BinlogValue::Jsonb(value) => {
-                // One node budget per value conversion entry point; a failure
-                // here aborts the row, so the counter never spans cells.
+                // The per-value counter is fresh per cell; the per-event
+                // counter is shared by every cell of the event
+                // (R48-refinement). A failure here aborts the row.
                 let mut nodes = 0usize;
-                CellValue::Json(jsonb_to_serde(value, 1, &mut nodes)?)
+                CellValue::Json(jsonb_to_serde(value, 1, &mut nodes, event_budget)?)
             }
             BinlogValue::JsonDiff(diffs) => {
                 // Without a paired before image (see [`decode_rows_pair`])
                 // there is nothing to apply the diffs to; they are preserved
                 // as a recorded loss instead of failing the whole image.
-                let (diffs, problem) = json_diff::parse_diffs(diffs);
+                let (diffs, problem) = json_diff::parse_diffs(diffs, event_budget);
                 CellValue::PartialJson {
                     diffs,
                     reason: problem
@@ -422,12 +503,17 @@ pub(crate) fn decode_row(
 /// the after cell becomes [`CellValue::Json`] with the full new document, on
 /// any failure it becomes [`CellValue::PartialJson`] with the preserved diffs
 /// and the reason. Images without diffs decode exactly like [`decode_row`].
+///
+/// Both images share the caller's per-event [`EventNodeBudget`]
+/// (R48-refinement), so an update row cannot double its jsonb allocation by
+/// decoding two images.
 pub(crate) fn decode_rows_pair(
     before_row: Option<&BinlogRow>,
     after_row: Option<&BinlogRow>,
     before_present: Option<&[bool]>,
     after_present: Option<&[bool]>,
     signedness: &[Option<bool>],
+    event_budget: &mut EventNodeBudget,
 ) -> io::Result<(Option<RowImage>, Option<RowImage>)> {
     let before = before_row
         .map(|row| {
@@ -437,6 +523,7 @@ pub(crate) fn decode_rows_pair(
                     io::Error::new(io::ErrorKind::InvalidData, "missing before bitmap")
                 })?,
                 signedness,
+                event_budget,
             )
         })
         .transpose()?;
@@ -448,6 +535,7 @@ pub(crate) fn decode_rows_pair(
                     io::Error::new(io::ErrorKind::InvalidData, "missing after bitmap")
                 })?,
                 signedness,
+                event_budget,
             )
         })
         .transpose()?;
@@ -1444,12 +1532,18 @@ mod json_diff {
     /// Converts the library's parsed diffs of one column into model records.
     ///
     /// A diff whose binary JSON value cannot be converted at all (invalid
-    /// UTF-8 in a string member, or nesting beyond the jsonb depth cap or the
-    /// node budget) yields `None` for its value and is reported in the
-    /// returned problem
-    /// note instead of failing the whole column; opaque values convert like
-    /// any other scalar (see [`super::jsonb_to_serde`]).
-    pub(super) fn parse_diffs(diffs: &[JsonDiff<'_>]) -> (Vec<JsonDiffRecord>, Option<String>) {
+    /// UTF-8 in a string member, or nesting beyond the jsonb depth cap or one
+    /// of the node budgets) yields `None` for its value and is reported in
+    /// the returned problem note instead of failing the whole column; opaque
+    /// values convert like any other scalar (see [`super::jsonb_to_serde`]).
+    ///
+    /// `event_budget` is the calling row event's shared per-event counter
+    /// (R48-refinement): the whole sequence charges it monotonically, like
+    /// any other value of the event.
+    pub(super) fn parse_diffs(
+        diffs: &[JsonDiff<'_>],
+        event_budget: &mut super::EventNodeBudget,
+    ) -> (Vec<JsonDiffRecord>, Option<String>) {
         let mut parsed = Vec::with_capacity(diffs.len());
         let mut problem = None;
         // The whole diff sequence shares one monotone per-value node budget
@@ -1464,7 +1558,7 @@ mod json_diff {
                 JsonDiffOperation::REMOVE => Operation::Remove,
             };
             let value = match diff.value() {
-                Some(jsonb) => match super::jsonb_to_serde(jsonb, 1, &mut nodes) {
+                Some(jsonb) => match super::jsonb_to_serde(jsonb, 1, &mut nodes, event_budget) {
                     Ok(value) => Some(value),
                     Err(error) => {
                         problem.get_or_insert_with(|| {
@@ -2049,6 +2143,14 @@ mod tests {
         JsonDiff::deserialize((), &mut buf).unwrap().into_owned()
     }
 
+    /// The maximum per-event budget (4M nodes), for the unit tests that
+    /// exercise the per-value budget in isolation: the aliased-bomb cases
+    /// decode up to 2^23 - 1 nodes, which only the per-value budget of one
+    /// million may stop here.
+    fn budget() -> EventNodeBudget {
+        EventNodeBudget::new(u32::MAX)
+    }
+
     fn json_column() -> Column {
         Column::new(ColumnType::MYSQL_TYPE_JSON).with_name(b"doc")
     }
@@ -2093,7 +2195,13 @@ mod tests {
     #[test]
     fn opaque_decimal_jsonb_renders_as_a_string_not_a_failure() {
         let mut nodes = 0usize;
-        let value = jsonb_to_serde(&jsonb(&opaque_decimal_jsonb()), 1, &mut nodes).unwrap();
+        let value = jsonb_to_serde(
+            &jsonb(&opaque_decimal_jsonb()),
+            1,
+            &mut nodes,
+            &mut budget(),
+        )
+        .unwrap();
         assert_eq!(value, serde_json::json!("12.5"));
     }
 
@@ -2107,14 +2215,14 @@ mod tests {
         out.extend_from_slice(&[1, 3]); // precision 1, scale 3 (scale > precision)
         dec.write_bin(&mut out).unwrap();
         let mut nodes = 0usize;
-        let error = jsonb_to_serde(&jsonb(&out), 1, &mut nodes).unwrap_err();
+        let error = jsonb_to_serde(&jsonb(&out), 1, &mut nodes, &mut budget()).unwrap_err();
         assert!(
             error.to_string().contains("scale exceeds precision"),
             "{error}"
         );
         // A truncated header (no precision/scale bytes at all) is the same.
         let truncated = vec![0x0f, 0xf6, 0];
-        let error = jsonb_to_serde(&jsonb(&truncated), 1, &mut nodes).unwrap_err();
+        let error = jsonb_to_serde(&jsonb(&truncated), 1, &mut nodes, &mut budget()).unwrap_err();
         assert!(
             error
                 .to_string()
@@ -2136,17 +2244,17 @@ mod tests {
         // 999999999 (0x3b9ac9ff with the first byte's high bit set on the
         // wire).
         let ok = vec![0x0f, 0xf6, 6, 9, 0, 0xbb, 0x9a, 0xc9, 0xff];
-        let value = jsonb_to_serde(&jsonb(&ok), 1, &mut nodes).unwrap();
+        let value = jsonb_to_serde(&jsonb(&ok), 1, &mut nodes, &mut budget()).unwrap();
         assert_eq!(value, serde_json::json!("999999999"));
         // Legitimate negative decimal: all group bytes inverted, then the
         // first byte's high bit flipped again on the wire.
         let neg = vec![0x0f, 0xf6, 6, 9, 0, 0x44, 0x65, 0x36, 0x00];
-        let value = jsonb_to_serde(&jsonb(&neg), 1, &mut nodes).unwrap();
+        let value = jsonb_to_serde(&jsonb(&neg), 1, &mut nodes, &mut budget()).unwrap();
         assert_eq!(value, serde_json::json!("-999999999"));
         // One over the limit in the same group: 10^9 with the high bit set
         // (0xba9aca00) is rejected.
         let over = vec![0x0f, 0xf6, 6, 9, 0, 0xc0, 0x00, 0x00, 0x00];
-        let error = jsonb_to_serde(&jsonb(&over), 1, &mut nodes).unwrap_err();
+        let error = jsonb_to_serde(&jsonb(&over), 1, &mut nodes, &mut budget()).unwrap_err();
         assert!(
             error.to_string().contains("digit group exceeds 9 digits"),
             "{error}"
@@ -2155,14 +2263,14 @@ mod tests {
         // digits, 3 bytes) with a group value whose scaling multiply
         // overflows i32 (first byte 0x83 = 0x03 with the sign bit set).
         let overflow = vec![0x0f, 0xf6, 5, 5, 5, 0x83, 0x46, 0xdc];
-        let error = jsonb_to_serde(&jsonb(&overflow), 1, &mut nodes).unwrap_err();
+        let error = jsonb_to_serde(&jsonb(&overflow), 1, &mut nodes, &mut budget()).unwrap_err();
         assert!(
             error.to_string().contains("digit group exceeds 5 digits"),
             "{error}"
         );
         // Packed length disagreeing with precision/scale is rejected too.
         let short = vec![0x0f, 0xf6, 4, 9, 0, 0xbb, 0x9a];
-        let error = jsonb_to_serde(&jsonb(&short), 1, &mut nodes).unwrap_err();
+        let error = jsonb_to_serde(&jsonb(&short), 1, &mut nodes, &mut budget()).unwrap_err();
         assert!(
             error
                 .to_string()
@@ -2247,12 +2355,15 @@ mod tests {
             ]);
         }
         let mut nodes = 0usize;
-        assert_eq!(jsonb_to_serde(&at_cap, 1, &mut nodes).unwrap(), expected);
+        assert_eq!(
+            jsonb_to_serde(&at_cap, 1, &mut nodes, &mut budget()).unwrap(),
+            expected
+        );
         // One level deeper is hostile input: a clean InvalidData error, not
         // a stack overflow.
         let over = jsonb(&deep_jsonb(MAX_JSONB_DEPTH + 1));
         let mut nodes = 0usize;
-        let err = jsonb_to_serde(&over, 1, &mut nodes).unwrap_err();
+        let err = jsonb_to_serde(&over, 1, &mut nodes, &mut budget()).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(err.to_string().contains("nesting depth"), "{}", err);
     }
@@ -2280,7 +2391,7 @@ mod tests {
     #[test]
     fn node_budget_counts_containers_and_their_children() {
         let mut nodes = 0usize;
-        jsonb_to_serde(&jsonb(JSONB_DOC), 1, &mut nodes).unwrap();
+        jsonb_to_serde(&jsonb(JSONB_DOC), 1, &mut nodes, &mut budget()).unwrap();
         // The root object, its two member values, and the array's two
         // elements.
         assert_eq!(nodes, 5);
@@ -2294,7 +2405,7 @@ mod tests {
         let bomb = aliased_jsonb_bomb(22);
         assert_eq!(bomb.len(), 221);
         let mut nodes = 0usize;
-        let err = jsonb_to_serde(&jsonb(&bomb), 1, &mut nodes).unwrap_err();
+        let err = jsonb_to_serde(&jsonb(&bomb), 1, &mut nodes, &mut budget()).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(
             err.to_string().contains("node budget of 1000000 nodes"),
@@ -2304,7 +2415,13 @@ mod tests {
         // An aliased document within the budget still converts, and the
         // counter reports the decoded node count exactly.
         let mut nodes = 0usize;
-        jsonb_to_serde(&jsonb(&aliased_jsonb_bomb(18)), 1, &mut nodes).unwrap();
+        jsonb_to_serde(
+            &jsonb(&aliased_jsonb_bomb(18)),
+            1,
+            &mut nodes,
+            &mut budget(),
+        )
+        .unwrap();
         assert_eq!(nodes, (1 << 19) - 1);
     }
 
@@ -2320,7 +2437,7 @@ mod tests {
         bomb_diff.extend_from_slice(&bomb);
         let leaf_diff = [0x01, 3, b'$', b'.', b'c', 3, 0x0c, 1, b'x']; // INSERT $.c = "x"
         let diffs = [diff(&bomb_diff), diff(&leaf_diff)];
-        let (parsed, problem) = json_diff::parse_diffs(&diffs);
+        let (parsed, problem) = json_diff::parse_diffs(&diffs, &mut budget());
         assert_eq!(parsed.len(), 2);
         assert_eq!(parsed[0].path, "$.b");
         assert_eq!(parsed[0].value, None);
@@ -2357,6 +2474,7 @@ mod tests {
             Some(&[true]),
             Some(&[true]),
             &[],
+            &mut budget(),
         )
         .unwrap();
         assert_eq!(
@@ -2391,6 +2509,7 @@ mod tests {
             Some(&[true]),
             Some(&[true]),
             &[],
+            &mut budget(),
         )
         .unwrap();
         assert_eq!(
@@ -2418,6 +2537,7 @@ mod tests {
             Some(&[true]),
             Some(&[true]),
             &[],
+            &mut budget(),
         )
         .unwrap();
         let CellValue::PartialJson { diffs, reason } = after.unwrap().columns[0].value.clone()
@@ -2446,6 +2566,7 @@ mod tests {
             Some(&[false]),
             Some(&[true]),
             &[],
+            &mut budget(),
         )
         .unwrap();
         let CellValue::PartialJson { reason, .. } = after.unwrap().columns[0].value.clone() else {
@@ -2458,7 +2579,8 @@ mod tests {
             vec![Some(BinlogValue::JsonDiff(diffs()))],
             vec![json_column()].into(),
         );
-        let (_, after) = decode_rows_pair(None, Some(&after), None, Some(&[true]), &[]).unwrap();
+        let (_, after) =
+            decode_rows_pair(None, Some(&after), None, Some(&[true]), &[], &mut budget()).unwrap();
         let CellValue::PartialJson { reason, .. } = after.unwrap().columns[0].value.clone() else {
             panic!("expected a partial JSON record");
         };
@@ -2479,6 +2601,7 @@ mod tests {
             Some(&[true]),
             Some(&[true]),
             &[],
+            &mut budget(),
         )
         .unwrap();
         let CellValue::PartialJson { reason, .. } = after.unwrap().columns[0].value.clone() else {
@@ -2493,7 +2616,7 @@ mod tests {
             vec![Some(BinlogValue::JsonDiff(vec![replace_b1_with_99()]))],
             vec![json_column()].into(),
         );
-        let image = decode_row(&row, &[true], &[]).unwrap();
+        let image = decode_row(&row, &[true], &[], &mut budget()).unwrap();
         let CellValue::PartialJson { diffs, reason } = image.columns[0].value.clone() else {
             panic!("expected a partial JSON record");
         };
@@ -2516,7 +2639,13 @@ mod tests {
             ],
             columns.into(),
         );
-        let image = decode_row(&row, &[false, true, true], &[None, None, None]).unwrap();
+        let image = decode_row(
+            &row,
+            &[false, true, true],
+            &[None, None, None],
+            &mut budget(),
+        )
+        .unwrap();
         let json = serde_json::to_value(image).unwrap();
         assert_eq!(json["columns"][0]["value"]["type"], "absent");
         assert_eq!(json["columns"][1]["value"]["type"], "null");
@@ -2532,7 +2661,7 @@ mod tests {
             vec![Some(BinlogValue::Value(Value::Int(4)))],
             vec![Column::new(ColumnType::MYSQL_TYPE_LONG)].into(),
         );
-        assert!(decode_row(&row, &[false], &[None]).is_err());
+        assert!(decode_row(&row, &[false], &[None], &mut budget()).is_err());
     }
     #[test]
     fn present_bits_must_cover_all_columns() {
