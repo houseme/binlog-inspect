@@ -40,8 +40,6 @@ Fourth and fifth batches, from the 2026-11-06 re-review and 2026-11-07/09 source
 - All third-party GitHub Actions are pinned by full commit SHA; `rustsec/audit-check` remains on its mutable v2 tag with an explanatory comment because its commit could not be resolved over the network (R43).
 - Documentation: the USAGE `--events` tables, the `EventType::PartialUpdateRows` rustdoc, and the library/limitation sections now describe the applied JSON-diff after image instead of the pre-R33 "not decoded" wording; the library section documents the full `EventFilter` (ranges, GTID allowlist) and the crates.io dependency form; stale language markers removed; the ROADMAP Contract section is annotated as the historical batch-1 spec.
 
-### Changed
-
 - CSV formatting reuses escaped strings for their enclosing quotes and escapes database/table names once per event, reducing temporary allocations for row output.
 - **Packaging**: the `remote` feature now implies `cli` (so `--no-default-features --features remote` builds the binary); the unused `clap` dev-dependency is gone; the published `.crate` excludes internal engineering documents and development material (`AGENT.md`, `EXECUTION.md`, `ROADMAP.md`, `docs/`, `tests/`, `.github/`, `fuzz/`, `.gitignore`, `deny.toml`).
 - Performance: per-table signedness metadata no longer re-serializes the table map for every row event; JSON-diff cell matching is linear in the column count; `--stats` reuses a scratch string for `by_table` keys. JSON output is byte-identical.

@@ -23,7 +23,7 @@
 
 ## 安装与快速开始
 
-从 crates.io 安装（需要 Rust 1.88 或更新版本——MSRV 已验证并由 CI 强制执行；项目使用 Rust 2024 edition）：
+从 crates.io 安装（需要 Rust 1.88 或更新版本——MSRV 已验证并由 CI 强制执行；项目使用 Rust 2024 edition）。注意：已发布的 0.4.0 早于下文记载的部分特性；0.5.0 批次在树内、尚未发布：
 
 ```sh
 cargo install binlog-inspect --locked

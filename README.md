@@ -23,7 +23,7 @@ English | [简体中文](README.zh-CN.md)
 
 ## Install and quick start
 
-Install from crates.io (requires Rust 1.88 or newer — the MSRV is verified and CI-enforced; the project uses the Rust 2024 edition):
+Install from crates.io (requires Rust 1.88 or newer — the MSRV is verified and CI-enforced; the project uses the Rust 2024 edition). Note: the published 0.4.0 release predates the features documented below; the 0.5.0 batch is in-tree and not yet published:
 
 ```sh
 cargo install binlog-inspect --locked

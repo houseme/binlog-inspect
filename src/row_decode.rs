@@ -453,12 +453,13 @@ fn apply_pair(before: &RowImage, after: &mut RowImage) {
         let CellValue::PartialJson { diffs, .. } = &after_cell.value else {
             continue;
         };
-        let diffs = diffs.clone();
         // A gap (no before cell at this index) keeps the loss-marked value,
-        // matching the previous search-based behavior.
+        // matching the previous search-based behavior; the clone happens only
+        // once a before counterpart exists.
         let Some(before_cell) = candidate.filter(|cell| cell.index == after_cell.index) else {
             continue;
         };
+        let diffs = diffs.clone();
         let replacement = match &before_cell.value {
             CellValue::Json(before_value) => {
                 match json_diff::apply_json_diffs(before_value.clone(), &diffs) {

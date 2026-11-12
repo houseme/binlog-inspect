@@ -35,9 +35,10 @@ abort, OOM, or timeout.
   `decimal_bin_size` when a NEWDECIMAL opaque declares `scale > precision`
   (cargo-fuzz builds with overflow checks). The harness reaches that decoder
   through `jsonb_to_serde`'s opaque rendering of hostile NEWDECIMAL members;
-  pre-validation does not yet cover the decimal metadata bytes. Expect the
-  scheduled CI job to keep reporting this crash until it is fixed; the job is
-  non-gating on purpose.
+  pre-validation did not cover the packed decimal digits. `validate_packed_decimal`
+  now hand-validates the full group layout (see ROADMAP R48/R52), so this
+  shape replays clean; the crashing input is kept as a regression seed in
+  `fuzz/corpus/jsonb_via_row/`. The scheduled CI job stays non-gating.
 
 ## Prerequisites
 
