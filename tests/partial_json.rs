@@ -1036,3 +1036,127 @@ fn re_registered_table_map_signedness_wins_for_subsequent_rows() {
     assert_eq!(second.columns[0].value, CellValue::Int(8));
     assert_eq!(second.columns[0].signedness, Some(Signedness::Unknown));
 }
+
+/// One-column table map for `db`.`t` (table id 5) carrying `metadata`, and a
+/// write-rows event over it with one row of `values` — the byte layout of
+/// the round-3 R50 reproduction fixtures.
+fn one_column_table_map(column_type: u8, metadata: &[u8]) -> Vec<u8> {
+    let mut body = vec![5, 0, 0, 0, 0, 0, 0, 0]; // Table id 5 and flags.
+    body.extend_from_slice(b"\x02db\0\x01t\0");
+    body.push(1); // One column.
+    body.push(column_type);
+    body.push(metadata.len() as u8);
+    body.extend_from_slice(metadata);
+    body.push(1); // NULL bitmap.
+    raw_event(19, &body, true)
+}
+
+fn one_column_write_rows(values: &[u8]) -> Vec<u8> {
+    let mut body = vec![5, 0, 0, 0, 0, 0, 0, 0]; // Table id 5 and flags.
+    body.extend([2, 0]); // Extra-data length (none).
+    body.push(1); // One column.
+    body.push(0x01); // The column is present.
+    body.push(0x00); // This row's NULL bitmap: not NULL.
+    body.extend_from_slice(values);
+    raw_event(30, &body, true)
+}
+
+/// The R50 hostile fixtures through the CLI: each aborts the process inside
+/// the dependency or renders wrong output without pre-validation, and each
+/// now fails the file with the documented message — exit 3 by default, exit
+/// 1 under `--strict`. Skipped when the CLI binary is not part of this test
+/// run (the target is not feature-gated, so library-only runs have no
+/// binary).
+#[test]
+fn hostile_r50_fixtures_exit_3_and_strict_1() {
+    let Ok(binary) = std::env::var("CARGO_BIN_EXE_binlog-inspect") else {
+        eprintln!("skipping: the CLI binary is not built for this feature set");
+        return;
+    };
+    let cases: [(&str, tempfile::NamedTempFile, &str); 5] = [
+        (
+            // NEWDECIMAL metadata with scale > precision: the dependency's
+            // decimal_bin_size underflows (debug panic, release allocator
+            // abort) when a row event references the map.
+            "decimal-scale-gt-precision",
+            binlog(&[
+                format_description(),
+                one_column_table_map(0xf6, &[1, 200]), // precision 1, scale 200
+                one_column_write_rows(&[0x01, 0x02, 0x03, 0x04]),
+            ]),
+            "NEWDECIMAL scale 200 exceeds precision 1",
+        ),
+        (
+            // Valid metadata, hostile packed digit group: the dependency's
+            // scaling multiply overflows (debug panic; release renders
+            // silently wrong output).
+            "decimal-hostile-group",
+            binlog(&[
+                format_description(),
+                one_column_table_map(0xf6, &[5, 5]),
+                one_column_write_rows(&[0xff, 0xff, 0xff]),
+            ]),
+            "malformed NEWDECIMAL value in column 0: digit group exceeds 5 digits",
+        ),
+        (
+            // TIMESTAMP2 with fsp 7: every later column of a row shifts.
+            "timestamp2-fsp7",
+            binlog(&[
+                format_description(),
+                one_column_table_map(0x11, &[7]),
+                one_column_write_rows(&[0x00, 0x00, 0x04, 0x50]),
+            ]),
+            "fractional-second precision 7 outside 0..=6",
+        ),
+        (
+            // TIMESTAMP2 fsp 2 with a fraction byte the server could not
+            // have written; the dependency renders a wrong negative time.
+            "timestamp2-frac-overflow",
+            binlog(&[
+                format_description(),
+                one_column_table_map(0x11, &[2]),
+                one_column_write_rows(&[0x00, 0x00, 0x04, 0x50, 0xff]),
+            ]),
+            "malformed TIMESTAMP2 fraction in column 0",
+        ),
+        (
+            // Trailing bytes after the last row: the library's row iterator
+            // would misread them as a phantom row.
+            "trailing-bytes",
+            binlog(&[
+                format_description(),
+                one_column_table_map(0x03, &[]),
+                one_column_write_rows(&[1, 0, 0, 0, 0x00]),
+            ]),
+            "trailing bytes after row data in rows event",
+        ),
+    ];
+    for (name, file, message) in cases {
+        let path = file.path().to_str().unwrap().to_owned();
+        for strict in [false, true] {
+            let mut command = Command::new(&binary);
+            command.arg(&path);
+            if strict {
+                command.arg("--strict");
+            }
+            let output = command.output().unwrap();
+            let expected_code = if strict { 1 } else { 3 };
+            assert_eq!(
+                output.status.code(),
+                Some(expected_code),
+                "{name} strict={strict}: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            // The default mode lists the failure per file; --strict reports
+            // it through the hard-error path.
+            assert!(
+                stderr.contains("could not be fully parsed")
+                    || stderr.contains("cannot fully parse"),
+                "{name} strict={strict}: {stderr}"
+            );
+            assert!(stderr.contains(message), "{name} strict={strict}: {stderr}");
+        }
+    }
+}

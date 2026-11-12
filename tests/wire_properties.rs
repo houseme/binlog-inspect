@@ -84,13 +84,13 @@ fn encode_event(event: &WireEvent, checksum: bool) -> Vec<u8> {
 }
 
 fn binlog(events: &[WireEvent]) -> Vec<u8> {
+    let mut bytes = b"\xfebin".to_vec();
     let mut description = vec![0; 57];
     description[..2].copy_from_slice(&4u16.to_le_bytes());
     description[2..8].copy_from_slice(b"8.0.30");
     description[56] = 19;
     description.extend([0; 40]);
     description.push(1); // CRC32
-    let mut bytes = b"\xfebin".to_vec();
     bytes.extend(encode_event(
         &WireEvent {
             code: 15,
@@ -592,4 +592,242 @@ fn with_max_event_size_rejects_events_above_the_custom_cap() {
     );
     // The parser is fused after the error.
     assert!(events.next().is_none());
+}
+
+/// One-column table map for `db`.`t` (table id 5) carrying `metadata`, in the
+/// byte layout of the round-3 R50 reproduction fixtures.
+fn one_column_table_map(column_type: u8, metadata: &[u8]) -> WireEvent {
+    let mut body = vec![5, 0, 0, 0, 0, 0, 0, 0]; // Table id 5 and flags.
+    body.extend_from_slice(b"\x02db\0\x01t\0");
+    body.push(1); // One column.
+    body.push(column_type);
+    body.push(metadata.len() as u8);
+    body.extend_from_slice(metadata);
+    body.push(1); // NULL bitmap.
+    WireEvent { code: 19, body }
+}
+
+/// A write-rows event over the one-column table map, each slice one row's
+/// value bytes (every row's NULL bitmap marks the column as not NULL).
+fn one_column_write_rows(rows: &[&[u8]]) -> WireEvent {
+    let mut body = vec![5, 0, 0, 0, 0, 0, 0, 0]; // Table id 5 and flags.
+    body.extend([2, 0]); // Extra-data length (none).
+    body.push(1); // One column.
+    body.push(0x01); // The column is present.
+    for row in rows {
+        body.push(0x00); // This row's NULL bitmap: not NULL.
+        body.extend_from_slice(row);
+    }
+    WireEvent { code: 30, body }
+}
+
+/// R50: a table map declaring NEWDECIMAL metadata with `scale > precision`
+/// aborts the process inside the dependency's `decimal_bin_size` (a debug
+/// panic through `precision - scale` underflow, a release allocator abort
+/// from the wrapped size). The registration check rejects it with the
+/// documented message before any row is decoded.
+#[test]
+fn decimal_scale_gt_precision_metadata_is_rejected_at_registration() {
+    let bytes = binlog(&[
+        one_column_table_map(0xf6, &[1, 200]), // precision 1, scale 200
+        one_column_write_rows(&[&[0x01, 0x02, 0x03, 0x04]]),
+    ]);
+    let context = "decimal-scale-gt-precision";
+    let outcome = parse(&bytes, bytes.len(), context);
+    assert_eq!(
+        outcome.events.len(),
+        1,
+        "{context}: only the format description decodes: {outcome:?}"
+    );
+    let error = outcome
+        .error
+        .clone()
+        .unwrap_or_else(|| panic!("{context}: the table map must fail"));
+    assert!(
+        error.contains(
+            "table map column metadata for column 0: NEWDECIMAL scale 200 exceeds precision 1"
+        ),
+        "{error}"
+    );
+    // The same outcome under chunked reads; parse() asserts the parser is
+    // fused afterwards.
+    assert_eq!(parse(&bytes, 7, context), outcome, "{context}");
+}
+
+/// R50: with valid metadata, hostile packed digit groups overflow the
+/// dependency's scaling multiply (a debug panic; a release build wraps the
+/// overflow into silently wrong output). The row-layout walk rejects the
+/// span with the documented message before the library reads it, while the
+/// legitimate decimal of the same shape still decodes byte-identically.
+#[test]
+fn hostile_decimal_digit_groups_are_rejected_before_the_library() {
+    let context = "decimal-hostile-group";
+    let bytes = binlog(&[
+        one_column_table_map(0xf6, &[5, 5]), // precision 5, scale 5
+        one_column_write_rows(&[&[0xff, 0xff, 0xff]]),
+    ]);
+    let outcome = parse(&bytes, bytes.len(), context);
+    assert_eq!(
+        outcome.events.len(),
+        2,
+        "{context}: the format description and table map still decode: {outcome:?}"
+    );
+    let error = outcome
+        .error
+        .clone()
+        .unwrap_or_else(|| panic!("{context}: the rows event must fail"));
+    assert!(
+        error.contains("malformed NEWDECIMAL value in column 0: digit group exceeds 5 digits"),
+        "{error}"
+    );
+    assert_eq!(parse(&bytes, 11, context), outcome, "{context}");
+
+    // The legitimate control from the same reproduction set: precision 5,
+    // scale 2, value 1.23, renders unchanged.
+    let context = "decimal-legit";
+    let legit = binlog(&[
+        one_column_table_map(0xf6, &[5, 2]),
+        one_column_write_rows(&[&[0x80, 0x01, 0x17]]),
+    ]);
+    let outcome = parse(&legit, legit.len(), context);
+    assert!(
+        outcome.error.is_none(),
+        "{context}: the legitimate decimal must decode: {outcome:?}"
+    );
+    let mut cells = Vec::new();
+    collect_cells(&outcome.events, &mut cells);
+    assert_eq!(
+        cells,
+        vec![CellValue::Bytes("312e3233".into())],
+        "{context}: the value renders as the hex of \"1.23\""
+    );
+}
+
+/// R50: a fractional-second precision above six shifts every later column of
+/// a row by bytes the dependency reads past its own declared widths; it is
+/// rejected at registration with the documented message.
+#[test]
+fn fractional_second_precision_above_six_is_rejected_at_registration() {
+    let bytes = binlog(&[
+        one_column_table_map(0x11, &[7]), // TIMESTAMP2, fsp 7
+        one_column_write_rows(&[&[0x00, 0x00, 0x04, 0x50]]),
+    ]);
+    let context = "timestamp2-fsp7";
+    let outcome = parse(&bytes, bytes.len(), context);
+    assert_eq!(
+        outcome.events.len(),
+        1,
+        "{context}: only the format description decodes: {outcome:?}"
+    );
+    let error = outcome
+        .error
+        .clone()
+        .unwrap_or_else(|| panic!("{context}: the table map must fail"));
+    assert!(
+        error.contains(
+            "table map column metadata for column 0: fractional-second precision 7 outside 0..=6"
+        ),
+        "{error}"
+    );
+    assert_eq!(parse(&bytes, 13, context), outcome, "{context}");
+}
+
+/// R50: a TIMESTAMP2 fraction byte the server could not have written (0xff
+/// for fsp 2) is recombined by the dependency through a signed integer and
+/// renders a wrong negative time; the walk rejects it with the documented
+/// message, and a legitimate fraction still decodes.
+#[test]
+fn overflowing_timestamp2_fraction_is_rejected() {
+    let context = "timestamp2-frac-overflow";
+    let bytes = binlog(&[
+        one_column_table_map(0x11, &[2]), // TIMESTAMP2, fsp 2
+        one_column_write_rows(&[&[0x00, 0x00, 0x04, 0x50, 0xff]]),
+    ]);
+    let outcome = parse(&bytes, bytes.len(), context);
+    assert_eq!(
+        outcome.events.len(),
+        2,
+        "{context}: the format description and table map still decode: {outcome:?}"
+    );
+    let error = outcome
+        .error
+        .clone()
+        .unwrap_or_else(|| panic!("{context}: the rows event must fail"));
+    assert!(
+        error.contains("malformed TIMESTAMP2 fraction in column 0"),
+        "{error}"
+    );
+    assert_eq!(parse(&bytes, 5, context), outcome, "{context}");
+
+    // The same event with an in-range fraction byte decodes.
+    let context = "timestamp2-frac-legit";
+    let legit = binlog(&[
+        one_column_table_map(0x11, &[2]),
+        one_column_write_rows(&[&[0x00, 0x00, 0x04, 0x50, 0x63]]),
+    ]);
+    let outcome = parse(&legit, legit.len(), context);
+    assert!(
+        outcome.error.is_none(),
+        "{context}: the legitimate fraction must decode: {outcome:?}"
+    );
+}
+
+/// R50: row bytes left over after the last complete row are rejected with
+/// the documented message — the library's row iterator would try to decode
+/// them as a phantom row and fail with an opaque end-of-stream error. The
+/// clean controls (a complete row, and a two-row event) still decode, so the
+/// check rejects nothing the library accepts.
+#[test]
+fn trailing_bytes_after_row_data_are_rejected() {
+    let context = "trailing-bytes";
+    let bytes = binlog(&[
+        one_column_table_map(0x03, &[]), // LONG
+        // One complete 4-byte row plus a byte that cannot form a row: its
+        // NULL bitmap marks the column as present, and no value follows.
+        one_column_write_rows(&[&[1, 0, 0, 0], &[0x00]]),
+    ]);
+    let outcome = parse(&bytes, bytes.len(), context);
+    assert_eq!(
+        outcome.events.len(),
+        2,
+        "{context}: the format description and table map still decode: {outcome:?}"
+    );
+    let error = outcome
+        .error
+        .clone()
+        .unwrap_or_else(|| panic!("{context}: the trailing bytes must fail the rows event"));
+    assert!(
+        error.contains("trailing bytes after row data in rows event"),
+        "{error}"
+    );
+    assert_eq!(parse(&bytes, 3, context), outcome, "{context}");
+
+    // A complete single row decodes.
+    let context = "trailing-bytes-clean-single-row";
+    let clean = binlog(&[
+        one_column_table_map(0x03, &[]),
+        one_column_write_rows(&[&[1, 0, 0, 0]]),
+    ]);
+    let outcome = parse(&clean, clean.len(), context);
+    assert!(outcome.error.is_none(), "{context}: {outcome:?}");
+    let mut cells = Vec::new();
+    collect_cells(&outcome.events, &mut cells);
+    assert_eq!(cells, vec![CellValue::Int(1)], "{context}");
+
+    // A clean multi-row event decodes both rows: row boundaries are
+    // self-delimiting, so the walk consumes exactly the rows present.
+    let context = "trailing-bytes-clean-multi-row";
+    let clean = binlog(&[
+        one_column_table_map(0x03, &[]),
+        one_column_write_rows(&[&[1, 0, 0, 0], &[2, 0, 0, 0]]),
+    ]);
+    let outcome = parse(&clean, clean.len(), context);
+    assert!(outcome.error.is_none(), "{context}: {outcome:?}");
+    let mut cells = Vec::new();
+    collect_cells(&outcome.events, &mut cells);
+    assert_eq!(
+        cells,
+        vec![CellValue::Int(1), CellValue::Int(2)],
+        "{context}"
+    );
 }

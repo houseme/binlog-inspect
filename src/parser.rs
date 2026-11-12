@@ -802,6 +802,34 @@ impl<R: Read> BinlogParser<R> {
                                 computed
                             }
                         };
+                        // R50: prevalidate the row layout before the library
+                        // iterates the rows — hostile packed decimals and
+                        // trailing bytes are rejected with precise messages
+                        // instead of the dependency's panics or silent
+                        // misdecoding. The after image carries the WL#2955
+                        // value-options header here.
+                        // The partial-update accessors return the bitmaps
+                        // directly (both images are always present here).
+                        let before_layout = Some(e.columns_before_image())
+                            .zip(before_bitmap.as_deref())
+                            .map(|(bits, present)| crate::row_decode::RowImageLayout {
+                                bitmap_ones: bits.count_ones(),
+                                present,
+                                partial_header: false,
+                            });
+                        let after_layout = Some(e.columns_after_image())
+                            .zip(after_bitmap.as_deref())
+                            .map(|(bits, present)| crate::row_decode::RowImageLayout {
+                                bitmap_ones: bits.count_ones(),
+                                present,
+                                partial_header: true,
+                            });
+                        crate::row_decode::prevalidate_row_layout(
+                            e.rows_data(),
+                            &[before_layout, after_layout],
+                            map.json_column_count(),
+                            map,
+                        )?;
                         let mut before = Vec::new();
                         let mut after = Vec::new();
                         for row in e.rows(map) {
@@ -889,6 +917,31 @@ impl<R: Read> BinlogParser<R> {
                             computed
                         }
                     };
+                    // R50: prevalidate the row layout before the library
+                    // iterates the rows — hostile packed decimals and
+                    // trailing bytes are rejected with precise messages
+                    // instead of the dependency's panics or silent
+                    // misdecoding.
+                    let before_layout = e.columns_before_image().zip(before_bitmap.as_deref()).map(
+                        |(bits, present)| crate::row_decode::RowImageLayout {
+                            bitmap_ones: bits.count_ones(),
+                            present,
+                            partial_header: false,
+                        },
+                    );
+                    let after_layout = e.columns_after_image().zip(after_bitmap.as_deref()).map(
+                        |(bits, present)| crate::row_decode::RowImageLayout {
+                            bitmap_ones: bits.count_ones(),
+                            present,
+                            partial_header: false,
+                        },
+                    );
+                    crate::row_decode::prevalidate_row_layout(
+                        e.rows_data(),
+                        &[before_layout, after_layout],
+                        map.json_column_count(),
+                        map,
+                    )?;
                     let mut changes = Vec::new();
                     for row in e.rows(map) {
                         let (before_row, after_row) = row?;

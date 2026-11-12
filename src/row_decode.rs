@@ -77,8 +77,8 @@ const DEFAULT_JSONB_NODE_BUDGET: usize = 1_000_000;
 /// into a `base64:type<id>:<data>` string. Legitimate data therefore never
 /// fails the event.
 ///
-/// `nodes` is the decoded-node counter shared by the whole conversion: every
-/// converted node charges one against it, and exceeding
+/// `nodes` is the per-value decoded-node counter shared by the whole
+/// conversion: every converted node charges one against it, and exceeding
 /// [`DEFAULT_JSONB_NODE_BUDGET`] returns `InvalidData`. Each value
 /// conversion entry point (the row-value path and the diff-value path) owns
 /// one counter and must never reset it mid-conversion.
@@ -174,35 +174,69 @@ fn jsonb_to_serde(
 /// partial-width suffix of `scale % 9` digits), every group big-endian with
 /// non-negative digit values below `10^digits` after the sign masks are
 /// reapplied.
+///
+/// The check is shared by both hostile-decimal routes: the jsonb opaque
+/// wrapper ([`validate_packed_decimal`], which carries the precision/scale
+/// header inside the opaque data) and the NEWDECIMAL column-value route of
+/// the row-layout walk ([`validate_column_packed_decimal`], which takes them
+/// from the table-map metadata).
 fn validate_packed_decimal(data: &[u8]) -> io::Result<()> {
-    const DIG_PER_DEC: usize = 9;
-    const DIG_TO_BYTES: [usize; DIG_PER_DEC + 1] = [0, 1, 1, 2, 2, 3, 3, 4, 4, 4];
     const INVALID: &str = "malformed jsonb opaque NEWDECIMAL";
-
     let Some(&precision) = data.first() else {
         return Err(io::Error::new(io::ErrorKind::InvalidData, INVALID));
     };
     let Some(&scale) = data.get(1) else {
         return Err(io::Error::new(io::ErrorKind::InvalidData, INVALID));
     };
-    if scale > precision {
-        return Err(io::Error::new(
+    validate_packed_decimal_groups(precision, scale, &data[2..]).map_err(|reason| {
+        io::Error::new(io::ErrorKind::InvalidData, format!("{INVALID}: {reason}"))
+    })
+}
+
+/// Validates the packed digits of a NEWDECIMAL column value during the
+/// row-layout walk, with the R50 column wording.
+///
+/// `precision` and `scale` come from the table-map metadata, which the
+/// registration check keeps inside the server ranges; the packed digits are
+/// exactly [`decimal_column_bin_size`] bytes, which the walk reads in full
+/// before calling.
+fn validate_column_packed_decimal(
+    column: usize,
+    precision: u8,
+    scale: u8,
+    packed: &[u8],
+) -> io::Result<()> {
+    validate_packed_decimal_groups(precision, scale, packed).map_err(|reason| {
+        io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("{INVALID}: scale exceeds precision"),
-        ));
+            format!("malformed NEWDECIMAL value in column {column}: {reason}"),
+        )
+    })
+}
+
+/// Validates the packed digit groups of a binlog DECIMAL and returns the
+/// plain reason on failure; the wrappers format it into their route-specific
+/// message. See [`validate_packed_decimal`] for the layout.
+fn validate_packed_decimal_groups(precision: u8, scale: u8, packed: &[u8]) -> Result<(), String> {
+    const DIG_PER_DEC: usize = 9;
+    const DIG_TO_BYTES: [usize; DIG_PER_DEC + 1] = [0, 1, 1, 2, 2, 3, 3, 4, 4, 4];
+    const LENGTH: &str = "packed length does not match precision and scale";
+
+    if scale > precision {
+        return Err("scale exceeds precision".to_owned());
     }
     // The writer flips the high bit of the first packed byte; undo it before
     // deriving the sign mask (the library reads it the same way).
-    let mut packed = data[2..].to_vec();
-    if let Some(first) = packed.first_mut() {
+    let mut bytes = packed.to_vec();
+    if let Some(first) = bytes.first_mut() {
         *first ^= 0x80;
     }
-    let mask = if packed.first().copied().unwrap_or(0) & 0x80 == 0 {
+    let mask = if bytes.first().copied().unwrap_or(0) & 0x80 == 0 {
         0i32
     } else {
         -1i32
     };
-    let intg = precision as usize - scale as usize;
+    let intg = usize::from(precision) - usize::from(scale);
     // (digit count per group, group count): a partial-width prefix group of
     // `intg % 9` digits, full 9-digit groups, full fractional groups, and a
     // partial-width suffix of `scale % 9` digits.
@@ -212,19 +246,19 @@ fn validate_packed_decimal(data: &[u8]) -> io::Result<()> {
             usize::from(!intg.is_multiple_of(DIG_PER_DEC)),
         ),
         (DIG_PER_DEC, intg / DIG_PER_DEC),
-        (DIG_PER_DEC, scale as usize / DIG_PER_DEC),
+        (DIG_PER_DEC, usize::from(scale) / DIG_PER_DEC),
         (
-            scale as usize % DIG_PER_DEC,
-            usize::from(!(scale as usize).is_multiple_of(DIG_PER_DEC)),
+            usize::from(scale) % DIG_PER_DEC,
+            usize::from(!usize::from(scale).is_multiple_of(DIG_PER_DEC)),
         ),
     ];
     let mut offset = 0usize;
     for (digits, count) in groups {
         let width = DIG_TO_BYTES[digits];
         for _ in 0..count {
-            let raw = packed
+            let raw = bytes
                 .get(offset..offset + width)
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, INVALID))?;
+                .ok_or_else(|| LENGTH.to_owned())?;
             offset += width;
             // Sign-extend the written group (the writer stored
             // `digit ^ mask` in `width` bytes) and re-apply the mask: the
@@ -244,22 +278,15 @@ fn validate_packed_decimal(data: &[u8]) -> io::Result<()> {
                 4 => i32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]),
                 _ => 0,
             } ^ mask;
-            let limit = 10i32
-                .checked_pow(digits as u32)
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, INVALID))?;
+            // `digits` is at most 9, so 10^digits always fits an i32.
+            let limit = 10i32.pow(digits as u32);
             if widened < 0 || widened >= limit {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("{INVALID}: digit group exceeds {digits} digits"),
-                ));
+                return Err(format!("digit group exceeds {digits} digits"));
             }
         }
     }
-    if offset != packed.len() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("{INVALID}: packed length does not match precision and scale"),
-        ));
+    if offset != bytes.len() {
+        return Err(LENGTH.to_owned());
     }
     Ok(())
 }
@@ -568,6 +595,75 @@ pub(crate) fn signedness(map: &TableMapEvent<'_>) -> io::Result<Vec<Option<bool>
     Ok(result)
 }
 
+/// Validates the value ranges of one column's metadata (R50).
+///
+/// A NEWDECIMAL metadata pair outside the server ranges makes the
+/// dependency's packed-size arithmetic underflow (`precision - scale` with
+/// `scale > precision`: a debug panic, a release allocator abort), and a
+/// fractional-second precision above six shifts every later column of a row
+/// by bytes the dependency reads past its own declared widths. Both are
+/// rejected here, at every table-map registration, before any row can
+/// reference them. A column whose metadata cannot be located at all is left
+/// to the truncated-metadata check below.
+fn validate_column_metadata_values(
+    index: usize,
+    column_type: ColumnType,
+    map: &TableMapEvent<'_>,
+) -> io::Result<()> {
+    let metadata = map.get_column_metadata(index).unwrap_or(&[]);
+    match column_type {
+        ColumnType::MYSQL_TYPE_NEWDECIMAL => {
+            let (Some(&precision), Some(&scale)) = (metadata.first(), metadata.get(1)) else {
+                return Ok(());
+            };
+            if scale > precision {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "table map column metadata for column {index}: \
+                         NEWDECIMAL scale {scale} exceeds precision {precision}"
+                    ),
+                ));
+            }
+            if !(1..=65).contains(&precision) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "table map column metadata for column {index}: \
+                         NEWDECIMAL precision {precision} outside 1..=65"
+                    ),
+                ));
+            }
+            if scale > 30 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "table map column metadata for column {index}: \
+                         NEWDECIMAL scale {scale} outside 0..=30"
+                    ),
+                ));
+            }
+        }
+        ColumnType::MYSQL_TYPE_TIMESTAMP2
+        | ColumnType::MYSQL_TYPE_DATETIME2
+        | ColumnType::MYSQL_TYPE_TIME2 => {
+            if let Some(&fsp) = metadata.first()
+                && fsp > 6
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "table map column metadata for column {index}: \
+                         fractional-second precision {fsp} outside 0..=6"
+                    ),
+                ));
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 /// Validate metadata before the dependency substitutes an empty slice for
 /// missing metadata and indexes it during row decoding.
 fn validate_column_metadata(map: &TableMapEvent<'_>) -> io::Result<()> {
@@ -593,6 +689,7 @@ fn validate_column_metadata(map: &TableMapEvent<'_>) -> io::Result<()> {
                 ),
             ));
         }
+        validate_column_metadata_values(index, column_type, map)?;
     }
     // The getter walks every preceding column, so checking the last column
     // once validates the complete metadata span in linear time.
@@ -605,6 +702,411 @@ fn validate_column_metadata(map: &TableMapEvent<'_>) -> io::Result<()> {
         ));
     }
     Ok(())
+}
+
+/// One row image's layout as declared by the rows event (R50).
+///
+/// `bitmap_ones` counts the set bits of the image's column bitmap —
+/// including any set bits beyond the declared column count, which still size
+/// the row's null bitmap exactly as the library derives it — and `present`
+/// holds the present flags of the declared columns in table order.
+/// `partial_header` marks the after image of a partial update rows event,
+/// which carries the WL#2955 value-options encoding before the null bitmap.
+pub(crate) struct RowImageLayout<'a> {
+    pub(crate) bitmap_ones: usize,
+    pub(crate) present: &'a [bool],
+    pub(crate) partial_header: bool,
+}
+
+/// The rejection error for row bytes that do not form a complete row image.
+///
+/// The library's row iterator parses rows until the data runs out; a
+/// remainder that cannot cover the next image is rejected there with an
+/// opaque end-of-stream error. The walk names the shape instead — without
+/// rejecting anything the library accepts, because the library errors on the
+/// same shortfall.
+fn trailing_bytes_error() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        "trailing bytes after row data in rows event",
+    )
+}
+
+/// Prevalidates the row layout of a rows event before the library iterates
+/// it (R50).
+///
+/// Per row, the walk skips the WL#2955 value-options header of a partial
+/// after image, skips the null bitmap, and advances each present, non-null
+/// column by the width the library's value reader consumes. It reuses
+/// [`validate_packed_decimal_groups`] on every NEWDECIMAL span (the
+/// dependency's reader panics on hostile digit groups in a debug build and
+/// renders silently wrong output in a release build) and range-checks the
+/// fraction bytes of TIMESTAMP2/DATETIME2/TIME2 values (the dependency
+/// recombines an overflowing fraction through a signed integer and renders
+/// a wrong time). A byte shortfall is reported as trailing bytes after the
+/// row data, matching the library's own deterministic rejection of the same
+/// shape.
+///
+/// The walk never rejects what the library accepts: any width the metadata
+/// does not resolve (an unknown or unsupported type the library rejects
+/// deterministically) defers to the library, and an image that consumes no
+/// bytes at all defers as well — the ordinary rows arm rejects that
+/// no-progress shape before the walk (R49). `images` holds the before and
+/// after layouts in the order the library reads them; a missing image is
+/// `None` (write rows carry only an after image, delete rows only a before
+/// image). `json_column_count` is the table map's count of JSON columns,
+/// which sizes the partial-update bitmap.
+pub(crate) fn prevalidate_row_layout(
+    rows_data: &[u8],
+    images: &[Option<RowImageLayout<'_>>],
+    json_column_count: usize,
+    map: &TableMapEvent<'_>,
+) -> io::Result<()> {
+    // An empty row body decodes as zero rows; nothing to walk.
+    if rows_data.is_empty() {
+        return Ok(());
+    }
+    // Column types and metadata are resolved once, lazily, as the walk
+    // reaches them: the library's metadata getter re-walks every preceding
+    // column, so a naive per-column call would be quadratic per row.
+    let mut types: Vec<Option<ColumnType>> = Vec::new();
+    let mut metas: Vec<&[u8]> = Vec::new();
+    let mut pos = 0usize;
+    while pos < rows_data.len() {
+        let start = pos;
+        for image in images.iter().flatten() {
+            skip_row_image(
+                rows_data,
+                &mut pos,
+                image,
+                json_column_count,
+                map,
+                &mut types,
+                &mut metas,
+            )?;
+        }
+        if pos == start {
+            // Neither image consumed a byte: the library would loop on this
+            // shape. The ordinary rows arm rejects it before the walk (R49);
+            // defer to the library for anything else instead of guessing.
+            return Ok(());
+        }
+    }
+    Ok(())
+}
+
+/// Advances `pos` past one row image, mirroring the library's `BinlogRow`
+/// deserialization: the partial-update value options (when
+/// `partial_header`), the null bitmap over the image's set column bits, and
+/// one value per present, non-null column.
+fn skip_row_image<'a>(
+    data: &[u8],
+    pos: &mut usize,
+    image: &RowImageLayout<'_>,
+    json_column_count: usize,
+    map: &'a TableMapEvent<'a>,
+    types: &mut Vec<Option<ColumnType>>,
+    metas: &mut Vec<&'a [u8]>,
+) -> io::Result<()> {
+    if image.partial_header {
+        // WL#2955: a length-encoded value-options field, then a bitmap over
+        // the table's JSON columns when PARTIAL_JSON_UPDATES is set.
+        let value_options = read_row_lenenc(data, pos)?;
+        if value_options & 1 != 0 {
+            span(data, pos, json_column_count.div_ceil(8))?;
+        }
+    }
+    // The null bitmap covers every set bit of the image's column bitmap,
+    // including set bits beyond the declared column count.
+    let null_bits = span(data, pos, image.bitmap_ones.div_ceil(8))?;
+    let mut image_index = 0usize;
+    for (index, &present) in image.present.iter().enumerate() {
+        if !present {
+            continue;
+        }
+        // Lsb0 bit order, as the library's `BitVec<u8>` reads it; a bit
+        // missing from the bitmap counts as NULL, like the library's
+        // `unwrap_or(true)` fallback.
+        let is_null = null_bits
+            .get(image_index / 8)
+            .is_none_or(|byte| byte & (1 << (image_index % 8)) != 0);
+        image_index += 1;
+        if is_null {
+            continue;
+        }
+        skip_column_value(data, pos, index, map, types, metas)?;
+    }
+    Ok(())
+}
+
+/// How a column value's width is derived from its type and metadata.
+enum ValueWidth {
+    /// A fixed number of bytes.
+    Fixed(usize),
+    /// A length-prefixed value: the prefix of the given width holds the
+    /// value's byte length, little-endian.
+    Prefixed(usize),
+    /// The width cannot be derived from the metadata; the library decides.
+    Deferred,
+}
+
+/// Advances `pos` past one present, non-null column value, deriving the
+/// width the library's value reader consumes.
+///
+/// Returns `false` when the width cannot be resolved (an unknown or
+/// unsupported type the library rejects deterministically): the walk then
+/// defers to the library instead of guessing.
+fn skip_column_value<'a>(
+    data: &[u8],
+    pos: &mut usize,
+    column: usize,
+    map: &'a TableMapEvent<'a>,
+    types: &mut Vec<Option<ColumnType>>,
+    metas: &mut Vec<&'a [u8]>,
+) -> io::Result<bool> {
+    while types.len() <= column {
+        let index = types.len();
+        let ty = map.get_column_type(index).ok().flatten();
+        let meta = map.get_column_metadata(index).unwrap_or(&[]);
+        types.push(ty);
+        metas.push(meta);
+    }
+    let Some(column_type) = types[column] else {
+        // Unknown or unsupported type byte: the library rejects it
+        // deterministically.
+        return Ok(false);
+    };
+    let meta = metas[column];
+    let width = match column_type {
+        ColumnType::MYSQL_TYPE_TINY => ValueWidth::Fixed(1),
+        ColumnType::MYSQL_TYPE_SHORT => ValueWidth::Fixed(2),
+        ColumnType::MYSQL_TYPE_INT24 => ValueWidth::Fixed(3),
+        ColumnType::MYSQL_TYPE_LONG => ValueWidth::Fixed(4),
+        ColumnType::MYSQL_TYPE_LONGLONG => ValueWidth::Fixed(8),
+        ColumnType::MYSQL_TYPE_FLOAT => ValueWidth::Fixed(4),
+        ColumnType::MYSQL_TYPE_DOUBLE => ValueWidth::Fixed(8),
+        ColumnType::MYSQL_TYPE_TIMESTAMP => ValueWidth::Fixed(4),
+        ColumnType::MYSQL_TYPE_YEAR => ValueWidth::Fixed(1),
+        ColumnType::MYSQL_TYPE_NEWDATE => ValueWidth::Fixed(3),
+        ColumnType::MYSQL_TYPE_TIME => ValueWidth::Fixed(3),
+        ColumnType::MYSQL_TYPE_DATETIME => ValueWidth::Fixed(8),
+        ColumnType::MYSQL_TYPE_TIMESTAMP2
+        | ColumnType::MYSQL_TYPE_DATETIME2
+        | ColumnType::MYSQL_TYPE_TIME2 => {
+            // An integer part of 4/5/3 bytes (timestamp/datetime/time) plus
+            // the fraction bytes.
+            let int_bytes = match column_type {
+                ColumnType::MYSQL_TYPE_TIMESTAMP2 => 4,
+                ColumnType::MYSQL_TYPE_DATETIME2 => 5,
+                _ => 3,
+            };
+            return skip_temporal2(data, pos, column, column_type, int_bytes, meta);
+        }
+        ColumnType::MYSQL_TYPE_BIT => {
+            let (Some(&low), Some(&high)) = (meta.first(), meta.get(1)) else {
+                return Ok(false);
+            };
+            ValueWidth::Fixed((usize::from(high) * 8 + usize::from(low)).div_ceil(8))
+        }
+        ColumnType::MYSQL_TYPE_ENUM => {
+            let Some(&pack) = meta.get(1) else {
+                return Ok(false);
+            };
+            match pack {
+                // The library reads a u8 or u16 by the declared pack length
+                // and errors on anything else.
+                1 | 2 => ValueWidth::Fixed(usize::from(pack)),
+                _ => ValueWidth::Deferred,
+            }
+        }
+        ColumnType::MYSQL_TYPE_SET => {
+            let Some(&pack) = meta.get(1) else {
+                return Ok(false);
+            };
+            ValueWidth::Fixed(usize::from(pack))
+        }
+        ColumnType::MYSQL_TYPE_JSON => ValueWidth::Prefixed(4),
+        ColumnType::MYSQL_TYPE_NEWDECIMAL => {
+            let (Some(&precision), Some(&scale)) = (meta.first(), meta.get(1)) else {
+                return Ok(false);
+            };
+            if scale > precision {
+                // Rejected at registration; defer for defense in depth, as
+                // the dependency's packed-size arithmetic underflows here.
+                return Ok(false);
+            }
+            let packed = span(data, pos, decimal_column_bin_size(precision, scale))?;
+            validate_column_packed_decimal(column, precision, scale, packed)?;
+            return Ok(true);
+        }
+        ColumnType::MYSQL_TYPE_TINY_BLOB
+        | ColumnType::MYSQL_TYPE_MEDIUM_BLOB
+        | ColumnType::MYSQL_TYPE_LONG_BLOB
+        | ColumnType::MYSQL_TYPE_BLOB
+        | ColumnType::MYSQL_TYPE_GEOMETRY
+        | ColumnType::MYSQL_TYPE_VECTOR => {
+            let Some(&prefix) = meta.first() else {
+                return Ok(false);
+            };
+            // The library errors on a prefix width outside 1..=4.
+            match prefix {
+                1..=4 => ValueWidth::Prefixed(usize::from(prefix)),
+                _ => ValueWidth::Deferred,
+            }
+        }
+        ColumnType::MYSQL_TYPE_VARCHAR => {
+            let (Some(&low), Some(&high)) = (meta.first(), meta.get(1)) else {
+                return Ok(false);
+            };
+            let type_len = u16::from(low) | (u16::from(high) << 8);
+            ValueWidth::Prefixed(if type_len < 256 { 1 } else { 2 })
+        }
+        ColumnType::MYSQL_TYPE_STRING => {
+            let (Some(&byte0), Some(&byte1)) = (meta.first(), meta.get(1)) else {
+                return Ok(false);
+            };
+            // The dependency's CHAR length encoding: the high length bits
+            // live in the first metadata byte unless the old-style two-byte
+            // form is used.
+            let length = if byte0 >= 1 {
+                if (byte0 & 0x30) != 0x30 {
+                    usize::from(byte1) | ((usize::from(byte0 & 0x30) ^ 0x30) << 4)
+                } else {
+                    usize::from(byte1)
+                }
+            } else {
+                usize::from(byte1) << 8
+            };
+            ValueWidth::Prefixed(if length < 256 { 1 } else { 2 })
+        }
+        // DATE resolves to NEWDATE above, and everything else (old DECIMAL,
+        // NULL, TYPED_ARRAY, VAR_STRING, unknown bytes) is rejected by the
+        // library or the registration checks deterministically.
+        _ => ValueWidth::Deferred,
+    };
+    match width {
+        ValueWidth::Deferred => Ok(false),
+        ValueWidth::Fixed(count) => {
+            span(data, pos, count)?;
+            Ok(true)
+        }
+        ValueWidth::Prefixed(prefix) => {
+            let raw = span(data, pos, prefix)?;
+            span(data, pos, prefixed_length(raw))?;
+            Ok(true)
+        }
+    }
+}
+
+/// Advances past one TIMESTAMP2/DATETIME2/TIME2 value: the integer part,
+/// then the fraction bytes, whose big-endian value must stay below 10^fsp.
+///
+/// The server never writes an overflowing fraction, and the dependency
+/// recombines one through a signed integer, rendering a wrong (negative)
+/// time. Returns `false` when the metadata does not resolve the width, and
+/// errors on a fraction byte the server could not have written.
+fn skip_temporal2(
+    data: &[u8],
+    pos: &mut usize,
+    column: usize,
+    column_type: ColumnType,
+    int_bytes: usize,
+    meta: &[u8],
+) -> io::Result<bool> {
+    let Some(&fsp) = meta.first() else {
+        return Ok(false);
+    };
+    if fsp > 6 {
+        // Rejected at registration; defer for defense in depth.
+        return Ok(false);
+    }
+    span(data, pos, int_bytes)?;
+    let frac_bytes = usize::from(fsp).div_ceil(2);
+    if frac_bytes == 0 {
+        return Ok(true);
+    }
+    let fraction = span(data, pos, frac_bytes)?;
+    let value = match frac_bytes {
+        1 => u32::from(fraction[0]),
+        2 => u32::from(u16::from_be_bytes([fraction[0], fraction[1]])),
+        _ => u32::from_be_bytes([0, fraction[0], fraction[1], fraction[2]]),
+    };
+    let limit: u32 = match fsp {
+        1..=2 => 99,
+        3..=4 => 9_999,
+        _ => 999_999,
+    };
+    if value > limit {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "malformed {} fraction in column {column}",
+                column_type_name(column_type)
+            ),
+        ));
+    }
+    Ok(true)
+}
+
+/// Decodes a little-endian length prefix of one to four bytes.
+fn prefixed_length(raw: &[u8]) -> usize {
+    match raw.len() {
+        1 => usize::from(raw[0]),
+        2 => usize::from(u16::from_le_bytes(raw.try_into().unwrap())),
+        3 => u32::from_le_bytes([raw[0], raw[1], raw[2], 0]) as usize,
+        _ => u32::from_le_bytes(raw.try_into().unwrap()) as usize,
+    }
+}
+
+/// The packed byte size of a NEWDECIMAL column value, mirroring the
+/// dependency's `decimal_bin_size` for metadata the registration checks keep
+/// valid (`scale <= precision` inside the server ranges).
+fn decimal_column_bin_size(precision: u8, scale: u8) -> usize {
+    const DIG_PER_DEC: usize = 9;
+    const DIG_TO_BYTES: [usize; DIG_PER_DEC + 1] = [0, 1, 1, 2, 2, 3, 3, 4, 4, 4];
+    let intg = usize::from(precision) - usize::from(scale);
+    intg / DIG_PER_DEC * 4
+        + DIG_TO_BYTES[intg % DIG_PER_DEC]
+        + usize::from(scale) / DIG_PER_DEC * 4
+        + DIG_TO_BYTES[usize::from(scale) % DIG_PER_DEC]
+}
+
+/// Returns the `count` bytes at `pos`, advancing `pos`, or a trailing-bytes
+/// error when they do not fit: the library's row parser reads the same
+/// spans and errors deterministically on the same shortfall.
+fn span<'a>(data: &'a [u8], pos: &mut usize, count: usize) -> io::Result<&'a [u8]> {
+    let end = pos
+        .checked_add(count)
+        .filter(|end| *end <= data.len())
+        .ok_or_else(trailing_bytes_error)?;
+    let spanned = &data[*pos..end];
+    *pos = end;
+    Ok(spanned)
+}
+
+/// Reads one length-encoded integer with the library's `ParseBuf` semantics
+/// (`0xfb`/`0xff` decode to zero), as `BinlogRow` reads the WL#2955
+/// value-options field. A truncated field means the row data ends mid-value.
+fn read_row_lenenc(data: &[u8], pos: &mut usize) -> io::Result<u64> {
+    let Some(&first) = data.get(*pos) else {
+        return Err(trailing_bytes_error());
+    };
+    let extra = match first {
+        0xfc => 2usize,
+        0xfd => 3,
+        0xfe => 8,
+        // The canonical short forms and the non-canonical 0xfb/0xff prefixes
+        // (which the library decodes to zero) consume one byte.
+        _ => 0,
+    };
+    let raw = span(data, pos, 1 + extra)?;
+    Ok(match extra {
+        0 if first == 0xfb || first == 0xff => 0,
+        0 => u64::from(first),
+        2 => u64::from(u16::from_le_bytes(raw[1..3].try_into().unwrap())),
+        3 => u64::from(u32::from_le_bytes([raw[1], raw[2], raw[3], 0])),
+        _ => u64::from_le_bytes(raw[1..9].try_into().unwrap()),
+    })
 }
 
 /// Reads the SIGNEDNESS (type 1) TLV value of a table map event, if any.
@@ -950,9 +1452,10 @@ mod json_diff {
     pub(super) fn parse_diffs(diffs: &[JsonDiff<'_>]) -> (Vec<JsonDiffRecord>, Option<String>) {
         let mut parsed = Vec::with_capacity(diffs.len());
         let mut problem = None;
-        // The whole diff sequence shares one monotone node budget (R48): an
-        // unrepresentable value does not abort the loop, so a fresh budget
-        // per diff would let hostile values each re-amplify to the limit.
+        // The whole diff sequence shares one monotone per-value node budget
+        // (R48): an unrepresentable value does not abort the loop, so a fresh
+        // budget per diff would let hostile values each re-amplify to the
+        // limit.
         let mut nodes = 0usize;
         for diff in diffs {
             let operation = match diff.operation() {
