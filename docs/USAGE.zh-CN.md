@@ -274,7 +274,7 @@ timestamp,event_type,database,table,before,after
 
 服务器开启 `binlog_row_value_options=PARTIAL_JSON` 时，表映射会携带 optional metadata 类型（14/15），`partial_update_rows` 的 after 镜像携带 JSON 差异序列；两者均已支持——元数据被接受（并经校验和验证后为底层库剥离），差异应用到 before 镜像上，无法应用的以 `partial_json` 值保留。
 
-JSON 列值的解码带有资源限制：嵌套超过 MySQL 100 层容器上限的值会使事件以携带文件偏移的 `jsonb nesting depth` 错误失败；敌意文档展开超过一百万个解码节点时，jsonb 解码同样会被拒绝并报 `jsonb decoding exceeds the node budget of 1000000 nodes`。
+JSON 列值的解码带有资源限制：嵌套超过 MySQL 100 层容器上限的值会使事件以携带文件偏移的 `jsonb nesting depth` 错误失败；敌意文档展开超过一百万个解码节点时，jsonb 解码同样会被拒绝并报 `jsonb decoding exceeds the node budget of 1000000 nodes`；这些值所在的行事件共享按事件预算（事件线长的 16 倍、上限 4,000,000 节点），超出时报 `jsonb decoding in this event exceeds the per-event node budget of N nodes`；NEWDECIMAL 列元数据与打包值按服务端取值范围校验，报 `table map column metadata` / `malformed NEWDECIMAL value` 错误。
 
 差异路径中的双引号成员名按 JSON 字符串规则解码，支持 `\f` 和 `\uD83D\uDE00` 等 UTF-16 代理项对。非法转义会生成 `partial_json` 值，保留原始差异及错误原因。
 
