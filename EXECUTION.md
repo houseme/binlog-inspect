@@ -70,3 +70,31 @@ The W5 changes passed the stable-toolchain gates with locked dependencies. The a
 New regression coverage includes visitor/collector equivalence for NONE and ZSTD payloads, shared table-map state, checksum ordering, callback cancellation/errors/panics, a 100,000-event visitor, row-iterator progress, complete required column metadata, JSON depth boundaries, and completion-script broken pipes. The deterministic wire corpus uses four synthetic families with 24 fixed-seed cases each, short reads and bounded mutations. It reproduced the zero-progress row loop and the unsupported metadata-layout panic that this batch fixes. Legacy JSON fixtures were corrected to include the required type-specific metadata.
 
 All new fixtures are synthetic. Performance microbenchmarks showed baseline drift, so this record claims no stable throughput improvement. Live-server compatibility and continuous coverage-guided fuzzing remain separate validation work.
+
+## Performance Acceptance Record (R42)
+
+The harness lives in `tests/perf_acceptance.rs`: four deterministic, synthetic workloads timed end to end through the public library API (no RNG and no real data; all output is discarded to `std::io::sink()`). Every test in the harness is `#[ignore]`d, so the regular suite never runs it; the acceptance run is:
+
+```sh
+cargo test --locked --release --test perf_acceptance -- --ignored --nocapture
+```
+
+Each metric performs 3 warmup runs and then the median of 11 timed runs (`std::time::Instant`), printed with `--nocapture`. The harness asserts structural invariants only — fixture shape, consumed event counts, every partial-JSON diff applied — and nothing about absolute speed, so it cannot fail on a slow or busy machine. The four metrics cover the framing/decoding loop over a ~10 MB / 20k-event transactional binlog (`framing_loop`), the same file through `JsonLinesFormatter` (`jsonl_hot_loop`, the R42 regression metric), 1,000 rows x 8 JSON columns x 4 diffs through the partial-JSON path (`partial_json_diffs`, pinning the `apply_pair` merge), and 5,000 row changes through `CsvFormatter` (`csv_output`). Adding a metric later is one fixture builder, one workload function, and one entry in the harness's metric registry.
+
+How to record: measure in one sitting on one machine, immediately after checking out the commit under review, and append a new entry below. Each entry lists the date, the commit SHA, `rustc -vV`, the CPU model and core count, the OS, and a table of metric / baseline / current / delta where the recorded number is the printed median wall-clock time of the release build (profile `lto = "thin"`, `strip = true`). A change is accepted when every metric's delta stays within ±5% of the previous entry's baseline; byte-identity of the JSON output is covered by the regular test suite, not here. Raw per-run timings stay out of version control — only the medians in the entries are tracked. Run-to-run noise of a few percent on an otherwise idle machine is normal; if an entry's min/max spread or a delta comparison straddles the 5% rule, re-run in a quieter window instead of weakening the rule. The harness is non-gating: it documents behavior, it does not pass or fail CI.
+
+### 2026-11-13 (initial baseline)
+
+- Commit: 1c8b8d0 (`test(perf): deterministic performance acceptance harness (R42)`); this entry is its own baseline, so current equals baseline and no delta applies.
+- Toolchain: rustc 1.99.1 (58cf8f9c3 2026-10-13), host aarch64-apple-darwin, LLVM 23.1.1; cargo 1.99.1.
+- CPU: Apple M5 Max, 18 logical cores.
+- OS: macOS 27.2 (Build 26B123), arm64.
+
+| metric | baseline (ms) | current (ms) | delta |
+|---|---|---|---|
+| framing_loop | 377.155 | 377.155 | — (initial) |
+| jsonl_hot_loop | 500.501 | 500.501 | — (initial) |
+| partial_json_diffs | 12.247 | 12.247 | — (initial) |
+| csv_output | 7.981 | 7.981 | — (initial) |
+
+Sanity invariants verified in the same run: 19,999 events consumed by both framing and JSONL metrics, 32,000 diffs applied across 8,000 JSON cells, and 5,000 CSV records from 5,000 row changes.
