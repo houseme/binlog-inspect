@@ -50,6 +50,10 @@ required-features = ["cli"]
 name = "remote"
 required-features = ["cli"]
 
+[[test]]
+name = "partial_json"
+required-features = ["cli"]
+
 [features]
 # The CLI layer (clap, completions, datetime parsing) is a default feature so
 # a plain dependency build still yields the binary; library consumers can use

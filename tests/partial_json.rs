@@ -1069,9 +1069,8 @@ fn one_column_write_rows(values: &[u8]) -> Vec<u8> {
 /// The R50 hostile fixtures through the CLI: each aborts the process inside
 /// the dependency or renders wrong output without pre-validation, and each
 /// now fails the file with the documented message — exit 3 by default, exit
-/// 1 under `--strict`. Skipped when the CLI binary is not part of this test
-/// run (the target is not feature-gated, so library-only runs have no
-/// binary).
+/// 1 under `--strict`. The target carries `required-features = ["cli"]`, so
+/// library-only runs skip the whole suite (no binary to spawn).
 #[test]
 fn hostile_r50_fixtures_exit_3_and_strict_1() {
     let Ok(binary) = std::env::var("CARGO_BIN_EXE_binlog-inspect") else {
