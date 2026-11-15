@@ -5,8 +5,8 @@ use anyhow::{Context, Result, bail};
 use binlog_inspect::{
     event::{EventPayload, EventType, ParsedEvent},
     filter::{EventFilter, RangeFilter},
-    formatter::{CsvFormatter, Formatter, JsonLinesFormatter, TextFormatter},
-    parser::{BinlogParser, DEFAULT_INNER_EVENT_LIMIT, MAX_EVENT_SIZE},
+    formatter::{CsvFormatter, Formatter, FormatterError, JsonLinesFormatter, TextFormatter},
+    parser::{BinlogParser, DEFAULT_INNER_EVENT_LIMIT, MAX_EVENT_SIZE, VisitEvent},
 };
 use clap::{CommandFactory, Parser, ValueEnum};
 #[cfg(unix)]
@@ -15,6 +15,7 @@ use std::{
     collections::BTreeMap,
     io::{self, Read, Write},
     num::NonZeroUsize,
+    ops::ControlFlow,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -94,7 +95,8 @@ struct Cli {
     max_event_size: u32,
     /// Stop an input with an error when one transaction payload contains more
     /// than COUNT inner events (default 250000); raising the limit trades
-    /// memory use for payload depth.
+    /// memory use for payload depth. Has no effect with
+    /// --stream-payload-events, which never buffers a payload.
     #[arg(
         long,
         value_name = "COUNT",
@@ -104,6 +106,13 @@ struct Cli {
         value_parser = parse_inner_event_limit
     )]
     max_inner_events: NonZeroUsize,
+    /// Stream the inner events of compressed transaction payloads as their own
+    /// JSONL lines: the payload is emitted once without its `events` field
+    /// (with `streamed: true`), and every inner event becomes a top-level line
+    /// carrying `parent_offset` and `inner_index`. JSONL only; has no effect
+    /// on event filters besides evaluating them per emitted line.
+    #[arg(long)]
+    stream_payload_events: bool,
     /// Abort on the first error in any input; without it, an error stops the
     /// current file, remaining files are still processed, and the exit code is
     /// non-zero (3).
@@ -341,6 +350,76 @@ fn parse_inner_event_limit(value: &str) -> Result<NonZeroUsize, String> {
         )
     })
 }
+/// Validates the `--stream-payload-events` combination (R46b).
+///
+/// Streaming mode emits JSONL event lines only, so `--format text`/`csv` and
+/// `--stats` are rejected through clap's own error machinery: the message and
+/// usage line go to stderr and the process exits with code 2 exactly like any
+/// other argument-validation failure, before any input is opened.
+fn validate_stream_payload_events(cli: &Cli) {
+    if cli.stream_payload_events && (cli.stats || !matches!(cli.format, Format::Jsonl)) {
+        Cli::command()
+            .error(
+                clap::error::ErrorKind::ArgumentConflict,
+                "--stream-payload-events requires --format jsonl",
+            )
+            .exit();
+    }
+}
+
+/// The outer record of a streamed transaction payload (R46b).
+///
+/// Field order replicates [`ParsedEvent`] exactly. The payload keeps the
+/// default `kind`, `compression` and `uncompressed_size` fields, adds
+/// `streamed: true`, and omits the inner `events` array — the omission is
+/// what distinguishes a streamed payload from a genuinely empty one, which
+/// the default mode still renders as `"events":[]`.
+#[derive(serde::Serialize)]
+struct StreamedPayloadStart<'a> {
+    offset: u64,
+    timestamp: u32,
+    event_type: EventType,
+    event_type_code: u8,
+    server_id: u32,
+    event_size: u32,
+    log_pos: u32,
+    payload: StreamedPayload<'a>,
+}
+
+/// The `payload` object of [`StreamedPayloadStart`].
+#[derive(serde::Serialize)]
+struct StreamedPayload<'a> {
+    kind: &'static str,
+    compression: &'a str,
+    uncompressed_size: u64,
+    streamed: bool,
+}
+
+/// One streamed inner event line (R46b): the inner event's own fields,
+/// flattened in place in [`ParsedEvent`] order, plus the two streaming
+/// markers appended after them.
+#[derive(serde::Serialize)]
+struct StreamedInnerEvent<'a> {
+    #[serde(flatten)]
+    event: &'a ParsedEvent,
+    /// File offset of the enclosing transaction payload event.
+    parent_offset: u64,
+    /// Zero-based position of this inner event within its payload.
+    inner_index: usize,
+}
+
+/// Writes one JSON value as a JSONL line with the JSONL formatter's
+/// conventions: `serde_json::to_writer` straight into the writer, then a
+/// trailing newline.
+fn write_json_line<T: serde::Serialize>(
+    value: &T,
+    out: &mut dyn Write,
+) -> Result<(), FormatterError> {
+    serde_json::to_writer(&mut *out, value)?;
+    out.write_all(b"\n")?;
+    Ok(())
+}
+
 /// Processes one input; a parse error either aborts (strict) or yields `Partial`.
 fn process<R: Read>(
     name: &str,
@@ -349,7 +428,39 @@ fn process<R: Read>(
     sink: &mut Sink,
     out: &mut dyn Write,
     strict: bool,
+    stream: bool,
 ) -> Result<Outcome> {
+    if stream {
+        // The argument-parse check restricts streaming mode to JSONL event
+        // output, so the sink is always the JSONL formatter here.
+        let Sink::Events(formatter) = sink else {
+            bail!("--stream-payload-events requires --format jsonl");
+        };
+        // Position-range bounds never gate an inner line: an inner offset
+        // counts from the start of the decompressed stream, not the file
+        // (they gate the outer payload event instead). Everything else —
+        // kinds, tables, GTIDs, datetime bounds — reuses the library's
+        // matching unchanged on a copy without the position bounds.
+        let inner_filter = EventFilter {
+            kinds: filter.kinds.clone(),
+            tables: filter.tables.clone(),
+            gtids: filter.gtids.clone(),
+            ranges: RangeFilter {
+                start_datetime: filter.ranges.start_datetime,
+                stop_datetime: filter.ranges.stop_datetime,
+                ..Default::default()
+            },
+        };
+        return process_streaming(
+            name,
+            parser,
+            filter,
+            &inner_filter,
+            formatter.as_mut(),
+            out,
+            strict,
+        );
+    }
     // Failures are collected instead of returned from inside the loop so the
     // iterator borrow ends before the advisory warnings are drained.
     let mut failure: Option<(bool, binlog_inspect::parser::ParserError)> = None;
@@ -381,6 +492,135 @@ fn process<R: Read>(
             error: err.to_string(),
         }),
         None => Ok(Outcome::Complete),
+    }
+}
+/// Processes one input in `--stream-payload-events` mode (R46b).
+///
+/// The parser is driven through `visit_events` instead of the collecting
+/// `events()` iterator: compressed transactions are never buffered, so the
+/// payload start is emitted as one outer record without the `events` field
+/// and every inner event is emitted as its own top-level JSONL line with
+/// `parent_offset` and `inner_index` markers. Each emitted line passes the
+/// filters as its own event, so `--table`, `--include-gtid` and datetime
+/// bounds match inside payloads.
+///
+/// Memory stays bounded by backpressure: the callback consumes each inner
+/// event immediately, so `--max-inner-events` has no effect here. Lines
+/// already emitted before a failure stay written; a parse error yields
+/// `Partial` (or a strict abort), exactly like the collecting path.
+fn process_streaming<R: Read>(
+    name: &str,
+    parser: &mut BinlogParser<R>,
+    filter: &EventFilter,
+    inner_filter: &EventFilter,
+    formatter: &mut dyn Formatter,
+    out: &mut dyn Write,
+    strict: bool,
+) -> Result<Outcome> {
+    let mut inner_index: usize = 0;
+    // Write failures break out of the visitor and propagate as hard errors
+    // (a closed reader is detected as a broken pipe by the caller), matching
+    // the collecting path where `formatter.format(...)?` aborts immediately.
+    let mut write_failure: Option<FormatterError> = None;
+    let result = parser.visit_events(|notification| {
+        match notification {
+            VisitEvent::Event {
+                event,
+                parent_offset,
+            } => match parent_offset {
+                None => {
+                    if filter.keep(event)
+                        && let Err(error) = formatter.format(event, out)
+                    {
+                        write_failure = Some(error);
+                        return Ok(ControlFlow::Break(()));
+                    }
+                }
+                Some(parent_offset) => {
+                    let index = inner_index;
+                    inner_index += 1;
+                    if inner_filter.keep(event) {
+                        let line = StreamedInnerEvent {
+                            event,
+                            parent_offset,
+                            inner_index: index,
+                        };
+                        if let Err(error) = write_json_line(&line, out) {
+                            write_failure = Some(error);
+                            return Ok(ControlFlow::Break(()));
+                        }
+                    }
+                }
+            },
+            VisitEvent::TransactionPayloadStart {
+                offset,
+                timestamp,
+                server_id,
+                event_size,
+                log_pos,
+                compression,
+                uncompressed_size,
+            } => {
+                inner_index = 0;
+                // Filter the outer record like any other event; the probe
+                // event mirrors exactly what the streamed record renders.
+                let probe = ParsedEvent {
+                    offset,
+                    timestamp,
+                    event_type: EventType::TransactionPayload,
+                    event_type_code: 40,
+                    server_id,
+                    event_size,
+                    log_pos,
+                    payload: EventPayload::TransactionPayload {
+                        compression: compression.to_owned(),
+                        uncompressed_size,
+                        events: Vec::new(),
+                    },
+                };
+                if filter.keep(&probe) {
+                    let line = StreamedPayloadStart {
+                        offset,
+                        timestamp,
+                        event_type: EventType::TransactionPayload,
+                        event_type_code: 40,
+                        server_id,
+                        event_size,
+                        log_pos,
+                        payload: StreamedPayload {
+                            kind: EventType::TransactionPayload.as_str(),
+                            compression,
+                            uncompressed_size,
+                            streamed: true,
+                        },
+                    };
+                    if let Err(error) = write_json_line(&line, out) {
+                        write_failure = Some(error);
+                        return Ok(ControlFlow::Break(()));
+                    }
+                }
+            }
+            // The end notification only confirms complete decoding; nothing
+            // is emitted for it.
+            VisitEvent::TransactionPayloadEnd { .. } => {}
+            // `VisitEvent` is #[non_exhaustive].
+            _ => {}
+        }
+        Ok(ControlFlow::Continue(()))
+    });
+    for warning in parser.take_warnings() {
+        advise(&format!("warning: {warning}"));
+    }
+    if let Some(error) = write_failure {
+        return Err(error.into());
+    }
+    match result {
+        Ok(_) => Ok(Outcome::Complete),
+        Err(err) if strict => Err(err).with_context(|| format!("cannot fully parse {name}")),
+        Err(err) => Ok(Outcome::Partial {
+            file: name.to_owned(),
+            error: err.to_string(),
+        }),
     }
 }
 /// Runs every input and flushes the output writer.
@@ -415,7 +655,15 @@ fn run_inputs(
             let mut parser = BinlogParser::from_reader(stdin.lock())?
                 .with_max_event_size(cli.max_event_size)
                 .with_inner_event_limit(cli.max_inner_events);
-            process("<stdin>", &mut parser, filter, sink, &mut out, cli.strict)?
+            process(
+                "<stdin>",
+                &mut parser,
+                filter,
+                sink,
+                &mut out,
+                cli.strict,
+                cli.stream_payload_events,
+            )?
         } else {
             let mut parser = BinlogParser::open(file)
                 .with_context(|| format!("cannot inspect {}", file.display()))?
@@ -428,6 +676,7 @@ fn run_inputs(
                 sink,
                 &mut out,
                 cli.strict,
+                cli.stream_payload_events,
             )?
         };
         outcomes.push(outcome);
@@ -448,6 +697,7 @@ fn run_inputs(
             sink,
             &mut out,
             cli.strict,
+            cli.stream_payload_events,
         )?);
     }
     if let Sink::Stats(stats) = sink {
@@ -586,6 +836,9 @@ fn run() -> Result<()> {
         stdout.flush()?;
         return Ok(());
     }
+    // Streaming mode is JSONL-only; validate the combination like any other
+    // argument error before anything is opened.
+    validate_stream_payload_events(&cli);
     #[cfg(feature = "remote")]
     let has_urls = !cli.urls.is_empty();
     #[cfg(not(feature = "remote"))]
