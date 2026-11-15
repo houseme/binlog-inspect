@@ -1,14 +1,17 @@
 name: Fuzz
 
-# Scheduled, NON-GATING fuzz smoke (R47b): one short coverage-guided round per
-# target to keep the parser's fail-closed prevalidation exercised. Findings are
-# triaged from the run logs (crash inputs land in the job artifacts); the job
-# result never blocks merges — see continue-on-error below. Known open findings
-# are listed in fuzz/README.md.
+# Scheduled, NON-GATING fuzz rounds (R47b): a short coverage-guided smoke
+# round per target every day, plus a longer round each Monday to grow the
+# corpus between releases. Findings are triaged from the run logs (crash
+# inputs land in the job artifacts); the job result never blocks merges —
+# see continue-on-error below. Known open findings are listed in
+# fuzz/README.md.
 on:
   schedule:
     # Daily, offset from the CI (17 03) and audit schedules.
     - cron: "43 04 * * *"
+    # Weekly long round: Monday, after the daily slot has fired.
+    - cron: "17 05 * * 1"
   workflow_dispatch:
 
 permissions:
@@ -21,7 +24,7 @@ jobs:
   fuzz:
     name: Fuzz (${{ matrix.target }})
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     # A fuzz finding is information, not a merge gate.
     continue-on-error: true
     strategy:
@@ -50,5 +53,18 @@ jobs:
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked
 
-      - name: Fuzz ${{ matrix.target }} (60 s smoke round)
-        run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=60 -rss_limit_mb=2048
+      # The Monday cron gets a 900 s round; the daily cron (and a manual
+      # dispatch, which carries no schedule) gets the 60 s smoke round.
+      - name: Resolve the round length from the trigger
+        id: round
+        run: |
+          if [ "${{ github.event.schedule }}" = "17 05 * * 1" ]; then
+            echo "seconds=900" >> "$GITHUB_OUTPUT"
+            echo "label=900 s weekly round"
+          else
+            echo "seconds=60" >> "$GITHUB_OUTPUT"
+            echo "label=60 s smoke round"
+          fi
+
+      - name: Fuzz ${{ matrix.target }} (${{ steps.round.outputs.label }})
+        run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=${{ steps.round.outputs.seconds }} -rss_limit_mb=2048
