@@ -1,4 +1,5 @@
 /target
 .idea/
 # User-provided production data must never be committed.
-cwt25_account_game123_binlog_mysqlbin.002006
+/*.json
+/cwt25_*
