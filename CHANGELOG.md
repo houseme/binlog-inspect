@@ -2,7 +2,7 @@
 
 This project follows the [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format and [Semantic Versioning](https://semver.org/). Entries are written in English; breaking changes are explicitly marked.
 
-## 0.6.0 - Unreleased
+## [0.6.0] - 2026-11-15
 
 Sixth batch, from the 2026-11-15 round-4 review (ROADMAP W7). Additive release — the default output contract is unchanged.
 
@@ -156,6 +156,7 @@ First batch of review fixes (event classification, CLI reliability and safety, p
 
 - Initial release: an offline MySQL binlog inspection CLI and library, with event-by-event parsing of plaintext binlogs, typed decoding of format description/table map/query/XID/GTID/rotate and row events, JSON Lines/text/CSV output, event and table filters, CRC32 checksum verification, explicit rejection of encrypted files, and HTTP(S) download via the `remote` feature.
 
-[Unreleased]: https://github.com/houseme/binlog-inspect/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/houseme/binlog-inspect/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/houseme/binlog-inspect/releases/tag/v0.6.0
 [0.5.0]: https://github.com/houseme/binlog-inspect/releases/tag/v0.5.0
 [0.4.0]: https://github.com/houseme/binlog-inspect/releases/tag/v0.4.0
