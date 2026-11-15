@@ -41,7 +41,8 @@ The table matches `binlog-inspect --help`:
 | `--stats` | Print one JSON statistics object instead of event lines: counts over the kept events only, after all inputs. |
 | `--completions <SHELL>` | Print shell completions for `bash`, `elvish`, `fish`, `powershell` or `zsh` and exit; all other options are ignored and no input is opened. |
 | `--max-event-size <BYTES>` | Reject single events larger than `BYTES` bytes as "invalid or oversized" (default 67108864; may not exceed the 1 GiB inspection limit). |
-| `--max-inner-events <COUNT>` | Reject a compressed transaction payload carrying more than `COUNT` inner events (default 250000; `0` is rejected). |
+| `--max-inner-events <COUNT>` | Reject a compressed transaction payload carrying more than `COUNT` inner events (default 250000; `0` is rejected). Has no effect with `--stream-payload-events`. |
+| `--stream-payload-events` | Stream the inner events of compressed transaction payloads as their own JSONL lines instead of nesting them (JSONL only; see [Streaming compressed transactions](#streaming-compressed-transactions)). |
 | `--strict` | Abort on the first error in any input (exit code 1); without it an error stops the current file, remaining files are still processed, and the exit code is 3. |
 | `--url <URL>` | HTTP(S) file URL; repeatable and available only when built with `remote`. |
 | `--max-download-size <BYTES>` | Abort a download that exceeds `BYTES` bytes (default 4294967296); available only when built with `remote`. |
@@ -106,6 +107,8 @@ cat mysql-bin.000001 | ./target/release/binlog-inspect - --events xid
 ./target/release/binlog-inspect mysql-bin.000001 --start-datetime "2026-01-01 00:00:00" --include-gtid 3E11FA47-71CA-11E1-9E33-C80AA9429562:23
 # One JSON statistics object instead of event lines
 ./target/release/binlog-inspect mysql-bin.000001 --stats
+# Stream the inner events of compressed transaction payloads (JSONL only)
+./target/release/binlog-inspect mysql-bin.000001 --stream-payload-events
 # Shell completions (bash, elvish, fish, powershell, zsh)
 ./target/release/binlog-inspect --completions zsh > ~/.zfunc/_binlog-inspect
 # Requires a build with the remote feature
@@ -206,7 +209,7 @@ Common fields of every JSON object:
 | `rows_query` | `rows_query` | `sql`: string. |
 | `incident` | `incident` | `incident_type`: string (for example `INCIDENT_LOST_EVENTS`; unrecognized codes render as `UNKNOWN(n)`); `message`: string. |
 | `intvar` | `intvar` | `var_type`: string (`INVALID_INT_EVENT` / `LAST_INSERT_ID_EVENT` / `INSERT_ID_EVENT`); `value`: integer. |
-| `transaction_payload` | `transaction_payload` | `compression`: string (`NONE` or `ZSTD`); `uncompressed_size`: integer as declared in the payload header (`0` for `NONE`); `events`: array of full event objects (same shape as top-level events) whose `offset` counts from the start of the decompressed stream and whose `timestamp`/`server_id` are inherited from the compressed event's header. |
+| `transaction_payload` | `transaction_payload` | `compression`: string (`NONE` or `ZSTD`); `uncompressed_size`: integer as declared in the payload header (`0` for `NONE`); `events`: array of full event objects (same shape as top-level events) whose `offset` counts from the start of the decompressed stream and whose `timestamp`/`server_id` are inherited from the compressed event's header. With `--stream-payload-events` the JSONL shape differs: `events` is omitted and `streamed: true` is added (see [Streaming compressed transactions](#streaming-compressed-transactions)). |
 | `unknown` | `rand`, `user_var`, `begin_load_query`, `execute_load_query`, `heartbeat`, `ignorable`, `transaction_context`, `view_change`, `xa_prepare`, `unknown`, and all MariaDB-specific types | `raw_len`: integer, length of the retained event data. |
 
 ### Row image structure
@@ -261,6 +264,35 @@ All filters combine with AND. Filtering happens after parsing and cannot bypass 
 ```
 
 (The sample is the real output for a synthetic four-event file: XID, table map, write rows, XID.) Counts cover kept events only, so statistics respect every other filter. `files` counts inputs processed, `bytes_total` sums `event_size` over kept events, `transactions` counts GTID payload events including anonymous ones (XID events are not counted), `by_table` counts row changes (write/update/delete rows plus `partial_update_rows` before images) per `database.table`, and `errors` counts partial parse failures (the process still exits 3 and prints the per-file error summary on stderr). `--format` is accepted but ignored in this mode; the JSON object is written to stdout or to the `--output` file as usual.
+
+### Streaming compressed transactions
+
+By default a compressed transaction payload (code 40) is emitted as one nested record whose `events` array carries the decoded inner events. `--stream-payload-events` changes the JSONL output shape for compressed transactions only:
+
+- the payload itself is emitted once as the outer record, with `payload.streamed: true` and **without** the `events` field — the omission distinguishes a streamed payload from a genuinely empty one, which the default mode still renders as `"events":[]`;
+- every inner event becomes its own top-level line with the inner event's real fields plus two markers: `parent_offset` (the file offset of the outer payload event) and `inner_index` (zero-based position within the payload, assigned by the CLI in stream order regardless of any filtering).
+
+The flag is JSONL-only: it requires `--format jsonl` (the default) and rejects `--format text`, `--format csv` and `--stats` with a usage error (exit code 2) before any input is opened: `--stream-payload-events requires --format jsonl`.
+
+The example below is the real output for a synthetic binlog of one `NONE` payload carrying an inner table map, write row and XID (server id 99, timestamp 555; the inner events have no checksums, per WL#3549):
+
+```jsonl
+{"offset":4,"timestamp":555,"event_type":"format_description","event_type_code":15,"server_id":99,"event_size":121,"log_pos":0,"payload":{"kind":"format_description","server_version":"8.0.30"}}
+{"offset":125,"timestamp":555,"event_type":"transaction_payload","event_type_code":40,"server_id":99,"event_size":133,"log_pos":0,"payload":{"kind":"transaction_payload","compression":"NONE","uncompressed_size":0,"streamed":true}}
+{"offset":0,"timestamp":555,"event_type":"table_map","event_type_code":19,"server_id":99,"event_size":38,"log_pos":38,"payload":{"kind":"table_map","table_id":5,"database":"db","table":"t","column_count":1},"parent_offset":125,"inner_index":0}
+{"offset":38,"timestamp":555,"event_type":"write_rows","event_type_code":30,"server_id":99,"event_size":36,"log_pos":36,"payload":{"kind":"rows","table_id":5,"database":"db","table":"t","changes":[{"before":null,"after":{"columns":[{"index":0,"name":"@0","mysql_type":"LONG","signedness":"unknown","value":{"type":"int","value":42}}]}}]},"parent_offset":125,"inner_index":1}
+{"offset":74,"timestamp":555,"event_type":"xid","event_type_code":16,"server_id":99,"event_size":27,"log_pos":27,"payload":{"kind":"xid","xid":77},"parent_offset":125,"inner_index":2}
+```
+
+In default mode (without the flag) the same file still emits one nested record, byte for byte as before:
+
+```jsonl
+{"offset":125,"timestamp":555,"event_type":"transaction_payload","event_type_code":40,"server_id":99,"event_size":133,"log_pos":0,"payload":{"kind":"transaction_payload","compression":"NONE","uncompressed_size":0,"events":[{"offset":0,"timestamp":555,"event_type":"table_map","event_type_code":19,"server_id":99,"event_size":38,"log_pos":38,"payload":{"kind":"table_map","table_id":5,"database":"db","table":"t","column_count":1}},{"offset":38,"timestamp":555,"event_type":"write_rows","event_type_code":30,"server_id":99,"event_size":36,"log_pos":36,"payload":{"kind":"rows","table_id":5,"database":"db","table":"t","changes":[{"before":null,"after":{"columns":[{"index":0,"name":"@0","mysql_type":"LONG","signedness":"unknown","value":{"type":"int","value":42}}]}}]}},{"offset":74,"timestamp":555,"event_type":"xid","event_type_code":16,"server_id":99,"event_size":27,"log_pos":27,"payload":{"kind":"xid","xid":77}}]}}
+```
+
+Filters evaluate each emitted line as its own event: `--events`, `--table`, `--include-gtid` and the datetime bounds evaluate every inner line individually, so `--table db.t` and `--include-gtid` now match inside payloads (in the default mode the filters only ever see the payload record). The position bounds `--start-position`/`--stop-position` gate only the outer payload event: an inner event's `offset` counts from the start of the decompressed stream, not the file, so a position window would be meaningless for an inner line and is not applied to one.
+
+Exit codes are unchanged (0/1/2/3). Because inner events are written as they are decoded, the output is intentionally partial on failure: the lines emitted before an error stay written, and a payload that fails mid-decode leaves the streamed record plus any inner lines already emitted behind (in the default mode a failing payload emits nothing). On exit code 3 an `--output` file is published with that prefix as usual; under `--strict` the process aborts with exit code 1 and the `--output` temporary file is deleted as today. `--max-inner-events` is accepted but has no effect in this mode: streaming never buffers a payload — each inner event is written before the next is decoded, so memory stays bounded by the writer's backpressure instead of the inner-event limit.
 
 ## Errors, input and safety
 
@@ -352,4 +384,4 @@ The unreleased source checkout provides `BinlogParser::visit_events` for consumi
 
 The callback returns `io::Result<ControlFlow<()>>`. `Continue(())` processes the next event and `Break(())` ends inspection. Callback errors, parsing errors and callback panics also terminate the parser. Previously delivered callbacks remain observable if decoding fails later, so transaction-atomic consumers should stage their changes until the matching end notification.
 
-Memory includes the outer raw payload, the current decoded inner event, and shared table maps. The `events()` iterator and CLI aggregate transaction children into the existing nested event model.
+Memory includes the outer raw payload, the current decoded inner event, and shared table maps. The `events()` iterator aggregates transaction children into the existing nested event model; the CLI offers the same per-child delivery through `--stream-payload-events` (see [Streaming compressed transactions](#streaming-compressed-transactions)).

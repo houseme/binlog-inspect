@@ -64,7 +64,7 @@ Requires Rust 1.88 or newer (the MSRV is verified and enforced by a dedicated CI
 ## Limitations
 
 - Only plaintext files are supported. Encrypted binlogs are rejected; HTTP download neither decrypts them nor implements the MySQL replication protocol.
-- Compressed transactions (code 40) are decoded safely: the compression header is pre-validated, decompression is streamed and bounded (declared size + slack; >1 GiB declarations rejected), and inner events share the parser's table-map state.
+- Compressed transactions (code 40) are decoded safely: the compression header is pre-validated, decompression is streamed and bounded (declared size + slack; >1 GiB declarations rejected), and inner events share the parser's table-map state. `--stream-payload-events` streams them as one JSONL line per inner event (opt-in, JSONL only); lines emitted before an error are kept (exit 3, or 1 under `--strict`), and `--max-inner-events` has no effect in that mode.
 - `partial_update_rows` decodes the before image and applies the JSON-diff after image against it; a diff that cannot be applied is preserved as a loss-marking `partial_json` value with its diffs and the reason.
 - Decoded JSON values are bounded: nesting beyond MySQL's 100-container limit, hostile aliased shapes that would expand past a 1,000,000-node per-value budget or a per-event shared budget (16× the event's wire size, capped at 4,000,000 nodes) return a parse error carrying the offset, as does a malformed opaque `NEWDECIMAL` member or malformed column metadata. Opaque jsonb members render per the documented rules — decimals and date/time values as their text form, other opaque types as `base64:type<id>:<data>` strings.
 - Rotate events are reported but not followed; list the next file yourself.

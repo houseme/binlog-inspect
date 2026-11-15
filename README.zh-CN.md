@@ -64,7 +64,7 @@ cargo run --locked --features remote -- --url https://example.com/mysql-bin.0000
 ## 限制
 
 - 仅支持明文文件；加密 binlog 会被明确拒绝，HTTP 下载不会解密，也不是 MySQL 复制协议。
-- 压缩事务（code 40）已安全解码：压缩头在解码前预校验，解压流式且有界（声明大小 + 余量；超过 1 GiB 的声明直接拒绝），内层事件与解析器共享表映射状态。
+- 压缩事务（code 40）已安全解码：压缩头在解码前预校验，解压流式且有界（声明大小 + 余量；超过 1 GiB 的声明直接拒绝），内层事件与解析器共享表映射状态。`--stream-payload-events` 可将其按每个内层事件一行 JSONL 流式输出（可选开启，仅限 JSONL）；出错前已输出的行会保留（退出码 3，`--strict` 下为 1），该模式下 `--max-inner-events` 不生效。
 - `partial_update_rows` 解码 before 镜像，并将 after 的 JSON 差异应用到 before 值上；无法应用的差异以带保留差异与原因的 `partial_json` 丢失标记呈现。
 - 解码后的 JSON 值受资源限制：嵌套超过 MySQL 100 层容器上限、按 1,000,000 节点的单值预算或按事件共享的预算（事件线长的 16 倍、上限 4,000,000 节点）会过度展开的敌意别名形状，都会返回携带偏移的解析错误，畸形的 opaque `NEWDECIMAL` 成员或畸形列元数据亦然。opaque jsonb 成员按文档规则渲染——十进制与日期/时间值渲染为文本形式，其他 opaque 类型渲染为 `base64:type<id>:<data>` 字符串。
 - Rotate 事件只报告不跟随，需自行列出下一个文件。

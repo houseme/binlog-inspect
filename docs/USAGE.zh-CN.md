@@ -41,7 +41,8 @@ cargo build --locked --release --features remote
 | `--stats` | 输出单个 JSON 统计对象代替事件行：仅统计被保留的事件，全部输入处理完后输出。 |
 | `--completions <SHELL>` | 输出 `bash`、`elvish`、`fish`、`powershell` 或 `zsh` 的补全脚本并退出；忽略其他参数，不打开任何输入。 |
 | `--max-event-size <BYTES>` | 超过 `BYTES` 字节的单个事件按 "invalid or oversized" 拒绝（默认 67108864；不得超过 1 GiB 检查上限）。 |
-| `--max-inner-events <COUNT>` | 压缩事务 payload 的内层事件超过 `COUNT` 个时拒绝（默认 250000；`0` 会被拒绝）。 |
+| `--max-inner-events <COUNT>` | 压缩事务 payload 的内层事件超过 `COUNT` 个时拒绝（默认 250000；`0` 会被拒绝）。指定 `--stream-payload-events` 时不生效。 |
+| `--stream-payload-events` | 将压缩事务 payload 的内层事件按独立 JSONL 行流式输出，而非嵌套（仅限 JSONL；见[压缩事务的流式输出](#压缩事务的流式输出)）。 |
 | `--strict` | 任一输入出现第一个错误即中止全部（退出码 1）；不指定时错误停止当前文件，其余文件继续处理，最终退出码为 3。 |
 | `--url <URL>` | HTTP(S) 文件地址，可重复；仅在构建时启用 `remote` 后可用。 |
 | `--max-download-size <BYTES>` | 下载超过 `BYTES` 字节时中止（默认 4294967296）；仅在构建时启用 `remote` 后可用。 |
@@ -106,6 +107,8 @@ cat mysql-bin.000001 | ./target/release/binlog-inspect - --events xid
 ./target/release/binlog-inspect mysql-bin.000001 --start-datetime "2026-01-01 00:00:00" --include-gtid 3E11FA47-71CA-11E1-9E33-C80AA9429562:23
 # 输出单个 JSON 统计对象代替事件行
 ./target/release/binlog-inspect mysql-bin.000001 --stats
+# 将压缩事务 payload 的内层事件流式输出（仅限 JSONL）
+./target/release/binlog-inspect mysql-bin.000001 --stream-payload-events
 # shell 补全（bash、elvish、fish、powershell、zsh）
 ./target/release/binlog-inspect --completions zsh > ~/.zfunc/_binlog-inspect
 # 需要 remote feature 的构建
@@ -206,7 +209,7 @@ timestamp,event_type,database,table,before,after
 | `rows_query` | `rows_query` | `sql`：字符串。 |
 | `incident` | `incident` | `incident_type`：字符串（如 `INCIDENT_LOST_EVENTS`，未识别的类型码为 `UNKNOWN(n)`）；`message`：字符串。 |
 | `intvar` | `intvar` | `var_type`：字符串（`INVALID_INT_EVENT` / `LAST_INSERT_ID_EVENT` / `INSERT_ID_EVENT`）；`value`：数字。 |
-| `transaction_payload` | `transaction_payload` | `compression`：字符串（`NONE` 或 `ZSTD`）；`uncompressed_size`：payload 头声明的数字（`NONE` 时为 `0`）；`events`：完整事件对象数组（结构与顶层事件相同），其 `offset` 从解压流起点计数，`timestamp`/`server_id` 继承压缩事件头。 |
+| `transaction_payload` | `transaction_payload` | `compression`：字符串（`NONE` 或 `ZSTD`）；`uncompressed_size`：payload 头声明的数字（`NONE` 时为 `0`）；`events`：完整事件对象数组（结构与顶层事件相同），其 `offset` 从解压流起点计数，`timestamp`/`server_id` 继承压缩事件头。指定 `--stream-payload-events` 时 JSONL 形状不同：省略 `events` 并增加 `streamed: true`（见[压缩事务的流式输出](#压缩事务的流式输出)）。 |
 | `unknown` | `rand`、`user_var`、`begin_load_query`、`execute_load_query`、`heartbeat`、`ignorable`、`transaction_context`、`view_change`、`xa_prepare`、`unknown` 及所有 MariaDB 专有类型 | `raw_len`：数字，保留的事件数据长度。 |
 
 ### 行镜像结构
@@ -261,6 +264,35 @@ timestamp,event_type,database,table,before,after
 ```
 
 （样例为合成四事件文件——XID、table map、write rows、XID——的真实输出。）计数仅覆盖被保留的事件，因此统计遵循所有其他过滤器。`files` 为处理的输入数；`bytes_total` 为保留事件的 `event_size` 之和；`transactions` 为 GTID payload 事件数（含匿名事务；XID 不计入）；`by_table` 按 `database.table` 统计行变更数（write/update/delete rows 与 `partial_update_rows` 的 before 镜像）；`errors` 为部分解析失败的输入数（进程仍以退出码 3 结束并在标准错误输出逐文件错误摘要）。该模式下 `--format` 被接受但忽略；JSON 对象照常写入标准输出或 `--output` 文件。
+
+### 压缩事务的流式输出
+
+默认模式下，压缩事务 payload（code 40）输出为一条嵌套记录，其 `events` 数组携带解码后的内层事件。`--stream-payload-events` 只改变压缩事务的 JSONL 输出形状：
+
+- payload 本身作为外层记录输出一次，带 `payload.streamed: true` 且**省略** `events` 字段——省略该字段即可区分流式 payload 与真正为空的 payload，默认模式下后者仍渲染为 `"events":[]`；
+- 每个内层事件成为独立的顶层行，携带内层事件的真实字段外加两个标记：`parent_offset`（外层 payload 事件的文件偏移）和 `inner_index`（payload 内的零基位置，由 CLI 按流顺序赋予，不受过滤影响）。
+
+该参数仅限 JSONL：要求 `--format jsonl`（默认值），与 `--format text`、`--format csv` 或 `--stats` 组合时在打开任何输入之前报用法错误（退出码 2）：`--stream-payload-events requires --format jsonl`。
+
+以下示例为合成 binlog 的真实输出：一个 `NONE` payload 内含 table map、write row 与 XID 各一个（server ID 99，时间戳 555；按 WL#3549，内层事件不带校验和）：
+
+```jsonl
+{"offset":4,"timestamp":555,"event_type":"format_description","event_type_code":15,"server_id":99,"event_size":121,"log_pos":0,"payload":{"kind":"format_description","server_version":"8.0.30"}}
+{"offset":125,"timestamp":555,"event_type":"transaction_payload","event_type_code":40,"server_id":99,"event_size":133,"log_pos":0,"payload":{"kind":"transaction_payload","compression":"NONE","uncompressed_size":0,"streamed":true}}
+{"offset":0,"timestamp":555,"event_type":"table_map","event_type_code":19,"server_id":99,"event_size":38,"log_pos":38,"payload":{"kind":"table_map","table_id":5,"database":"db","table":"t","column_count":1},"parent_offset":125,"inner_index":0}
+{"offset":38,"timestamp":555,"event_type":"write_rows","event_type_code":30,"server_id":99,"event_size":36,"log_pos":36,"payload":{"kind":"rows","table_id":5,"database":"db","table":"t","changes":[{"before":null,"after":{"columns":[{"index":0,"name":"@0","mysql_type":"LONG","signedness":"unknown","value":{"type":"int","value":42}}]}}]},"parent_offset":125,"inner_index":1}
+{"offset":74,"timestamp":555,"event_type":"xid","event_type_code":16,"server_id":99,"event_size":27,"log_pos":27,"payload":{"kind":"xid","xid":77},"parent_offset":125,"inner_index":2}
+```
+
+默认模式（不带该参数）下，同一文件仍输出一条嵌套记录，与此前逐字节一致：
+
+```jsonl
+{"offset":125,"timestamp":555,"event_type":"transaction_payload","event_type_code":40,"server_id":99,"event_size":133,"log_pos":0,"payload":{"kind":"transaction_payload","compression":"NONE","uncompressed_size":0,"events":[{"offset":0,"timestamp":555,"event_type":"table_map","event_type_code":19,"server_id":99,"event_size":38,"log_pos":38,"payload":{"kind":"table_map","table_id":5,"database":"db","table":"t","column_count":1}},{"offset":38,"timestamp":555,"event_type":"write_rows","event_type_code":30,"server_id":99,"event_size":36,"log_pos":36,"payload":{"kind":"rows","table_id":5,"database":"db","table":"t","changes":[{"before":null,"after":{"columns":[{"index":0,"name":"@0","mysql_type":"LONG","signedness":"unknown","value":{"type":"int","value":42}}]}}]}},{"offset":74,"timestamp":555,"event_type":"xid","event_type_code":16,"server_id":99,"event_size":27,"log_pos":27,"payload":{"kind":"xid","xid":77}}]}}
+```
+
+过滤器按每条输出行分别求值：`--events`、`--table`、`--include-gtid` 与时间边界逐条评估每个内层行，因此 `--table db.t` 与 `--include-gtid` 现在能匹配 payload 内部的事件（默认模式下过滤器只能看到 payload 整体记录）。位置边界 `--start-position`/`--stop-position` 只作用于外层 payload 事件：内层事件的 `offset` 从解压流起点计数而非文件偏移，位置窗口对内层行没有意义，因此不对其应用。
+
+退出码保持不变（0/1/2/3）。由于内层事件是边解码边写入的，失败时的输出有意保留部分内容：出错前已输出的行保持原样，payload 中途解码失败会在输出中留下流式记录及已输出的内层行（默认模式下失败的 payload 不会输出任何内容）。退出码 3 时 `--output` 文件照常发布该前缀；`--strict` 下进程以退出码 1 中止，`--output` 临时文件照旧删除。`--max-inner-events` 在该模式下被接受但不生效：流式输出从不缓存 payload——每个内层事件在下一个事件解码前即被写出，内存由写入方的背压而非内层事件上限来约束。
 
 ## 错误、输入和安全
 
@@ -352,4 +384,4 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 回调返回 `io::Result<ControlFlow<()>>`。`Continue(())` 处理下一个事件，`Break(())` 结束检查。回调错误、解析错误和回调 panic 也会使解析器进入终止状态。后续解码失败时，先前回调已产生的效果仍然存在，需要事务原子性的调用者应将变更暂存到对应的结束通知。
 
-内存包含外层原始 payload、当前解码的内层事件和共享表映射。`events()` 迭代器及 CLI 会将事务内层事件聚合到现有的嵌套事件模型中。
+内存包含外层原始 payload、当前解码的内层事件和共享表映射。`events()` 迭代器会将事务内层事件聚合到现有的嵌套事件模型中；CLI 则通过 `--stream-payload-events`（见[压缩事务的流式输出](#压缩事务的流式输出)）提供同样的逐内层事件交付。
