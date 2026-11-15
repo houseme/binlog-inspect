@@ -2,6 +2,25 @@
 
 This project follows the [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format and [Semantic Versioning](https://semver.org/). Entries are written in English; breaking changes are explicitly marked.
 
+## [0.6.0] - Unreleased
+
+Sixth batch, from the 2026-11-15 round-4 review (ROADMAP W7). Additive release — the default output contract is unchanged.
+
+### Added
+
+- **`--stream-payload-events`** streams compressed-transaction inner events as their own top-level JSONL lines instead of buffering them into one nested record (R46b): the outer line carries `payload.streamed: true` with `events` omitted, each inner line carries `parent_offset` (outer file offset) and `inner_index` (0-based per payload). JSONL-only — combining the flag with `--format text|csv` or `--stats` is a usage error (exit 2). Filters evaluate per emitted line, so `--table`, `--include-gtid` and datetime filters now match inside payloads; position-range filters gate only the outer payload event. Default-mode output bytes are unchanged, and `--max-inner-events` has no effect in streaming mode (`visit_events` is backpressured by design).
+- The scheduled fuzz job gains a weekly long round (Monday 17:05 UTC, 900 s per target vs the daily 60 s smoke) (R47b).
+
+### Fixed
+
+- The row-layout walk now honors its deferred-width contract: an unresolvable column width aborts the walk and defers wholly to the library, so hostile shapes surface the dependency's own deterministic error (e.g. `Unknown ENUM`) instead of a misattributed `malformed NEWDECIMAL value` / `trailing bytes` message from misaligned offsets (R50 follow-up).
+- Repo hygiene: root-level real-data outputs (`*.json`) and production binlogs (`cwt25_*`) are gitignored, closing the path where one `git add -A` could commit player data (R51 follow-up).
+- Pointer corrections: fuzz/README's known-findings attribution (R50 + the W5-2 opaque guard, not R48/R52) and the ROADMAP R50 entry's durable fixture homes (R52 follow-up).
+
+### Changed
+
+- **Decision recorded**: the virtual workspace lib/bin split (R38 remainder) is closed as won't-fix — the `cli` default feature already isolates CLI dependencies, and a split would break `cargo install binlog-inspect` and double the publish path for zero user-visible gain.
+
 ## [0.5.0] - 2026-11-13
 
 Fourth and fifth batches, from the 2026-11-06 re-review and 2026-11-07/09 source reviews (ROADMAP R39–R52). **Breaking library release** (R45).
