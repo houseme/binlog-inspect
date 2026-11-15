@@ -2,7 +2,7 @@
 
 This project follows the [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format and [Semantic Versioning](https://semver.org/). Entries are written in English; breaking changes are explicitly marked.
 
-## [0.6.0] - Unreleased
+## 0.6.0 - Unreleased
 
 Sixth batch, from the 2026-11-15 round-4 review (ROADMAP W7). Additive release — the default output contract is unchanged.
 
