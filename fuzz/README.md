@@ -35,9 +35,11 @@ abort, OOM, or timeout.
   `decimal_bin_size` when a NEWDECIMAL opaque declares `scale > precision`
   (cargo-fuzz builds with overflow checks). The harness reaches that decoder
   through `jsonb_to_serde`'s opaque rendering of hostile NEWDECIMAL members;
-  pre-validation did not cover the packed decimal digits. `validate_packed_decimal`
-  now hand-validates the full group layout (see ROADMAP R48/R52), so this
-  shape replays clean; the crashing input is kept as a regression seed in
+  pre-validation did not cover the packed decimal digits. The W5-2 opaque
+  guard (`validate_packed_decimal`) now hand-validates the full group layout
+  on this route, and R50's row-value walk covers the NEWDECIMAL column-value
+  route with the same check (see ROADMAP R50), so this shape replays clean;
+  the crashing input is kept as a regression seed in
   `fuzz/corpus/jsonb_via_row/`. The scheduled CI job stays non-gating.
 
 ## Prerequisites
@@ -79,7 +81,8 @@ to `crash-<sha1>`; minimize with `cargo fuzz tmin` / `cargo fuzz cmin`.
   allocator abort that loses the repro.
 - `-max_total_time=<seconds>` — prefer time-bounded rounds for local and CI
   runs (the scheduled, non-gating CI job in
-  `.github/workflows/fuzz.yml` uses 60 s per target). An unbounded session
+  `.github/workflows/fuzz.yml` uses 60 s per target on the daily round and
+  900 s per target on the weekly Monday round). An unbounded session
   belongs on a dedicated machine.
 
 ## Plain cargo build
