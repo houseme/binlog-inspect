@@ -880,6 +880,58 @@ fn trailing_bytes_after_row_data_are_rejected() {
     );
 }
 
+/// R50 follow-up: when a present column's value width cannot be resolved
+/// from the table-map metadata, the walk stops for the event and defers to
+/// the library. A hostile ENUM pack length of three is such a shape (the
+/// library rejects it deterministically with its own "Unknown ENUM"
+/// message); before the fix the walk kept going from the un-advanced
+/// offset — it read the ENUM value byte as the next row's null bitmap and
+/// the LONG value as a second ENUM-less row's data, misattributing the
+/// failure to trailing bytes.
+#[test]
+fn unresolvable_column_width_defers_to_the_library() {
+    // Two columns for `db`.`t` (table id 5): an ENUM with the given
+    // metadata, then a plain LONG.
+    let mut map = vec![5, 0, 0, 0, 0, 0, 0, 0]; // Table id 5 and flags.
+    map.extend_from_slice(b"\x02db\0\x01t\0");
+    map.extend([2, 0xf7, 0x03]); // Two columns: ENUM, LONG.
+    map.extend([2, 2, 3]); // Metadata block (two bytes): variants 2, pack 3.
+    map.push(1); // NULL bitmap.
+    let table_map = WireEvent {
+        code: 19,
+        body: map,
+    };
+
+    let mut rows = vec![5, 0, 0, 0, 0, 0, 0, 0]; // Table id 5 and flags.
+    rows.extend([2, 0]); // Extra-data length (none).
+    rows.extend([2, 0x03]); // Two columns, both present.
+    rows.push(0x00); // This row's NULL bitmap: neither column is NULL.
+    rows.extend_from_slice(&[0x01, 1, 0, 0, 0]); // One ENUM byte, one LONG.
+    let write_rows = WireEvent {
+        code: 30,
+        body: rows,
+    };
+
+    let context = "enum-pack3-defer";
+    let bytes = binlog(&[table_map, write_rows]);
+    let outcome = parse(&bytes, bytes.len(), context);
+    assert_eq!(
+        outcome.events.len(),
+        2,
+        "{context}: the format description and table map still decode: {outcome:?}"
+    );
+    let error = outcome
+        .error
+        .clone()
+        .unwrap_or_else(|| panic!("{context}: the rows event must fail"));
+    assert!(
+        error.contains("Unknown ENUM"),
+        "{context}: the library's own message must surface instead of a \
+         misattributed walk error: {error}"
+    );
+    assert_eq!(parse(&bytes, 5, context), outcome, "{context}");
+}
+
 /// R48-refinement acceptance: a legitimate rows event over 1200 JSON
 /// columns of small documents still decodes — the shared per-event budget
 /// (`min(16 × event_size, 4_000_000)` nodes) leaves a wide margin over the

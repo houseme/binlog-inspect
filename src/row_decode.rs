@@ -295,8 +295,6 @@ fn validate_packed_decimal_groups(precision: u8, scale: u8, packed: &[u8]) -> Re
     if scale > precision {
         return Err("scale exceeds precision".to_owned());
     }
-    // The writer flips the high bit of the first packed byte; undo it before
-    // deriving the sign mask (the library reads it the same way).
     // The writer flips the high bit of the first packed byte; treat it as
     // flipped without copying the value (the library reads it the same way).
     let first_flipped = packed.first().map(|byte| byte ^ 0x80);
@@ -845,15 +843,18 @@ fn trailing_bytes_error() -> io::Error {
 /// row data, matching the library's own deterministic rejection of the same
 /// shape.
 ///
-/// The walk never rejects what the library accepts: any width the metadata
-/// does not resolve (an unknown or unsupported type the library rejects
-/// deterministically) defers to the library, and an image that consumes no
-/// bytes at all defers as well — the ordinary rows arm rejects that
-/// no-progress shape before the walk (R49). `images` holds the before and
-/// after layouts in the order the library reads them; a missing image is
-/// `None` (write rows carry only an after image, delete rows only a before
-/// image). `json_column_count` is the table map's count of JSON columns,
-/// which sizes the partial-update bitmap.
+/// The walk never rejects what the library accepts: when a present column's
+/// value width cannot be resolved from the metadata (an unknown or
+/// unsupported type the library rejects deterministically), the walk stops
+/// for the whole event and defers to the library — continuing would read
+/// the remaining columns from the un-advanced offset and misattribute the
+/// error (R50 follow-up). An image that consumes no bytes at all defers as
+/// well — the ordinary rows arm rejects that no-progress shape before the
+/// walk (R49). `images` holds the before and after layouts in the order the
+/// library reads them; a missing image is `None` (write rows carry only an
+/// after image, delete rows only a before image). `json_column_count` is
+/// the table map's count of JSON columns, which sizes the partial-update
+/// bitmap.
 pub(crate) fn prevalidate_row_layout(
     rows_data: &[u8],
     images: &[Option<RowImageLayout<'_>>],
@@ -873,7 +874,7 @@ pub(crate) fn prevalidate_row_layout(
     while pos < rows_data.len() {
         let start = pos;
         for image in images.iter().flatten() {
-            skip_row_image(
+            if !skip_row_image(
                 rows_data,
                 &mut pos,
                 image,
@@ -881,7 +882,14 @@ pub(crate) fn prevalidate_row_layout(
                 map,
                 &mut types,
                 &mut metas,
-            )?;
+            )? {
+                // Some column value's width does not resolve from the
+                // metadata: the library rejects the shape deterministically,
+                // and walking on would read the later columns from the
+                // un-advanced offset, misattributing the error. Defer the
+                // event wholly to the library instead of guessing.
+                return Ok(());
+            }
         }
         if pos == start {
             // Neither image consumed a byte: the library would loop on this
@@ -897,6 +905,10 @@ pub(crate) fn prevalidate_row_layout(
 /// deserialization: the partial-update value options (when
 /// `partial_header`), the null bitmap over the image's set column bits, and
 /// one value per present, non-null column.
+///
+/// Returns `false` when a present column's value width cannot be resolved
+/// (see [`skip_column_value`]): `pos` still points at that value, and the
+/// caller stops walking instead of continuing from it.
 fn skip_row_image<'a>(
     data: &[u8],
     pos: &mut usize,
@@ -905,7 +917,7 @@ fn skip_row_image<'a>(
     map: &'a TableMapEvent<'a>,
     types: &mut Vec<Option<ColumnType>>,
     metas: &mut Vec<&'a [u8]>,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     if image.partial_header {
         // WL#2955: a length-encoded value-options field, then a bitmap over
         // the table's JSON columns when PARTIAL_JSON_UPDATES is set.
@@ -932,9 +944,11 @@ fn skip_row_image<'a>(
         if is_null {
             continue;
         }
-        skip_column_value(data, pos, index, map, types, metas)?;
+        if !skip_column_value(data, pos, index, map, types, metas)? {
+            return Ok(false);
+        }
     }
-    Ok(())
+    Ok(true)
 }
 
 /// How a column value's width is derived from its type and metadata.
