@@ -159,7 +159,7 @@ impl std::fmt::Display for EventType {
 }
 
 /// An event and its byte offset in the input file.
-#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ParsedEvent {
     /// File offset of the event header.
     pub offset: u64,
@@ -184,7 +184,7 @@ pub struct ParsedEvent {
 /// This enum is `#[non_exhaustive]` (R45): downstream matches require a
 /// wildcard arm, so new payload kinds can be added without a semver-major
 /// release.
-#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum EventPayload {
@@ -322,7 +322,7 @@ pub enum EventPayload {
 }
 
 /// Before and after images for a single row.
-#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RowChange {
     /// Previous image, if present.
     pub before: Option<RowImage>,
@@ -331,14 +331,14 @@ pub struct RowChange {
 }
 
 /// A row image in table-column order, including columns omitted by minimal row images.
-#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RowImage {
     /// Cells are in zero-based table-column order.
     pub columns: Vec<ColumnValue>,
 }
 
 /// One table column in a row image.
-#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ColumnValue {
     /// Zero-based position in the table.
     pub index: usize,
@@ -443,7 +443,7 @@ pub struct JsonDiffRecord {
 ///
 /// This enum is `#[non_exhaustive]` (R45): downstream matches require a
 /// wildcard arm, so new states can be added without a semver-major release.
-#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum Signedness {

@@ -2,6 +2,17 @@
 
 This project follows the [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format and [Semantic Versioning](https://semver.org/). Entries are written in English; breaking changes are explicitly marked.
 
+## [Unreleased]
+
+### Added
+
+- Library event-model types `ParsedEvent`, `EventPayload`, `RowChange`, `RowImage`, `ColumnValue`, and `Signedness` now derive `Clone` (`CellValue` and `JsonDiffRecord` already did), so consumers can retain or aggregate streamed events without field-by-field rebuilding (additive, semver-minor; 2026-11-18 source review).
+
+### Fixed
+
+- `BinlogParser::with_max_event_size` now rejects a cap below the 19-byte event header with a clear panic instead of building a parser that fails every event of any file as `OversizedEvent`; the CLI already enforced the bound (plus its 1 GiB limit) at argument-parse time, so only library consumers were exposed (2026-11-18 source review).
+- `--url` scheme matching is now case-insensitive per RFC 3986: `HTTPS://`/`HTTP://` URLs are accepted, with the scheme lowercased for the request (authority, path, and query untouched); previously the byte-prefix check rejected them with a contradictory "URL must use HTTP or HTTPS" error (2026-11-18 source review).
+
 ## [0.6.0] - 2026-11-15
 
 Sixth batch, from the 2026-11-15 round-4 review (ROADMAP W7). Additive release — the default output contract is unchanged.
