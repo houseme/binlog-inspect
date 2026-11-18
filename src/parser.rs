@@ -343,7 +343,19 @@ impl<R: Read> BinlogParser<R> {
     }
 
     /// Overrides the per-event size cap (defaulting to [`MAX_EVENT_SIZE`]).
+    ///
+    /// The cap must be at least the 19-byte event header: no event can be
+    /// smaller, so a lower bound cannot reject anything selectively and would
+    /// fail every event of any file as [`ParserError::OversizedEvent`]. A
+    /// nonsensical cap panics here instead of producing such a parser — the
+    /// builder's equivalent of [`Self::with_inner_event_limit`] refusing a
+    /// zero through [`core::num::NonZeroUsize`]. The CLI applies the same
+    /// bound (plus its 1 GiB inspection limit) at argument-parse time.
     pub fn with_max_event_size(mut self, cap: u32) -> Self {
+        assert!(
+            cap >= 19,
+            "max event size {cap} is below the 19-byte event header"
+        );
         self.max_event_size = cap;
         self
     }
@@ -1784,6 +1796,17 @@ mod tests {
         // A non-EOF failure while filling the buffer stays a plain I/O error.
         let interrupted = io::Error::new(io::ErrorKind::Interrupted, "retry");
         assert!(matches!(truncated_or_io(interrupted), FrameError::Io(_)));
+    }
+
+    #[test]
+    #[should_panic(expected = "below the 19-byte event header")]
+    fn with_max_event_size_below_the_event_header_is_rejected() {
+        // A cap below the 19-byte event header cannot reject anything
+        // selectively, so the builder refuses it up front instead of
+        // producing a parser that fails every event.
+        let _ = BinlogParser::from_reader(Cursor::new(b"\xfebin".to_vec()))
+            .unwrap()
+            .with_max_event_size(18);
     }
 
     #[test]
