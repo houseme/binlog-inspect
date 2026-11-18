@@ -28,16 +28,30 @@ fn request_error(error: ureq::Error) -> anyhow::Error {
     }
 }
 
+/// Validates the URL scheme and normalizes it to lowercase.
+///
+/// RFC 3986 schemes are case-insensitive, so `HTTPS://` and `Http://` are
+/// accepted like their lowercase forms; only the scheme segment is rewritten,
+/// leaving the authority, path, and query (which can carry credentials)
+/// untouched. Anything but HTTP/HTTPS is rejected.
+fn normalized_url(url: &str) -> Result<String> {
+    // A scheme cannot itself contain `://`, so the first occurrence delimits it.
+    match url.split_once("://") {
+        Some((scheme, rest)) if scheme.eq_ignore_ascii_case("https") => {
+            Ok(format!("https://{rest}"))
+        }
+        Some((scheme, rest)) if scheme.eq_ignore_ascii_case("http") => Ok(format!("http://{rest}")),
+        _ => bail!("URL must use HTTP or HTTPS"),
+    }
+}
+
 /// Streams the response body into a temporary file, aborting once it would
 /// exceed `max_bytes`.
 ///
 /// The URL is never part of an error: query parameters can carry credentials.
 pub fn download(url: &str, max_bytes: u64) -> Result<tempfile::TempPath> {
+    let url = normalized_url(url)?;
     let https = url.starts_with("https://");
-    anyhow::ensure!(
-        https || url.starts_with("http://"),
-        "URL must use HTTP or HTTPS"
-    );
     // Per-read deadlines allow arbitrarily large, steadily progressing downloads.
     // HTTPS-only applies to redirects as well and prevents transport downgrade.
     let config = ureq::Agent::config_builder()
@@ -48,7 +62,7 @@ pub fn download(url: &str, max_bytes: u64) -> Result<tempfile::TempPath> {
         .timeout_per_write(Some(Duration::from_secs(30)))
         .build();
     let agent = ureq::Agent::new_with_config(config);
-    let mut response = agent.get(url).call().map_err(request_error)?;
+    let mut response = agent.get(&url).call().map_err(request_error)?;
     if response.status().as_u16() != 200 {
         bail!(
             "HTTP download failed: unexpected status {}",
@@ -81,4 +95,39 @@ pub fn download(url: &str, max_bytes: u64) -> Result<tempfile::TempPath> {
     }
     file.flush().context("cannot flush temporary download")?;
     Ok(file.into_temp_path())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalized_url;
+
+    #[test]
+    fn schemes_match_case_insensitively_and_are_normalized() {
+        assert_eq!(
+            normalized_url("https://example.com/a").unwrap(),
+            "https://example.com/a"
+        );
+        assert_eq!(
+            normalized_url("HTTPS://example.com/a").unwrap(),
+            "https://example.com/a"
+        );
+        assert_eq!(
+            normalized_url("Http://example.com").unwrap(),
+            "http://example.com"
+        );
+        // The first `://` delimits the scheme; everything after it —
+        // authority, path, and query — is passed through untouched.
+        assert_eq!(
+            normalized_url("https://user@example.com/x?u=https://other").unwrap(),
+            "https://user@example.com/x?u=https://other"
+        );
+    }
+
+    #[test]
+    fn non_http_schemes_are_rejected() {
+        for url in ["ftp://example.com", "example.com", "", "https:/one-slash"] {
+            let error = normalized_url(url).unwrap_err().to_string();
+            assert!(error.contains("HTTP or HTTPS"), "{url}: {error}");
+        }
+    }
 }
