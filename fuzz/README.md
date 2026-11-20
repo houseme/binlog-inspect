@@ -14,13 +14,16 @@ it out of the published `.crate`.
   encrypted-header validation, event framing, CRC32 checksums, the
   hostile-input pre-validation walks (previous-GTIDs counts, table-map
   metadata TLVs, compression-payload headers), row decoding and the jsonb
-  conversion.
-- **`jsonb_via_row`** — each input is wrapped as the JSON column value of a
-  minimal synthetic binlog (magic + checksummed format description + table
-  map with one JSON column + one write-rows event), reusing the fixture byte
-  layouts of `tests/partial_json.rs`. This focuses the fuzzer on the jsonb
-  path: container framing, the 100-container depth cap, opaque member
-  rendering, and the decoded-node budget.
+  conversion. The same input then runs once more through `visit_events`,
+  whose emit/backpressure/break loop is distinct code from the collecting
+  iterator.
+- **`jsonb_via_row`** — each input drives two minimal synthetic binlogs
+  reusing the fixture byte layouts of `tests/partial_json.rs`: as the JSON
+  column value of a write-rows event (container framing, the 100-container
+  depth cap, opaque member rendering, the decoded-node budget), and as the
+  WL#2955 diff sequence of a partial-update-rows event against a fixed
+  before document (`parse_diffs`, the hand-written JSON path parser, and the
+  diff applier).
 
 Both targets swallow decode results on purpose. The contract under test is
 fail-closed: hostile input produces an error carrying the file offset, never

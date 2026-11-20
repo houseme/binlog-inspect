@@ -2153,11 +2153,43 @@ mod json_diff {
 mod tests {
     use super::*;
     use mysql_common::{
-        binlog::{jsonb::Value as JsonbValue, jsondiff::JsonDiff},
+        binlog::{
+            EventStreamReader, consts::BinlogVersion, events::TableMapEvent,
+            jsonb::Value as JsonbValue, jsondiff::JsonDiff,
+        },
         io::ParseBuf,
         proto::MyDeserialize,
     };
     use mysql_common::{constants::ColumnType, packets::Column};
+
+    /// Parses a one-column table map event (`column_type`, `meta` metadata
+    /// bytes) through the library, as a registration would produce.
+    fn one_column_map(column_type: u8, meta: &[u8]) -> TableMapEvent<'static> {
+        let mut body = vec![0u8; 6 + 2]; // table id + flags
+        body.push(1);
+        body.extend_from_slice(b"d\0");
+        body.push(1);
+        body.extend_from_slice(b"t\0");
+        body.push(1); // one column
+        body.push(column_type);
+        body.push(meta.len() as u8); // metadata block length (lenenc)
+        body.extend_from_slice(meta);
+        body.push(1); // null bitmap byte
+        let mut event = Vec::new();
+        event.extend_from_slice(&0u32.to_le_bytes());
+        event.push(19); // TABLE_MAP_EVENT
+        event.extend_from_slice(&1u32.to_le_bytes()); // server id
+        event.extend_from_slice(&(19 + body.len() as u32).to_le_bytes());
+        event.extend_from_slice(&0u32.to_le_bytes()); // log pos
+        event.extend_from_slice(&0u16.to_le_bytes()); // flags
+        event.extend_from_slice(&body);
+        let mut reader = EventStreamReader::new(BinlogVersion::Version4);
+        reader
+            .read(&mut std::io::Cursor::new(event))
+            .unwrap()
+            .unwrap();
+        reader.get_tme(0).unwrap().clone()
+    }
 
     /// Parses binary jsonb bytes with the library, as a row value would be.
     fn jsonb(bytes: &[u8]) -> JsonbValue<'static> {
@@ -2926,5 +2958,143 @@ mod tests {
         let map = reader.get_tme(0).unwrap();
         let signedness = signedness(map).unwrap();
         assert_eq!(signedness, vec![Some(true), None]);
+    }
+
+    #[test]
+    fn newdecimal_metadata_outside_the_server_ranges_is_rejected() {
+        // scale > precision is covered elsewhere; the registration check also
+        // bounds precision to 1..=65 and scale to 0..=30.
+        for (meta, needle) in [
+            (&[0u8, 0][..], "precision 0 outside 1..=65"),
+            (&[66u8, 0][..], "precision 66 outside 1..=65"),
+            (&[65u8, 31][..], "scale 31 outside 0..=30"),
+            (&[10u8, 11][..], "scale 11 exceeds precision 10"),
+        ] {
+            let map = one_column_map(0xf6, meta); // NEWDECIMAL
+            let err = signedness(&map).unwrap_err();
+            assert!(err.to_string().contains(needle), "{meta:?}: {}", err);
+        }
+        // In-range metadata passes.
+        let map = one_column_map(0xf6, &[10, 2]);
+        signedness(&map).unwrap();
+    }
+
+    #[test]
+    fn temporal2_fraction_bytes_are_range_checked() {
+        // DATETIME2 fsp 2: 5 integer bytes plus 1 fraction byte bounded by
+        // 10^2; the walk errors on a fraction no server could write.
+        let mut data = vec![0u8; 5];
+        data.push(99);
+        let mut pos = 0usize;
+        assert!(
+            skip_temporal2(
+                &data,
+                &mut pos,
+                0,
+                ColumnType::MYSQL_TYPE_DATETIME2,
+                5,
+                &[2]
+            )
+            .unwrap()
+        );
+        assert_eq!(pos, 6);
+        data[5] = 100;
+        let mut pos = 0usize;
+        let err = skip_temporal2(
+            &data,
+            &mut pos,
+            3,
+            ColumnType::MYSQL_TYPE_DATETIME2,
+            5,
+            &[2],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("column 3"), "{err}");
+        // fsp 0 consumes no fraction bytes.
+        let mut pos = 0usize;
+        assert!(
+            skip_temporal2(
+                &[0u8; 3],
+                &mut pos,
+                0,
+                ColumnType::MYSQL_TYPE_TIME2,
+                3,
+                &[0]
+            )
+            .unwrap()
+        );
+        assert_eq!(pos, 3);
+        // A missing fsp defers to the library instead of guessing.
+        let mut pos = 0usize;
+        assert!(
+            !skip_temporal2(
+                &[0u8; 4],
+                &mut pos,
+                0,
+                ColumnType::MYSQL_TYPE_TIMESTAMP2,
+                4,
+                &[]
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn oversized_json_length_prefix_is_rejected_by_the_walk() {
+        // A JSON value whose 4-byte length prefix declares more bytes than
+        // the row holds is a trailing-bytes error before the library reads.
+        let map = one_column_map(0xf5, &[4]); // JSON, 4-byte length prefix
+        let present = [true];
+        let oversized = RowImageLayout {
+            bitmap_ones: 1,
+            present: &present,
+            partial_header: false,
+        };
+        let mut row = vec![0u8]; // null bitmap: not null
+        row.extend_from_slice(&0x7fff_ffffu32.to_le_bytes()); // length prefix
+        let err = prevalidate_row_layout(&row, &[Some(oversized)], 1, &map).unwrap_err();
+        assert!(err.to_string().contains("trailing bytes"), "{}", err);
+        // A prefix that fits (4 bytes, empty document) passes the walk.
+        let mut row = vec![0u8];
+        row.extend_from_slice(&0u32.to_le_bytes());
+        let fitting = RowImageLayout {
+            bitmap_ones: 1,
+            present: &present,
+            partial_header: false,
+        };
+        prevalidate_row_layout(&row, &[Some(fitting)], 1, &map).unwrap();
+    }
+
+    #[test]
+    fn byte_values_render_exact_hex_regardless_of_charset() {
+        // utf8mb4 text is hex-rendered byte for byte; no character decoding
+        // is attempted (the contract of CellValue::Bytes).
+        let text = "中\u{1F600}";
+        let row = BinlogRow::new(
+            vec![Some(BinlogValue::Value(Value::Bytes(
+                text.as_bytes().to_vec(),
+            )))],
+            vec![Column::new(ColumnType::MYSQL_TYPE_VARCHAR).with_name(b"s")].into(),
+        );
+        let image = decode_row(&row, &[true], &[None], &mut budget()).unwrap();
+        let CellValue::Bytes(hex) = &image.columns[0].value else {
+            panic!("expected a Bytes value");
+        };
+        assert_eq!(hex, "e4b8adf09f9880");
+    }
+
+    #[test]
+    fn unrepresentable_diff_values_are_reported_not_fatal() {
+        // A diff whose string member carries invalid UTF-8 cannot convert;
+        // the record keeps a None value and the problem is reported instead
+        // of failing the column.
+        let diff_bytes = [0x00, 3, b'$', b'.', b'b', 3, 0x0c, 1, 0xff];
+        let diffs = [diff(&diff_bytes)];
+        let (parsed, problem) = json_diff::parse_diffs(&diffs, &mut budget());
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].path, "$.b");
+        assert_eq!(parsed[0].value, None);
+        let problem = problem.expect("the unrepresentable value must be reported");
+        assert!(problem.contains("not representable"), "{problem}");
     }
 }

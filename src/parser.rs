@@ -2094,4 +2094,127 @@ mod tests {
         let err = parser_events.read_decompressed(&mut stream).unwrap_err();
         assert!(err.to_string().contains("nested"), "{err}");
     }
+
+    /// A raw inner event from header fields and a body.
+    fn raw_inner(event_type: u8, body: &[u8]) -> Vec<u8> {
+        let mut event = Vec::new();
+        event.extend_from_slice(&0u32.to_le_bytes()); // timestamp
+        event.push(event_type);
+        event.extend_from_slice(&7u32.to_le_bytes()); // server id
+        event.extend_from_slice(&((19 + body.len()) as u32).to_le_bytes());
+        event.extend_from_slice(&0u32.to_le_bytes()); // log pos
+        event.extend_from_slice(&0u16.to_le_bytes()); // flags
+        event.extend_from_slice(body);
+        event
+    }
+
+    #[test]
+    fn payload_stream_rejects_misframed_inner_events() {
+        let read_first_error = |bytes: &[u8]| {
+            let reader = TransactionPayloadReader::new_uncompressed(bytes);
+            let mut stream = PayloadStream::new(reader, 1 << 20, 200, 0);
+            let mut parser_events = EventStreamReader::new(BinlogVersion::Version4);
+            parser_events
+                .read_decompressed(&mut stream)
+                .unwrap_err()
+                .to_string()
+        };
+        // A declared size below the 19-byte event header is rejected before
+        // any buffering.
+        let mut tiny = raw_inner(16, &[0u8; 8]);
+        tiny[9..13].copy_from_slice(&10u32.to_le_bytes());
+        assert!(read_first_error(&tiny).contains("invalid inner event size"));
+        // A declared size above the parser's event size cap is rejected the
+        // same way (the body is never buffered).
+        let mut huge = raw_inner(16, &[0u8; 8]);
+        huge[9..13].copy_from_slice(&1000u32.to_le_bytes());
+        huge.extend(std::iter::repeat_n(0u8, 1000 - 19));
+        assert!(read_first_error(&huge).contains("event size limit"));
+        // A format description or rotate inside a payload would rewrite the
+        // shared parser state; both are rejected by event type.
+        for event_type in [4u8, 15] {
+            let inner = raw_inner(event_type, &[0u8; 57]);
+            let mut bytes = inner_xid(11);
+            bytes.extend(inner);
+            let reader = TransactionPayloadReader::new_uncompressed(&bytes);
+            let mut stream = PayloadStream::new(reader, 1 << 20, u64::from(MAX_EVENT_SIZE), 0);
+            let mut parser_events = EventStreamReader::new(BinlogVersion::Version4);
+            assert!(
+                parser_events
+                    .read_decompressed(&mut stream)
+                    .unwrap()
+                    .is_some()
+            );
+            let err = parser_events.read_decompressed(&mut stream).unwrap_err();
+            assert!(
+                err.to_string().contains("unexpected event inside"),
+                "type {event_type}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn verify_event_checksum_clears_the_binlog_in_use_flag() {
+        // The writer clears LOG_EVENT_BINLOG_IN_USE_F before checksumming; a
+        // live file's event carries the flag in its header but a checksum
+        // computed over the cleared header. Both shapes verify.
+        let mut event = inner_xid(42);
+        event.extend_from_slice(&crc_of_event(&event).to_le_bytes());
+        assert!(verify_event_checksum(&event).is_ok());
+        // The live-file shape: flag set in the header, checksum unchanged.
+        let mut live = event.clone();
+        let flags = u16::from_le_bytes([live[17], live[18]]) | 0x0001;
+        live[17..19].copy_from_slice(&flags.to_le_bytes());
+        assert!(verify_event_checksum(&live).is_ok());
+        // A flipped body byte is a checksum mismatch.
+        let mut corrupt = event.clone();
+        let last = corrupt.len() - 5;
+        corrupt[last] ^= 1;
+        let err = verify_event_checksum(&corrupt).unwrap_err();
+        assert!(matches!(err, FrameError::Checksum));
+    }
+
+    /// CRC32 over a bare event (no checksum trailer) with the
+    /// BINLOG_IN_USE flag cleared, as the writer computes it.
+    fn crc_of_event(event: &[u8]) -> u32 {
+        let mut cleared = event.to_vec();
+        let flags = u16::from_le_bytes([cleared[17], cleared[18]]) & !0x0001;
+        cleared[17..19].copy_from_slice(&flags.to_le_bytes());
+        let mut crc = Crc32::new();
+        crc.update(&cleared);
+        crc.finalize()
+    }
+
+    #[test]
+    fn payload_header_skip_prefixes_and_varlen_forms_are_handled() {
+        // Unknown-field skips with the 3-byte and 8-byte length prefixes.
+        let mut body = vec![5u8, 0xfd, 3, 0, 0];
+        body.extend(std::iter::repeat_n(0u8, 3));
+        body.push(0); // end mark
+        validate_transaction_payload_header(&body).unwrap();
+        let mut body = vec![5u8, 0xfe];
+        body.extend(3u64.to_le_bytes());
+        body.extend(std::iter::repeat_n(0u8, 3));
+        body.push(0);
+        validate_transaction_payload_header(&body).unwrap();
+        // A skip running past the body is rejected for both prefixes.
+        for body in [vec![5u8, 0xfd, 0xff, 0xff, 0xff], {
+            let mut body = vec![5u8, 0xfe];
+            body.extend(u64::MAX.to_le_bytes());
+            body
+        }] {
+            let err = validate_transaction_payload_header(&body).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        }
+        // The 9-byte varlen form of read_varlen_uint (0xff prefix marking
+        // eight value bytes).
+        let mut buf = vec![0xffu8];
+        buf.extend_from_slice(&42u64.to_le_bytes());
+        let mut pos = 0usize;
+        assert_eq!(read_varlen_uint(&buf, &mut pos).unwrap(), 42);
+        assert_eq!(pos, 9);
+        // Truncated 9-byte form.
+        let mut pos = 0usize;
+        assert!(read_varlen_uint(&buf[..5], &mut pos).is_err());
+    }
 }

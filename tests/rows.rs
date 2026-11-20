@@ -310,7 +310,12 @@ fn mysql_type_names_are_canonical() {
     assert!(CsvFormatter.format(&event, &mut csv_out).unwrap());
     let csv = String::from_utf8(csv_out).unwrap();
     assert!(csv.starts_with("1,\"write_rows\","), "{csv}");
-    // The formatter's Write target is honored without buffering tricks.
+    // The formatter's Write target is honored without buffering tricks: the
+    // JSONL line lands in the probe byte for byte.
     let mut probe = Cursor::new(Vec::new());
     assert!(JsonLinesFormatter.format(&event, &mut probe).unwrap());
+    assert_eq!(
+        String::from_utf8(probe.into_inner()).unwrap(),
+        format!("{text}\n")
+    );
 }

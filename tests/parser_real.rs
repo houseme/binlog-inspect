@@ -4,7 +4,11 @@
 //! Synthetic-binlog parser tests: framing, hostile input, and typed events.
 //!
 //! All fixtures are crafted bytes; no real binlog data is used.
-use binlog_inspect::{event::EventPayload, parser::BinlogParser, parser::MAX_EVENT_SIZE};
+use binlog_inspect::{
+    event::{EventPayload, EventType},
+    parser::BinlogParser,
+    parser::MAX_EVENT_SIZE,
+};
 use mysql_common::{
     binlog::events::{GtidEvent, PreviousGtidsEvent, PreviousGtidsSid},
     packets::{GnoInterval, Tag},
@@ -295,6 +299,111 @@ fn typed_events_decode() {
         }
     );
     assert!(events.next().is_none());
+}
+
+#[test]
+fn rotate_and_named_unhandled_events_decode_to_their_model_shapes() {
+    let mut bytes = b"\xfebin".to_vec();
+    // Rotate: position 4 in the next file.
+    let mut rotate = 4u64.to_le_bytes().to_vec();
+    rotate.extend_from_slice(b"mysql-bin.000002");
+    bytes.extend(raw_event(4, &rotate, false));
+    // Rand: two 8-byte seeds; a named event type the model does not decode.
+    bytes.extend(raw_event(13, &[7u8; 16], false));
+    // Ignorable and heartbeat are named but retained raw, like rand.
+    bytes.extend(raw_event(28, &[1, 2, 3], false));
+    bytes.extend(raw_event(27, b"mysql-bin.000001", false));
+    // Incident with an unrecognized type code renders UNKNOWN(n).
+    let mut incident = 99u16.to_le_bytes().to_vec();
+    incident.push(2);
+    incident.extend_from_slice(b"??");
+    bytes.extend(raw_event(26, &incident, false));
+    // Intvar INVALID_INT_EVENT (subtype 0).
+    let mut intvar = vec![0u8];
+    intvar.extend_from_slice(&5u64.to_le_bytes());
+    bytes.extend(raw_event(5, &intvar, false));
+    let f = file(&bytes);
+    let mut parser = BinlogParser::open(f.path()).unwrap();
+    let mut events = parser.events();
+    let rotate = events.next().unwrap().unwrap();
+    assert_eq!(rotate.event_type_code, 4);
+    assert_eq!(rotate.event_type, EventType::Rotate);
+    assert_eq!(
+        rotate.payload,
+        EventPayload::Rotate {
+            next_file: "mysql-bin.000002".into(),
+            position: 4
+        }
+    );
+    let rand = events.next().unwrap().unwrap();
+    assert_eq!(rand.event_type_code, 13);
+    assert_eq!(rand.event_type, EventType::Rand);
+    assert_eq!(rand.payload, EventPayload::Unknown { raw_len: 16 });
+    let ignorable = events.next().unwrap().unwrap();
+    assert_eq!(ignorable.event_type, EventType::Ignorable);
+    assert_eq!(ignorable.payload, EventPayload::Unknown { raw_len: 3 });
+    let heartbeat = events.next().unwrap().unwrap();
+    assert_eq!(heartbeat.event_type, EventType::Heartbeat);
+    assert_eq!(
+        heartbeat.payload,
+        EventPayload::Unknown {
+            raw_len: "mysql-bin.000001".len()
+        }
+    );
+    let incident = events.next().unwrap().unwrap();
+    assert_eq!(
+        incident.payload,
+        EventPayload::Incident {
+            incident_type: "UNKNOWN(99)".into(),
+            message: "??".into()
+        }
+    );
+    let intvar = events.next().unwrap().unwrap();
+    assert_eq!(
+        intvar.payload,
+        EventPayload::Intvar {
+            var_type: "INVALID_INT_EVENT".into(),
+            value: 5
+        }
+    );
+    assert!(events.next().is_none());
+}
+
+/// Rewrites the header `log_pos` of an event after it was built; the header
+/// layout is timestamp(0..4), type(4), server id(5..9), size(9..13),
+/// log_pos(13..17), flags(17..19).
+fn with_log_pos(mut event: Vec<u8>, log_pos: u32) -> Vec<u8> {
+    event[13..17].copy_from_slice(&log_pos.to_le_bytes());
+    event
+}
+
+#[test]
+fn log_pos_warnings_skip_artificial_events_and_cap_at_mismatches() {
+    // A header log_pos that does not land right after its event is a
+    // non-fatal warning; log_pos 0 marks an artificial event and never
+    // warns.
+    let mut bytes = b"\xfebin".to_vec();
+    // offset 4, size 19 + 8 = 27; a header log_pos of 999 mismatches.
+    bytes.extend(with_log_pos(raw_event(16, &1u64.to_le_bytes(), false), 999));
+    // Same body at offset 31 with log_pos 0 (artificial): no warning.
+    bytes.extend(raw_event(16, &2u64.to_le_bytes(), false));
+    // offset 58, matching log_pos 85: no warning.
+    bytes.extend(with_log_pos(raw_event(16, &3u64.to_le_bytes(), false), 85));
+    let f = file(&bytes);
+    let mut parser = BinlogParser::open(f.path()).unwrap();
+    {
+        let mut events = parser.events();
+        assert!(events.next().unwrap().is_ok());
+        assert!(events.next().unwrap().is_ok());
+        assert!(events.next().unwrap().is_ok());
+        assert!(events.next().is_none());
+    }
+    let warnings = parser.take_warnings();
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(
+        warnings[0].contains("log_pos 999 does not match offset 4"),
+        "{warnings:?}"
+    );
 }
 
 #[test]

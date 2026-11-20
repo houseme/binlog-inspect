@@ -145,6 +145,52 @@ mod tests {
             },
         }
     }
+    fn rows(database: &str, table: &str) -> ParsedEvent {
+        ParsedEvent {
+            offset: 4,
+            timestamp: 1,
+            event_type: EventType::WriteRows,
+            event_type_code: 30,
+            server_id: 1,
+            event_size: 40,
+            log_pos: 44,
+            payload: EventPayload::Rows {
+                table_id: 1,
+                database: database.to_owned(),
+                table: table.to_owned(),
+                changes: Vec::new(),
+            },
+        }
+    }
+    #[test]
+    fn filter_dimensions_compose_with_and_semantics() {
+        // Every configured dimension must match: a rows event for the right
+        // table is excluded while a GTID allow list is configured, because it
+        // carries no GTID payload.
+        let filter = EventFilter {
+            tables: [("app".to_owned(), "t".to_owned())].into_iter().collect(),
+            gtids: ["11111111-1111-1111-1111-111111111111:1".to_owned()]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        assert!(!filter.keep(&rows("app", "t")));
+        // Conversely, a matching GTID event is excluded by the table filter.
+        assert!(!filter.keep(&gtid(4, "11111111-1111-1111-1111-111111111111:1")));
+        // kinds and ranges compose the same way: the right type outside the
+        // position range is excluded, the wrong type inside it as well.
+        let filter = EventFilter {
+            kinds: [EventType::Xid].into_iter().collect(),
+            ranges: RangeFilter {
+                start_position: Some(10),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(filter.keep(&xid(10, 1)));
+        assert!(!filter.keep(&xid(9, 1)));
+        assert!(!filter.keep(&rows("app", "t")));
+    }
     #[test]
     fn position_bounds_are_start_inclusive_and_stop_exclusive() {
         let filter = EventFilter {

@@ -133,6 +133,59 @@ fn cli_events_flag_validation() {
     assert!(out.stdout.is_empty());
 }
 #[test]
+fn cli_table_value_validation() {
+    let mut bytes = b"\xfebin".to_vec();
+    bytes.extend(event(16, &123u64.to_le_bytes()));
+    let f = file(&bytes);
+    let path = f.path().to_str().unwrap();
+    // A --table value must split at the first `.` into two non-empty parts.
+    for value in ["nodot", "db.", ".t", "."] {
+        let out = run_cli(&[path, "--table", value]);
+        assert_eq!(out.status.code(), Some(2), "{value}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("invalid --table value"),
+            "{value}: {stderr}"
+        );
+    }
+    // A valid value parses; the XID-only file simply has no matching rows.
+    let out = run_cli(&[path, "--table", "app.t"]);
+    assert_eq!(out.status.code(), Some(0));
+    assert!(out.stdout.is_empty());
+}
+#[test]
+fn cli_max_event_size_lower_bound_is_rejected() {
+    // Below the 19-byte event header is a usage error (exit 2), mirroring
+    // the library builder's panic and the 1 GiB upper bound.
+    let out = run_cli(&["--max-event-size", "10"]);
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("smaller than the 19-byte event header"),
+        "{stderr}"
+    );
+}
+#[test]
+fn cli_stats_counts_files_over_multiple_inputs() {
+    let make = |xid: u64| {
+        let mut bytes = b"\xfebin".to_vec();
+        bytes.extend(event(16, &xid.to_le_bytes()));
+        file(&bytes)
+    };
+    let first = make(11);
+    let second = make(22);
+    let out = run_cli(&[
+        first.path().to_str().unwrap(),
+        second.path().to_str().unwrap(),
+        "--stats",
+    ]);
+    assert!(out.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["files"], 2);
+    assert_eq!(v["events_total"], 2);
+    assert_eq!(v["errors"], 0);
+}
+#[test]
 fn cli_csv_output_writes_header_and_row_records() {
     let mut map = vec![1, 0, 0, 0, 0, 0, 0, 0];
     map.extend_from_slice(b"\x03app\0\x01t\0\x01\x03\x00\x00");
