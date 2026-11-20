@@ -462,15 +462,21 @@ fn process<R: Read>(
         );
     }
     // Failures are collected instead of returned from inside the loop so the
-    // iterator borrow ends before the advisory warnings are drained.
+    // iterator borrow ends before the advisory warnings are drained; a write
+    // failure is stashed the same way so the warnings emitted before it are
+    // not lost.
     let mut failure: Option<(bool, binlog_inspect::parser::ParserError)> = None;
+    let mut write_failure: Option<FormatterError> = None;
     for result in parser.events() {
         match result {
             Ok(event) => {
                 if filter.keep(&event) {
                     match sink {
                         Sink::Events(formatter) => {
-                            formatter.format(&event, out)?;
+                            if let Err(error) = formatter.format(&event, out) {
+                                write_failure = Some(error);
+                                break;
+                            }
                         }
                         Sink::Stats(stats) => stats.record(&event),
                     }
@@ -484,6 +490,9 @@ fn process<R: Read>(
     }
     for warning in parser.take_warnings() {
         advise(&format!("warning: {warning}"));
+    }
+    if let Some(error) = write_failure {
+        return Err(error.into());
     }
     match failure {
         Some((true, err)) => Err(err).with_context(|| format!("cannot fully parse {name}")),
