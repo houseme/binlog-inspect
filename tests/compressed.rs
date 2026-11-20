@@ -776,13 +776,23 @@ fn stream_position_filters_gate_only_the_outer_event() {
 }
 
 /// Streaming mode is JSONL-only: `--format text`, `--format csv` and
-/// `--stats` are usage errors (exit code 2) at argument-parse time.
+/// `--stats` are usage errors (exit code 2) at argument-parse time, each
+/// naming its actual conflict.
 #[test]
 fn stream_payload_events_rejects_text_csv_stats() {
-    for args in [
-        vec!["--format", "text"],
-        vec!["--format", "csv"],
-        vec!["--stats"],
+    for (args, expected) in [
+        (
+            vec!["--format", "text"],
+            "--stream-payload-events requires --format jsonl",
+        ),
+        (
+            vec!["--format", "csv"],
+            "--stream-payload-events requires --format jsonl",
+        ),
+        (
+            vec!["--stats"],
+            "--stream-payload-events cannot be combined with --stats",
+        ),
     ] {
         let f = none_payload_sample();
         let mut argv = vec!["--stream-payload-events"];
@@ -791,10 +801,7 @@ fn stream_payload_events_rejects_text_csv_stats() {
         let output = run_cli(&argv);
         assert_eq!(output.status.code(), Some(2), "{argv:?}");
         let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            stderr.contains("--stream-payload-events requires --format jsonl"),
-            "{stderr}"
-        );
+        assert!(stderr.contains(expected), "{stderr}");
         assert!(String::from_utf8_lossy(&output.stdout).is_empty());
     }
 }

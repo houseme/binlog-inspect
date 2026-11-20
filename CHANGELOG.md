@@ -9,8 +9,11 @@ This project follows the [Keep a Changelog](https://keepachangelog.com/en/1.1.0/
 - Library event-model types `ParsedEvent`, `EventPayload`, `RowChange`, `RowImage`, `ColumnValue`, and `Signedness` now derive `Clone` (`CellValue` and `JsonDiffRecord` already did), so consumers can retain or aggregate streamed events without field-by-field rebuilding (additive, semver-minor; 2026-11-18 source review).
 - **`--format csv` now emits one record per `partial_update_rows` row** (2026-11-20 source review): the full before image and the diff-applied after image render in the same `before`/`after` columns as ordinary row events, with an absent image as JSON `null`. Previously `--format csv` silently produced no records for partial-update events, dropping those rows from CSV output entirely. JSONL and text output are unchanged, and row events without a resolved table map still produce no records. The USAGE and DESIGN output-contract sections were updated accordingly.
 
-### Fixed
+### Changed
 
+- The `--stream-payload-events` usage error now names the actual conflict: combining the flag with `--stats` reports "`--stream-payload-events cannot be combined with --stats`" instead of the misleading "`requires --format jsonl`"; the message for a non-JSONL `--format` is unchanged (2026-11-20 source review).
+
+### Fixed
 - Advisory `log_pos` warnings accumulated before a formatter write failure are no longer silently dropped: the failure is stashed and the warnings drained before the hard error propagates, matching the parse-error path (2026-11-20 source review).
 - `BinlogParser::with_max_event_size` now rejects a cap below the 19-byte event header with a clear panic instead of building a parser that fails every event of any file as `OversizedEvent`; the CLI already enforced the bound (plus its 1 GiB limit) at argument-parse time, so only library consumers were exposed (2026-11-18 source review).
 - `--url` scheme matching is now case-insensitive per RFC 3986: `HTTPS://`/`HTTP://` URLs are accepted, with the scheme lowercased for the request (authority, path, and query untouched); previously the byte-prefix check rejected them with a contradictory "URL must use HTTP or HTTPS" error (2026-11-18 source review).

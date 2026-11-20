@@ -358,11 +358,13 @@ fn parse_inner_event_limit(value: &str) -> Result<NonZeroUsize, String> {
 /// other argument-validation failure, before any input is opened.
 fn validate_stream_payload_events(cli: &Cli) {
     if cli.stream_payload_events && (cli.stats || !matches!(cli.format, Format::Jsonl)) {
+        let detail = if cli.stats {
+            "--stream-payload-events cannot be combined with --stats"
+        } else {
+            "--stream-payload-events requires --format jsonl"
+        };
         Cli::command()
-            .error(
-                clap::error::ErrorKind::ArgumentConflict,
-                "--stream-payload-events requires --format jsonl",
-            )
+            .error(clap::error::ErrorKind::ArgumentConflict, detail)
             .exit();
     }
 }

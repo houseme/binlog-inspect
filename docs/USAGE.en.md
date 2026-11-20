@@ -272,7 +272,7 @@ By default a compressed transaction payload (code 40) is emitted as one nested r
 - the payload itself is emitted once as the outer record, with `payload.streamed: true` and **without** the `events` field — the omission distinguishes a streamed payload from a genuinely empty one, which the default mode still renders as `"events":[]`;
 - every inner event becomes its own top-level line with the inner event's real fields plus two markers: `parent_offset` (the file offset of the outer payload event) and `inner_index` (zero-based position within the payload, assigned by the CLI in stream order regardless of any filtering).
 
-The flag is JSONL-only: it requires `--format jsonl` (the default) and rejects `--format text`, `--format csv` and `--stats` with a usage error (exit code 2) before any input is opened: `--stream-payload-events requires --format jsonl`.
+The flag is JSONL-only: it requires `--format jsonl` (the default) and rejects `--format text`, `--format csv` and `--stats` with a usage error (exit code 2) before any input is opened: `--stream-payload-events requires --format jsonl`, or `--stream-payload-events cannot be combined with --stats` when `--stats` is the conflicting option.
 
 The example below is the real output for a synthetic binlog of one `NONE` payload carrying an inner table map, write row and XID (server id 99, timestamp 555; the inner events have no checksums, per WL#3549):
 

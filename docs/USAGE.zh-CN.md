@@ -272,7 +272,7 @@ timestamp,event_type,database,table,before,after
 - payload 本身作为外层记录输出一次，带 `payload.streamed: true` 且**省略** `events` 字段——省略该字段即可区分流式 payload 与真正为空的 payload，默认模式下后者仍渲染为 `"events":[]`；
 - 每个内层事件成为独立的顶层行，携带内层事件的真实字段外加两个标记：`parent_offset`（外层 payload 事件的文件偏移）和 `inner_index`（payload 内的零基位置，由 CLI 按流顺序赋予，不受过滤影响）。
 
-该参数仅限 JSONL：要求 `--format jsonl`（默认值），与 `--format text`、`--format csv` 或 `--stats` 组合时在打开任何输入之前报用法错误（退出码 2）：`--stream-payload-events requires --format jsonl`。
+该参数仅限 JSONL：要求 `--format jsonl`（默认值），与 `--format text`、`--format csv` 或 `--stats` 组合时在打开任何输入之前报用法错误（退出码 2）：`--stream-payload-events requires --format jsonl`；冲突项为 `--stats` 时报 `--stream-payload-events cannot be combined with --stats`。
 
 以下示例为合成 binlog 的真实输出：一个 `NONE` payload 内含 table map、write row 与 XID 各一个（server ID 99，时间戳 555；按 WL#3549，内层事件不带校验和）：
 
