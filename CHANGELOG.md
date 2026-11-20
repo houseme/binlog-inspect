@@ -7,6 +7,7 @@ This project follows the [Keep a Changelog](https://keepachangelog.com/en/1.1.0/
 ### Added
 
 - Library event-model types `ParsedEvent`, `EventPayload`, `RowChange`, `RowImage`, `ColumnValue`, and `Signedness` now derive `Clone` (`CellValue` and `JsonDiffRecord` already did), so consumers can retain or aggregate streamed events without field-by-field rebuilding (additive, semver-minor; 2026-11-18 source review).
+- **`--format csv` now emits one record per `partial_update_rows` row** (2026-11-20 source review): the full before image and the diff-applied after image render in the same `before`/`after` columns as ordinary row events, with an absent image as JSON `null`. Previously `--format csv` silently produced no records for partial-update events, dropping those rows from CSV output entirely. JSONL and text output are unchanged, and row events without a resolved table map still produce no records. The USAGE and DESIGN output-contract sections were updated accordingly.
 
 ### Fixed
 

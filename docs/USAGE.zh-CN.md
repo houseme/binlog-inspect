@@ -135,7 +135,7 @@ error: the following binlogs could not be fully parsed:
 
 - `jsonl`：每个匹配事件一个 JSON 对象。多个输入的输出没有附加源文件名；需要归属信息时请分别运行。
 - `text`：每事件一行，格式为 `{timestamp} {event_type} server={server_id} pos={log_pos} {payload JSON}`。
-- `csv`：表头为 `timestamp,event_type,database,table,before,after`。只有已解析的行事件（`kind` 为 `rows`）的每个行变更产生一条记录；`partial_update_rows`、未解析表映射的行事件及所有非行事件不产生记录。镜像字段是经过 CSV 转义的 JSON 字符串，缺失镜像为 JSON `null`。
+- `csv`：表头为 `timestamp,event_type,database,table,before,after`。已解析的行事件（`kind` 为 `rows`）的每个行变更产生一条记录；`partial_update_rows` 的每一行产生一条记录（完整前镜像与已应用差异的后镜像，缺失镜像为 JSON `null`）；未解析表映射的行事件及所有非行事件不产生记录。镜像字段是经过 CSV 转义的 JSON 字符串。
 
 ### 真实输出样例
 

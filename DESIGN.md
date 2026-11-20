@@ -28,7 +28,7 @@ Row images are presented in table column order, with missing columns and SQL NUL
 
 ## Output, Exit Codes, and Atomic Writes
 
-JSON Lines emits one record per event; text is `{ts} {event_type} server={id} pos={log_pos} {payload_json}`; CSV emits one row per row change (only `kind=rows`), with before/after image fields as CSV-escaped JSON strings. Timestamps are Unix seconds. The `Formatter` trait writes directly to `&mut dyn Write` (`serde_json::to_writer` writes straight through, with no per-event intermediate String) and returns whether the event produced output. Output can contain raw business data; handle it in a trusted destination.
+JSON Lines emits one record per event; text is `{ts} {event_type} server={id} pos={log_pos} {payload_json}`; CSV emits one row per row change (`kind=rows`) and per partial-update row pair (`kind=partial_update_rows`), with before/after image fields as CSV-escaped JSON strings. Timestamps are Unix seconds. The `Formatter` trait writes directly to `&mut dyn Write` (`serde_json::to_writer` writes straight through, with no per-event intermediate String) and returns whether the event produced output. Output can contain raw business data; handle it in a trusted destination.
 
 Exit codes are layered: 0 success; 1 hard error (input cannot be opened, invalid header, output target already exists, first parse error under `--strict`); 2 clap usage error; 3 partial parse failure (default mode: an error stops the current file, remaining files are still processed, and stderr lists paths and offsets per file; in that case `--output` contains the successfully parsed prefix, which is intentional). A closed stdout (for example when piped into `head`) is treated as a normal end and exits 0.
 

@@ -135,7 +135,7 @@ error: the following binlogs could not be fully parsed:
 
 - `jsonl`: one JSON object per matching event. Output from multiple inputs does not include source filenames; run each input separately if attribution is needed.
 - `text`: one event per line, formatted as `{timestamp} {event_type} server={server_id} pos={log_pos} {payload JSON}`.
-- `csv`: header `timestamp,event_type,database,table,before,after`. Only decoded row events (`kind` of `rows`) produce one record per row change; `partial_update_rows`, row events without a resolved table map and all non-row events produce no records. Image fields contain CSV-escaped JSON strings, and a missing image is JSON `null`.
+- `csv`: header `timestamp,event_type,database,table,before,after`. Decoded row events (`kind` of `rows`) produce one record per row change, and `partial_update_rows` produces one record per row (the full before image and the diff-applied after image, an absent image as JSON `null`); row events without a resolved table map and all non-row events produce no records. Image fields contain CSV-escaped JSON strings.
 
 ### Real output samples
 

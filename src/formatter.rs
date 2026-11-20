@@ -75,31 +75,172 @@ impl Formatter for CsvFormatter {
         Some("timestamp,event_type,database,table,before,after")
     }
     fn format(&mut self, e: &ParsedEvent, out: &mut dyn Write) -> Result<bool, FormatterError> {
-        if let EventPayload::Rows {
-            database,
-            table,
-            changes,
-            ..
-        } = &e.payload
-        {
-            let database = quote(database);
-            let table = quote(table);
-            for change in changes {
-                // EventType's fixed names never contain CSV delimiters.
-                writeln!(
-                    out,
-                    "{},\"{}\",{},{},{},{}",
-                    e.timestamp,
-                    e.event_type.as_str(),
-                    database,
-                    table,
-                    quote(&serde_json::to_string(&change.before)?),
-                    quote(&serde_json::to_string(&change.after)?)
-                )?;
+        match &e.payload {
+            EventPayload::Rows {
+                database,
+                table,
+                changes,
+                ..
+            } => {
+                let database = quote(database);
+                let table = quote(table);
+                for change in changes {
+                    // EventType's fixed names never contain CSV delimiters.
+                    writeln!(
+                        out,
+                        "{},\"{}\",{},{},{},{}",
+                        e.timestamp,
+                        e.event_type.as_str(),
+                        database,
+                        table,
+                        quote(&serde_json::to_string(&change.before)?),
+                        quote(&serde_json::to_string(&change.after)?)
+                    )?;
+                }
+                Ok(!changes.is_empty())
             }
-            Ok(!changes.is_empty())
-        } else {
-            Ok(false)
+            // Partial update rows carry a full before image and a diff-applied
+            // after image per row; both render like any other row-image pair,
+            // an absent image as JSON `null`.
+            EventPayload::PartialUpdateRows {
+                database,
+                table,
+                before,
+                after,
+                ..
+            } => {
+                let database = quote(database);
+                let table = quote(table);
+                for (before_row, after_row) in before.iter().zip(after) {
+                    writeln!(
+                        out,
+                        "{},\"{}\",{},{},{},{}",
+                        e.timestamp,
+                        e.event_type.as_str(),
+                        database,
+                        table,
+                        quote(&serde_json::to_string(&before_row)?),
+                        quote(&serde_json::to_string(&after_row)?)
+                    )?;
+                }
+                Ok(!before.is_empty())
+            }
+            _ => Ok(false),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::event::{CellValue, ColumnValue, EventPayload, EventType, RowChange, RowImage};
+
+    fn write_rows_event(changes: Vec<RowChange>) -> ParsedEvent {
+        ParsedEvent {
+            offset: 100,
+            timestamp: 7,
+            event_type: EventType::WriteRows,
+            event_type_code: 30,
+            server_id: 1,
+            event_size: 50,
+            log_pos: 150,
+            payload: EventPayload::Rows {
+                table_id: 5,
+                database: "db".to_owned(),
+                table: "t".to_owned(),
+                changes,
+            },
+        }
+    }
+
+    fn image(value: CellValue) -> RowImage {
+        RowImage {
+            columns: vec![ColumnValue {
+                index: 0,
+                name: None,
+                mysql_type: Some("JSON".to_owned()),
+                signedness: None,
+                value,
+            }],
+        }
+    }
+
+    #[test]
+    fn csv_writes_one_record_per_row_change_with_a_header() {
+        let event = write_rows_event(vec![RowChange {
+            before: None,
+            after: Some(image(CellValue::Null)),
+        }]);
+        let mut formatter = CsvFormatter;
+        let header = formatter.header().expect("csv has a header");
+        let mut out = Vec::new();
+        assert!(formatter.format(&event, &mut &mut out).unwrap());
+        let csv = String::from_utf8(out).unwrap();
+        assert_eq!(
+            csv,
+            "7,\"write_rows\",\"db\",\"t\",\"null\",\"{\"\"columns\"\":[{\"\"index\"\":0,\
+             \"\"name\"\":null,\"\"mysql_type\"\":\"\"JSON\"\",\"\"signedness\"\":null,\
+             \"\"value\"\":{\"\"type\"\":\"\"null\"\"}}]}\"\n"
+        );
+        assert_eq!(header, "timestamp,event_type,database,table,before,after");
+    }
+
+    #[test]
+    fn csv_renders_partial_update_rows_as_row_pairs() {
+        let event = ParsedEvent {
+            offset: 200,
+            timestamp: 9,
+            event_type: EventType::PartialUpdateRows,
+            event_type_code: 39,
+            server_id: 1,
+            event_size: 80,
+            log_pos: 280,
+            payload: EventPayload::PartialUpdateRows {
+                table_id: 5,
+                database: "db".to_owned(),
+                table: "t".to_owned(),
+                before: vec![
+                    Some(image(CellValue::Json(serde_json::json!({"a": 1})))),
+                    None,
+                ],
+                after: vec![
+                    Some(image(CellValue::Json(serde_json::json!({"a": 2})))),
+                    None,
+                ],
+            },
+        };
+        let mut out = Vec::new();
+        assert!(CsvFormatter.format(&event, &mut out).unwrap());
+        let csv = String::from_utf8(out).unwrap();
+        let lines: Vec<&str> = csv.lines().collect();
+        assert_eq!(lines.len(), 2, "{csv}");
+        assert!(
+            lines[0].starts_with("9,\"partial_update_rows\",\"db\",\"t\","),
+            "{csv}"
+        );
+        // The applied after image renders as the full new document.
+        assert!(lines[0].contains("\"\"a\"\":2"), "{csv}");
+        // An absent image in either position renders as quoted JSON `null`.
+        assert_eq!(
+            lines[1], "9,\"partial_update_rows\",\"db\",\"t\",\"null\",\"null\"",
+            "{csv}"
+        );
+    }
+
+    #[test]
+    fn csv_ignores_non_row_events() {
+        let event = ParsedEvent {
+            offset: 4,
+            timestamp: 1,
+            event_type: EventType::Xid,
+            event_type_code: 16,
+            server_id: 1,
+            event_size: 27,
+            log_pos: 31,
+            payload: EventPayload::Xid { xid: 1 },
+        };
+        let mut out = Vec::new();
+        assert!(!CsvFormatter.format(&event, &mut out).unwrap());
+        assert!(out.is_empty());
     }
 }

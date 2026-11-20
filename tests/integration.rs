@@ -133,6 +133,32 @@ fn cli_events_flag_validation() {
     assert!(out.stdout.is_empty());
 }
 #[test]
+fn cli_csv_output_writes_header_and_row_records() {
+    let mut map = vec![1, 0, 0, 0, 0, 0, 0, 0];
+    map.extend_from_slice(b"\x03app\0\x01t\0\x01\x03\x00\x00");
+    let mut row = vec![1, 0, 0, 0, 0, 0, 0, 0];
+    row.extend_from_slice(&[2, 0, 1, 1, 0, 42, 0, 0, 0]);
+    let mut bytes = b"\xfebin".to_vec();
+    bytes.extend(event(19, &map));
+    bytes.extend(event(30, &row));
+    let f = file(&bytes);
+    let out = run_cli(&[f.path().to_str().unwrap(), "--format", "csv"]);
+    assert!(out.status.success());
+    let csv = String::from_utf8_lossy(&out.stdout);
+    let mut lines = csv.lines();
+    assert_eq!(
+        lines.next(),
+        Some("timestamp,event_type,database,table,before,after")
+    );
+    let record = lines.next().expect("one row record");
+    assert!(
+        record.starts_with("1,\"write_rows\",\"app\",\"t\","),
+        "{record}"
+    );
+    assert!(record.contains("42"), "{record}");
+    assert_eq!(lines.next(), None);
+}
+#[test]
 fn text_formatter_layout_is_stable() {
     let item = ParsedEvent {
         offset: 4,
