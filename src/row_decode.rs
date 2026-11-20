@@ -573,16 +573,20 @@ fn apply_pair(before: &RowImage, after: &mut RowImage) {
         if !matches!(after_cell.value, CellValue::PartialJson { .. }) {
             continue;
         }
-        let CellValue::PartialJson { diffs, .. } = &after_cell.value else {
+        // The diffs are moved out of the cell instead of cloned: on the
+        // common path (a successful application) the clone was dropped
+        // unused, so every applied JSON column paid a full deep copy of its
+        // diff sequence for nothing. The cell is reparsed from scratch on
+        // the early-continue paths below, which leave it untouched.
+        let CellValue::PartialJson { diffs, .. } = &mut after_cell.value else {
             continue;
         };
         // A gap (no before cell at this index) keeps the loss-marked value,
-        // matching the previous search-based behavior; the clone happens only
-        // once a before counterpart exists.
+        // matching the previous search-based behavior.
         let Some(before_cell) = candidate.filter(|cell| cell.index == after_cell.index) else {
             continue;
         };
-        let diffs = diffs.clone();
+        let diffs = std::mem::take(diffs);
         let replacement = match &before_cell.value {
             CellValue::Json(before_value) => {
                 match json_diff::apply_json_diffs(before_value.clone(), &diffs) {

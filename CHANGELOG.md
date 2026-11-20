@@ -12,6 +12,7 @@ This project follows the [Keep a Changelog](https://keepachangelog.com/en/1.1.0/
 ### Changed
 
 - The `--stream-payload-events` usage error now names the actual conflict: combining the flag with `--stats` reports "`--stream-payload-events cannot be combined with --stats`" instead of the misleading "`requires --format jsonl`"; the message for a non-JSONL `--format` is unchanged (2026-11-20 source review).
+- Applying a partial-JSON diff to its before value no longer clones the diff sequence for every successfully applied JSON column; the diffs are moved out of the cell instead, so an applied column only pays for the decoded document (2026-11-20 source review). Output bytes are unchanged.
 
 ### Fixed
 - Advisory `log_pos` warnings accumulated before a formatter write failure are no longer silently dropped: the failure is stashed and the warnings drained before the hard error propagates, matching the parse-error path (2026-11-20 source review).
