@@ -257,7 +257,7 @@ fn parse_datetime(value: &str) -> Result<i64, String> {
         .parse::<jiff::civil::DateTime>()
         .map_err(|_| invalid())?;
     let zoned = datetime
-        .to_zoned(jiff::tz::TimeZone::system())
+        .to_zoned_datetime(jiff::tz::TimeZone::system())
         .map_err(|_| invalid())?;
     Ok(zoned.timestamp().as_second())
 }
